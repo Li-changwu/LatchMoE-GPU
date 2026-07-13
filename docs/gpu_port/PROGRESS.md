@@ -62,4 +62,7 @@ nvidia-smi, nvidia-smi topo -m, lscpu, free -h, df -hT
 
 ### Next Step
 
-Write the TDD implementation plan, then implement Stage 1 from failing tests.
+The TDD implementation plan was written and self-reviewed at
+`docs/superpowers/plans/2026-07-13-latchmoe-cuda-implementation.md`. It maps the
+three stages to nine tasks with explicit RED/GREEN commands and evidence gates.
+Execute Stage 1 from failing tests, then continue through Stages 2 and 3.
