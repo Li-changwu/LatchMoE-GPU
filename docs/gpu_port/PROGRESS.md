@@ -129,3 +129,65 @@ Execute Stage 1 from failing tests, then continue through Stages 2 and 3.
 
 Implement Stage 2 async transfer, lifecycle events, eager split boundary, and
 PIECEWISE CUDA Graph checks from failing tests.
+
+## 2026-07-13 - Stage 2: Async Lifecycle and CUDA Graph Core
+
+### Completed
+
+- Added a dedicated CUDA transfer stream and transfer-ready events.
+- Added deterministic coalescing of adjacent expert/slot copies into contiguous
+  H2D runs.
+- Enforced `EMPTY -> LOADING -> READY -> COMPUTING -> READY`; `LOADING` is not
+  published in the map and `COMPUTING` is not an eviction candidate.
+- Added compute-done events. The transfer stream waits on prior compute events
+  before a slot becomes reusable, without a host synchronization in the normal
+  adapter path.
+- Added capture rejection for dynamic staging and in-place map mutation.
+- Added Dynamo-disabled eager prepare/finish boundaries around the original
+  vLLM router and quant kernel call.
+- Added an instance-local FusedMoE forward adapter. It reuses vLLM 0.19.1
+  `router.select_experts()` and `quant_method.apply()` rather than copying the
+  Qwen model or Triton kernel.
+- Added a vectorized stable-address compute path and verified real CUDA Graph
+  capture/replay on the synthetic layout.
+- Added stale mapping, early reuse, graph break, pointer stability, and bounded
+  CUDA allocator-growth tests.
+
+### TDD Evidence
+
+- Async/graph RED: collection failed because `ExpertCopy`, async transfer, and
+  capturable compute did not exist.
+- Runner integration RED: collection failed because the instance adapter did
+  not exist.
+- GREEN: the Stage 2 focused suite passed 8/8 tests.
+- Full regression artifact passed 48/48 tests.
+
+### Commands
+
+```bash
+/opt/miniconda3/bin/python -m pytest \
+  tests/gpu/test_async_lifecycle.py \
+  tests/gpu/test_graph_boundary.py \
+  tests/gpu/test_memory_stability.py \
+  tests/integration/test_runner_adapter.py -q
+/opt/miniconda3/bin/python -m pytest tests/unit tests/integration tests/gpu -q \
+  --junitxml=artifacts/stage2/pytest.xml
+```
+
+### Artifacts
+
+- `artifacts/stage2/pytest.xml` - 48 tests, 48 passed in the recorded run.
+- Implementation commit: `3ab013e`.
+
+### Scope Boundary
+
+- The CUDA Graph test captured and replayed stable slot compute while staging
+  remained outside capture.
+- Full Qwen vLLM PIECEWISE graph counters and server-level eager ablation remain
+  pending under the final real-model gate.
+- No performance claim is made from the synthetic graph test.
+
+### Next Step
+
+Implement Stage 3 capacity-bounded exact pair waves, shared double stage banks,
+transfer-aware issue order, and union-128 stress tests.
