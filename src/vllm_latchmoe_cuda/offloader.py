@@ -8,6 +8,7 @@ from vllm.model_executor.offloader.base import BaseOffloader
 
 from .host_store import PinnedHostStore
 from .manifest import OffloadManifest
+from .runtime import CudaLayerRuntime
 
 
 def _resolve_parameter(module: nn.Module, dotted_name: str) -> nn.Parameter:
@@ -35,7 +36,9 @@ class CudaSEWOffloader(BaseOffloader):
         self.first_layer_id = first_layer_id
         self.bound_parameter_names: set[str] = set()
         self.bound_layers: dict[int, nn.Module] = {}
+        self.runtimes: dict[int, CudaLayerRuntime] = {}
         self._wrapped = False
+        self._post_initialized = False
 
     def wrap_modules(
         self, modules_generator: Generator[nn.Module, None, None]
@@ -60,3 +63,23 @@ class CudaSEWOffloader(BaseOffloader):
             self.bound_layers[layer_id] = module
         return modules
 
+    def post_init(self) -> None:
+        if self._post_initialized:
+            raise RuntimeError("post_init may only be called once")
+        self._post_initialized = True
+        for layer_id, module in self.bound_layers.items():
+            experts_module = module.get_submodule("mlp.experts")
+            bindings = {
+                binding.name: binding
+                for binding in self.host_store.bindings
+                if binding.layer_id == layer_id
+            }
+            device = bindings["w13_weight"].original_device
+            self.runtimes[layer_id] = CudaLayerRuntime(
+                layer=self.manifest.layer(layer_id),
+                num_experts=self.manifest.model.num_experts,
+                num_slots=self.manifest.num_slots,
+                host_store=self.host_store,
+                experts_module=experts_module,
+                device=device,
+            )
