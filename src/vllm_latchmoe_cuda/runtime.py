@@ -9,6 +9,7 @@ from torch import nn
 from .core.expert_key import ExpertKey
 from .core.policy import LruPolicy
 from .core.slots import ComputeHandle, ExpertSlotBank, SlotLease, SlotState
+from .core.waves import WaveDescriptor
 from .errors import (
     ActiveExpertCapacityError,
     NoEvictableSlotError,
@@ -19,7 +20,12 @@ from .errors import (
 from .host_store import PinnedHostStore
 from .manifest import LayerLayout
 from .profile import RuntimeCounters
-from .transfer import CudaTransferEngine, ExpertCopy, copy_expert_sync
+from .transfer import (
+    CudaTransferEngine,
+    ExpertCopy,
+    TransferTicket,
+    copy_expert_sync,
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,87 @@ class PendingCompute:
     event: torch.cuda.Event
 
 
+@dataclass
+class StageBank:
+    bank_id: int
+    w13: torch.Tensor
+    w2: torch.Tensor
+    compute_done: torch.cuda.Event | None = None
+
+
+@dataclass(frozen=True)
+class StagedWave:
+    wave_id: int
+    bank_id: int
+    experts: tuple[int, ...]
+    ticket: TransferTicket
+
+
+@dataclass(frozen=True)
+class WaveExecutionTrace:
+    pair_count: int
+    compute_order: tuple[int, ...]
+    issue_order: tuple[int, ...]
+    buffer_by_wave: tuple[tuple[int, int], ...]
+
+
+class CudaStagePool:
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        num_slots: int,
+        w13_shape: tuple[int, ...],
+        w2_shape: tuple[int, ...],
+        dtype: torch.dtype,
+        buffer_count: int = 2,
+    ):
+        if buffer_count != 2:
+            raise ValueError("LatchMoE B2 requires exactly two stage banks")
+        self.device = device
+        self.num_slots = num_slots
+        self.transfer_engine = CudaTransferEngine(device)
+        self.banks = tuple(
+            StageBank(
+                bank_id=index,
+                w13=torch.empty((num_slots, *w13_shape), dtype=dtype, device=device),
+                w2=torch.empty((num_slots, *w2_shape), dtype=dtype, device=device),
+            )
+            for index in range(buffer_count)
+        )
+
+    def data_ptrs(self) -> tuple[tuple[int, int], ...]:
+        return tuple((bank.w13.data_ptr(), bank.w2.data_ptr()) for bank in self.banks)
+
+    def issue(
+        self, runtime: CudaLayerRuntime, wave: WaveDescriptor, bank_id: int
+    ) -> StagedWave:
+        bank = self.banks[bank_id]
+        if bank.compute_done is not None:
+            self.transfer_engine.stream.wait_event(bank.compute_done)
+        copies = tuple(
+            ExpertCopy(expert_id=expert, slot_id=position, generation=0)
+            for position, expert in enumerate(wave.experts)
+        )
+        ticket = self.transfer_engine.load_many_async(
+            host_w13=runtime.host_w13,
+            host_w2=runtime.host_w2,
+            slot_w13=bank.w13,
+            slot_w2=bank.w2,
+            copies=copies,
+        )
+        return StagedWave(wave.wave_id, bank_id, wave.experts, ticket)
+
+    def wait_ready(self, staged: StagedWave) -> StageBank:
+        self.transfer_engine.wait_ready(staged.ticket)
+        return self.banks[staged.bank_id]
+
+    def record_compute_done(self, bank_id: int) -> None:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self.banks[bank_id].compute_done = event
+
+
 class CudaLayerRuntime:
     def __init__(
         self,
@@ -50,6 +137,7 @@ class CudaLayerRuntime:
         host_store: PinnedHostStore,
         experts_module: nn.Module,
         device: torch.device,
+        stage_pool: CudaStagePool | None = None,
     ):
         if device.type != "cuda":
             raise ValueError(f"CUDA runtime requires a CUDA device, got {device}")
@@ -94,6 +182,14 @@ class CudaLayerRuntime:
         self.policy = LruPolicy()
         self.counters = RuntimeCounters()
         self.transfer_engine = CudaTransferEngine(device)
+        self.stage_pool = stage_pool or CudaStagePool(
+            device=device,
+            num_slots=num_slots,
+            w13_shape=tuple(self.host_w13.shape[1:]),
+            w2_shape=tuple(self.host_w2.shape[1:]),
+            dtype=self.host_w13.dtype,
+        )
+        self.last_wave_trace: WaveExecutionTrace | None = None
         self.mapping_version = 0
         self._active_compute: ComputeHandle | None = None
         self._pending_computes: list[PendingCompute] = []

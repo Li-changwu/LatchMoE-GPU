@@ -8,7 +8,7 @@ from vllm.model_executor.offloader.base import BaseOffloader
 
 from .host_store import PinnedHostStore
 from .manifest import OffloadManifest
-from .runtime import CudaLayerRuntime
+from .runtime import CudaLayerRuntime, CudaStagePool
 
 
 def _resolve_parameter(module: nn.Module, dotted_name: str) -> nn.Parameter:
@@ -39,6 +39,7 @@ class CudaSEWOffloader(BaseOffloader):
         self.runtimes: dict[int, CudaLayerRuntime] = {}
         self._wrapped = False
         self._post_initialized = False
+        self.stage_pool: CudaStagePool | None = None
 
     def wrap_modules(
         self, modules_generator: Generator[nn.Module, None, None]
@@ -75,6 +76,23 @@ class CudaSEWOffloader(BaseOffloader):
                 if binding.layer_id == layer_id
             }
             device = bindings["w13_weight"].original_device
+            host_w13 = self.host_store.tensor_view(layer_id, "w13_weight")
+            host_w2 = self.host_store.tensor_view(layer_id, "w2_weight")
+            if self.stage_pool is None:
+                self.stage_pool = CudaStagePool(
+                    device=device,
+                    num_slots=self.manifest.num_slots,
+                    w13_shape=tuple(host_w13.shape[1:]),
+                    w2_shape=tuple(host_w2.shape[1:]),
+                    dtype=host_w13.dtype,
+                )
+            elif (
+                tuple(self.stage_pool.banks[0].w13.shape[1:])
+                != tuple(host_w13.shape[1:])
+                or tuple(self.stage_pool.banks[0].w2.shape[1:])
+                != tuple(host_w2.shape[1:])
+            ):
+                raise RuntimeError("offloaded layers do not share one expert layout")
             self.runtimes[layer_id] = CudaLayerRuntime(
                 layer=self.manifest.layer(layer_id),
                 num_experts=self.manifest.model.num_experts,
@@ -82,6 +100,7 @@ class CudaSEWOffloader(BaseOffloader):
                 host_store=self.host_store,
                 experts_module=experts_module,
                 device=device,
+                stage_pool=self.stage_pool,
             )
             if hasattr(experts_module, "router") and hasattr(
                 experts_module, "quant_method"

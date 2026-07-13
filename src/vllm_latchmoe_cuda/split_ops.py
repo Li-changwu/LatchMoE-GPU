@@ -22,3 +22,10 @@ def eager_prepare_compute(runtime: CudaLayerRuntime, topk_ids: torch.Tensor) -> 
 @torch.compiler.disable
 def eager_finish_compute(runtime: CudaLayerRuntime) -> None:
     runtime.finish_compute_async()
+
+
+@torch.compiler.disable
+def eager_needs_exact_waves(
+    runtime: CudaLayerRuntime, topk_ids: torch.Tensor
+) -> bool:
+    return int(torch.unique(topk_ids).numel()) > runtime.num_slots

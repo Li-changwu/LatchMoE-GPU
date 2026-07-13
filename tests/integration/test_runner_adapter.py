@@ -68,3 +68,33 @@ def test_instance_adapter_stages_between_router_and_original_quant_kernel(
     torch.testing.assert_close(output_again, output, rtol=2e-2, atol=2e-2)
     assert experts.quant_method.calls == 2
     assert runtime.counters.snapshot()["slot_hit"] >= 2
+
+
+def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
+    tiny_manifest, tiny_decoder_factory
+):
+    module = tiny_decoder_factory("cuda")
+    offloader = CudaSEWOffloader(tiny_manifest)
+    offloader.wrap_modules(iter((module,)))
+    torch.manual_seed(29)
+    for parameter in module.mlp.experts.parameters():
+        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    offloader.post_init()
+    runtime = offloader.runtimes[0]
+    experts = module.mlp.experts
+    experts.router = FakeRouter()
+    experts.quant_method = FakeQuantMethod(runtime)
+    experts._shared_experts = None
+    install_vllm_forward_adapter(experts, runtime)
+    hidden = torch.randn((2, 2), dtype=torch.bfloat16, device="cuda")
+    router_logits = torch.tensor(
+        [[5.0, 4.0, -3.0, -4.0], [-4.0, -3.0, 5.0, 4.0]], device="cuda"
+    )
+
+    shared, output = experts(hidden, router_logits)
+
+    assert shared is None
+    assert output.shape == hidden.shape
+    assert experts.quant_method.calls == 2
+    assert runtime.last_wave_trace.pair_count == 4
+    assert runtime.last_wave_trace.compute_order == (0, 1)
