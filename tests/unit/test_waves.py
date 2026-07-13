@@ -1,0 +1,79 @@
+import pytest
+import torch
+
+from vllm_latchmoe_cuda.core.waves import (
+    ExactWavePlan,
+    PairDescriptor,
+    WaveDescriptor,
+    plan_exact_waves,
+    plan_transfer_issue_order,
+    validate_pair_coverage,
+)
+from vllm_latchmoe_cuda.errors import PairIntegrityError
+
+
+def _routing_with_union(union: int, top_k: int = 8):
+    experts = torch.arange(union, dtype=torch.int64)
+    padding = (-union) % top_k
+    if padding:
+        repeats = (padding + union - 1) // union
+        experts = torch.cat((experts, experts.repeat(repeats)[:padding]))
+    ids = experts.view(-1, top_k)
+    weights = torch.arange(1, ids.numel() + 1, dtype=torch.float32).view_as(ids)
+    return ids, weights
+
+
+@pytest.mark.parametrize("union", [1, 32, 33, 64, 127, 128])
+def test_wave_plan_covers_every_pair_once(union: int):
+    ids, weights = _routing_with_union(union)
+
+    plan = plan_exact_waves(ids, weights, capacity=32)
+
+    assert max(len(wave.experts) for wave in plan.waves) <= 32
+    assert plan.all_pair_offsets() == tuple(range(ids.numel()))
+    validate_pair_coverage(plan, expected_pairs=ids.numel())
+
+
+def test_pair_descriptor_preserves_token_topk_and_weight():
+    ids = torch.tensor([[5, 2], [9, 5]], dtype=torch.int64)
+    weights = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+
+    plan = plan_exact_waves(ids, weights, capacity=2)
+    pair = plan.pair(3)
+
+    assert pair == PairDescriptor(
+        pair_offset=3,
+        token_index=1,
+        topk_position=1,
+        expert_id=5,
+        weight=pytest.approx(0.4),
+    )
+
+
+def test_validation_rejects_duplicate_pair_assignment():
+    pair = PairDescriptor(0, 0, 0, 1, 1.0)
+    plan = ExactWavePlan(
+        capacity=1,
+        top_k=1,
+        num_tokens=1,
+        waves=(WaveDescriptor(0, (1,), (pair, pair)),),
+        compute_order=(0,),
+        issue_order=(0,),
+    )
+
+    with pytest.raises(PairIntegrityError, match="duplicate"):
+        validate_pair_coverage(plan, expected_pairs=1)
+
+
+def test_transfer_issue_order_does_not_change_compute_order():
+    ids, weights = _routing_with_union(64)
+    plan = plan_exact_waves(ids, weights, capacity=32)
+
+    issue_order = plan_transfer_issue_order(
+        plan.waves,
+        ready_experts=frozenset(range(16)),
+        h2d_bytes_by_wave={0: 400, 1: 1000},
+    )
+
+    assert plan.compute_order == (0, 1)
+    assert issue_order == (1, 0)
