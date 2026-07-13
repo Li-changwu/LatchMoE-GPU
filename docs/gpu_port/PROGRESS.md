@@ -191,3 +191,68 @@ PIECEWISE CUDA Graph checks from failing tests.
 
 Implement Stage 3 capacity-bounded exact pair waves, shared double stage banks,
 transfer-aware issue order, and union-128 stress tests.
+
+## 2026-07-13 - Stage 3: B2 Exact Pair Waves
+
+### Completed
+
+- Added exact routed-pair descriptors with unique flat offsets and explicit
+  token/top-k/expert/weight fields.
+- Added deterministic capacity-bounded waves with at most 32 experts per wave.
+- Added shared layout-scoped double stage banks. Synthetic two-layer validation
+  confirmed both layers reference the same two CUDA allocations.
+- Added transfer-aware future-wave issue selection while preserving fixed
+  compute/scatter order.
+- Added per-bank compute-done events; the transfer stream waits before reusing a
+  stage bank.
+- Added pair microbatch construction and final token `index_add` accumulation.
+- Added the vLLM-style overflow adapter path. Each wave copies from a stable
+  stage bank into the stable main slot Parameters, updates the stable map in
+  place, and invokes the original `quant_method.apply()` with top-k=1 pairs.
+- Added prefill union-128, mixed decode/prefill, and union 120/127/128 stress
+  coverage.
+- GPU numerical tests compared exact waves with a full 128-expert small-dimension
+  reference for both prefill and mixed workloads.
+
+### TDD and Failure Evidence
+
+- Exact-wave RED: collection failed because the overflow executor did not exist.
+- Overflow-adapter RED: the existing adapter raised
+  `ActiveExpertCapacityError` for 4 experts with 2 slots.
+- The first scheduler GREEN run exposed a duplicate issue sequence: a completed
+  wave was removed from `issued` and later prefetched again. A completed-wave set
+  was added; the issue-order test then passed.
+- A subsequent comparison failure was limited to expected BF16 output versus an
+  FP32 reference dtype; the assertion was corrected to compare FP32 views under
+  the fixed BF16 tolerance.
+- Final Stage 3 full regression artifact passed 60/60 tests.
+
+### Commands
+
+```bash
+/opt/miniconda3/bin/python -m pytest \
+  tests/unit/test_wave_stress.py \
+  tests/gpu/test_wave_numerics.py \
+  tests/gpu/test_wave_double_buffer.py \
+  tests/integration/test_runner_adapter.py -q
+/opt/miniconda3/bin/python -m pytest tests/unit tests/integration tests/gpu -q \
+  --junitxml=artifacts/stage3/pytest.xml
+```
+
+### Artifacts
+
+- `artifacts/stage3/pytest.xml` - 60 tests, 60 passed in the recorded run.
+- Implementation commit: `4020736`.
+
+### Scope Boundary
+
+- Correctness-first host planning is implemented.
+- A CUDA device planner is intentionally not implemented; it remains a later
+  optimization only after real-model correctness and profiling.
+- These correctness/stress runs are not performance measurements.
+
+### Next Step
+
+Run formatting/static checks, real Qwen per-layer comparisons, graph artifact
+runners, and the real greedy E2E capacity/correctness gate. Preserve every
+failure as an artifact and do not convert smoke results into final results.
