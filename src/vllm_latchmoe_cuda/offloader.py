@@ -83,3 +83,11 @@ class CudaSEWOffloader(BaseOffloader):
                 experts_module=experts_module,
                 device=device,
             )
+            if hasattr(experts_module, "router") and hasattr(
+                experts_module, "quant_method"
+            ):
+                from .runner_adapter import install_vllm_forward_adapter
+
+                install_vllm_forward_adapter(
+                    experts_module, self.runtimes[layer_id]
+                )

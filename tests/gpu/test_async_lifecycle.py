@@ -1,0 +1,64 @@
+import pytest
+import torch
+
+from vllm_latchmoe_cuda.core.slots import SlotState
+from vllm_latchmoe_cuda.errors import NoEvictableSlotError
+from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
+from vllm_latchmoe_cuda.transfer import ExpertCopy, contiguous_copy_runs
+
+
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+]
+
+
+def _runtime(tiny_manifest, tiny_decoder_factory):
+    module = tiny_decoder_factory("cuda")
+    offloader = CudaSEWOffloader(tiny_manifest)
+    offloader.wrap_modules(iter((module,)))
+    for parameter in module.mlp.experts.parameters():
+        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    offloader.post_init()
+    return offloader.runtimes[0]
+
+
+def test_contiguous_copy_runs_coalesce_adjacent_experts_and_slots():
+    loads = (
+        ExpertCopy(expert_id=4, slot_id=0, generation=1),
+        ExpertCopy(expert_id=5, slot_id=1, generation=1),
+        ExpertCopy(expert_id=8, slot_id=2, generation=1),
+    )
+
+    assert contiguous_copy_runs(loads) == (loads[:2], loads[2:])
+
+
+def test_async_stage_uses_distinct_stream_and_marks_slots_ready(
+    tiny_manifest, tiny_decoder_factory
+):
+    runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+
+    snapshot = runtime.stage_async((0, 1))
+
+    assert runtime.transfer_engine.stream.cuda_stream != torch.cuda.current_stream().cuda_stream
+    assert all(
+        runtime.bank.slots[slot_id].state is SlotState.READY
+        for slot_id in snapshot.slot_ids
+    )
+    runtime.validate_snapshot(snapshot)
+
+
+def test_compute_done_event_guards_slot_reuse(tiny_manifest, tiny_decoder_factory):
+    runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+    snapshot = runtime.stage_async((0, 1))
+    compute = runtime.begin_compute(snapshot)
+    pending = runtime.end_compute_async(compute)
+
+    with pytest.raises(NoEvictableSlotError):
+        runtime.stage_async((2, 3))
+
+    runtime.wait_compute_done(pending)
+    next_snapshot = runtime.stage_async((2, 3))
+
+    assert next_snapshot.active_experts == (2, 3)
+

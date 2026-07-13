@@ -11,13 +11,15 @@ from .core.policy import LruPolicy
 from .core.slots import ComputeHandle, ExpertSlotBank, SlotLease, SlotState
 from .errors import (
     ActiveExpertCapacityError,
+    NoEvictableSlotError,
     StableAddressError,
+    StagingDuringCaptureError,
     StaleMappingError,
 )
 from .host_store import PinnedHostStore
 from .manifest import LayerLayout
 from .profile import RuntimeCounters
-from .transfer import copy_expert_sync
+from .transfer import CudaTransferEngine, ExpertCopy, copy_expert_sync
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,12 @@ class LayerMappingSnapshot:
     @property
     def slot_ids(self) -> tuple[int, ...]:
         return tuple(lease.slot_id for lease in self.leases)
+
+
+@dataclass(frozen=True)
+class PendingCompute:
+    handle: ComputeHandle
+    event: torch.cuda.Event
 
 
 class CudaLayerRuntime:
@@ -76,6 +84,8 @@ class CudaLayerRuntime:
             experts_module._buffers["_expert_map"] = self.expert_map
         else:
             experts_module.register_buffer("_expert_map", self.expert_map)
+        if not hasattr(type(experts_module), "expert_map"):
+            experts_module.expert_map = self.expert_map
         if hasattr(experts_module, "local_num_experts"):
             experts_module.local_num_experts = num_slots
         if hasattr(experts_module, "n_local_physical_experts"):
@@ -83,7 +93,10 @@ class CudaLayerRuntime:
         self.bank = ExpertSlotBank(num_slots)
         self.policy = LruPolicy()
         self.counters = RuntimeCounters()
+        self.transfer_engine = CudaTransferEngine(device)
         self.mapping_version = 0
+        self._active_compute: ComputeHandle | None = None
+        self._pending_computes: list[PendingCompute] = []
         self._stable_ptrs = self.data_ptrs()
 
     def data_ptrs(self) -> dict[str, int]:
@@ -166,21 +179,91 @@ class CudaLayerRuntime:
                 + self.host_w2[expert_id].numel() * self.host_w2.element_size(),
             )
 
+        snapshot = self._publish_mapping(active, selected)
+        self.validate_snapshot(snapshot)
+        self.assert_stable_addresses()
+        return snapshot
+
+    def stage_async(self, active_experts: Iterable[int]) -> LayerMappingSnapshot:
+        if torch.cuda.is_current_stream_capturing():
+            raise StagingDuringCaptureError(
+                f"dynamic staging attempted during CUDA Graph capture: "
+                f"layer={self.layer_id}"
+            )
+        self.assert_stable_addresses()
+        active = self._normalize_active(active_experts)
+        selected: dict[int, SlotLease] = {}
+        reserved: set[int] = set()
+        copies: list[ExpertCopy] = []
+        for expert_id in active:
+            key = ExpertKey(self.layer_id, expert_id)
+            slot = self.bank.find(key)
+            if slot is None:
+                continue
+            if slot.state is SlotState.COMPUTING:
+                raise NoEvictableSlotError(
+                    f"layer={self.layer_id}, expert={expert_id} is still computing"
+                )
+            self.bank.touch(slot.slot_id)
+            selected[expert_id] = SlotLease(slot.slot_id, key, slot.generation)
+            reserved.add(slot.slot_id)
+            self.counters.increment("slot_hit")
+
+        for expert_id in active:
+            if expert_id in selected:
+                continue
+            slot_id = self.policy.choose(self.bank, excluded=reserved)
+            slot = self.bank.slots[slot_id]
+            if slot.state is SlotState.READY:
+                self.bank.evict(slot_id)
+                self.counters.increment("eviction")
+            key = ExpertKey(self.layer_id, expert_id)
+            lease = self.bank.begin_load(key, slot_id=slot_id)
+            copies.append(ExpertCopy(expert_id, slot_id, lease.generation))
+            selected[expert_id] = lease
+            reserved.add(slot_id)
+            self.counters.increment("slot_miss")
+
+        if copies:
+            ticket = self.transfer_engine.load_many_async(
+                host_w13=self.host_w13,
+                host_w2=self.host_w2,
+                slot_w13=self.slot_w13,
+                slot_w2=self.slot_w2,
+                copies=copies,
+            )
+            self.transfer_engine.wait_ready(ticket)
+            for copy in copies:
+                lease = self.bank.mark_ready(copy.slot_id, copy.generation)
+                selected[copy.expert_id] = lease
+                self.counters.increment(
+                    "h2d_bytes",
+                    self.host_w13[copy.expert_id].numel()
+                    * self.host_w13.element_size()
+                    + self.host_w2[copy.expert_id].numel()
+                    * self.host_w2.element_size(),
+                )
+
+        snapshot = self._publish_mapping(active, selected)
+        self.validate_snapshot(snapshot)
+        self.assert_stable_addresses()
+        return snapshot
+
+    def _publish_mapping(
+        self, active: tuple[int, ...], selected: dict[int, SlotLease]
+    ) -> LayerMappingSnapshot:
         cpu_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
         for key, slot_id in self.bank.ready_mapping().items():
             if key.layer_id == self.layer_id:
                 cpu_map[key.expert_id] = slot_id
         self.log2phy.copy_(cpu_map, non_blocking=False)
         self.mapping_version += 1
-        snapshot = LayerMappingSnapshot(
+        return LayerMappingSnapshot(
             layer_id=self.layer_id,
             active_experts=active,
             leases=tuple(selected[expert] for expert in active),
             mapping_version=self.mapping_version,
         )
-        self.validate_snapshot(snapshot)
-        self.assert_stable_addresses()
-        return snapshot
 
     def validate_snapshot(self, snapshot: LayerMappingSnapshot) -> None:
         if snapshot.layer_id != self.layer_id:
@@ -205,3 +288,34 @@ class CudaLayerRuntime:
     def end_compute(self, handle: ComputeHandle) -> None:
         self.bank.end_compute(handle)
 
+    def end_compute_async(self, handle: ComputeHandle) -> PendingCompute:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.slot_w13.device))
+        return PendingCompute(handle=handle, event=event)
+
+    def wait_compute_done(self, pending: PendingCompute) -> None:
+        pending.event.synchronize()
+        self.bank.end_compute(pending.handle)
+
+    def prepare_compute_async(self, active_experts: Iterable[int]) -> None:
+        if self._active_compute is not None:
+            raise RuntimeError(f"layer {self.layer_id} already has active compute")
+        self.release_pending_for_transfer()
+        snapshot = self.stage_async(active_experts)
+        self._active_compute = self.begin_compute(snapshot)
+
+    def finish_compute_async(self) -> PendingCompute:
+        if self._active_compute is None:
+            raise RuntimeError(f"layer {self.layer_id} has no active compute")
+        pending = self.end_compute_async(self._active_compute)
+        self._active_compute = None
+        self._pending_computes.append(pending)
+        return pending
+
+    def release_pending_for_transfer(self) -> None:
+        if not self._pending_computes:
+            return
+        for pending in self._pending_computes:
+            self.transfer_engine.stream.wait_event(pending.event)
+            self.bank.end_compute(pending.handle)
+        self._pending_computes.clear()
