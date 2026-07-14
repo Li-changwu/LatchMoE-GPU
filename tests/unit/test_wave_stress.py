@@ -43,4 +43,3 @@ def test_near_full_union_never_drops_padding_pairs(union):
     plan = _assert_exact(ids)
 
     assert len(plan.all_pair_offsets()) == ids.numel()
-

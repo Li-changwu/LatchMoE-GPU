@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from vllm_latchmoe_cuda.core.slots import SlotState
-from vllm_latchmoe_cuda.errors import NoEvictableSlotError
+from vllm_latchmoe_cuda.errors import NoEvictableSlotError, StaleMappingError
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
 from vllm_latchmoe_cuda.transfer import ExpertCopy, contiguous_copy_runs
 
@@ -17,8 +17,9 @@ def _runtime(tiny_manifest, tiny_decoder_factory):
     module = tiny_decoder_factory("cuda")
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     return offloader.runtimes[0]
 
@@ -40,7 +41,10 @@ def test_async_stage_uses_distinct_stream_and_marks_slots_ready(
 
     snapshot = runtime.stage_async((0, 1))
 
-    assert runtime.transfer_engine.stream.cuda_stream != torch.cuda.current_stream().cuda_stream
+    assert (
+        runtime.transfer_engine.stream.cuda_stream
+        != torch.cuda.current_stream().cuda_stream
+    )
     assert all(
         runtime.bank.slots[slot_id].state is SlotState.READY
         for slot_id in snapshot.slot_ids
@@ -62,3 +66,16 @@ def test_compute_done_event_guards_slot_reuse(tiny_manifest, tiny_decoder_factor
 
     assert next_snapshot.active_experts == (2, 3)
 
+
+def test_async_map_publication_uses_pinned_lifetime_guard(
+    tiny_manifest, tiny_decoder_factory
+):
+    runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+
+    first = runtime.stage_async((0, 1))
+
+    assert runtime.pending_map_copy_count >= 1
+    assert all(copy.cpu_map.is_pinned() for copy in runtime._pending_map_copies)
+    runtime.stage_async((0, 1))
+    with pytest.raises(StaleMappingError, match="mapping version"):
+        runtime.validate_snapshot(first)

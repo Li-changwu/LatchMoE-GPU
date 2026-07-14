@@ -19,8 +19,9 @@ def test_wave_executor_alternates_two_stable_stage_banks(
     module = tiny_decoder_factory("cuda")
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     runtime = offloader.runtimes[0]
     pointers = runtime.stage_pool.data_ptrs()
@@ -34,7 +35,10 @@ def test_wave_executor_alternates_two_stable_stage_banks(
 
     assert first_trace.buffer_by_wave == ((0, 0), (1, 1))
     assert runtime.stage_pool.data_ptrs() == pointers
-    assert runtime.stage_pool.banks[0].w13.data_ptr() != runtime.stage_pool.banks[1].w13.data_ptr()
+    assert (
+        runtime.stage_pool.banks[0].w13.data_ptr()
+        != runtime.stage_pool.banks[1].w13.data_ptr()
+    )
 
 
 def test_transfer_aware_prefetch_never_changes_compute_order(
@@ -43,8 +47,9 @@ def test_transfer_aware_prefetch_never_changes_compute_order(
     module = tiny_decoder_factory("cuda")
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     runtime = offloader.runtimes[0]
     hidden = torch.randn((4, 2), dtype=torch.bfloat16, device="cuda")
@@ -72,9 +77,10 @@ def test_two_layers_share_the_same_double_stage_pool(
     modules = (tiny_decoder_factory("cuda"), tiny_decoder_factory("cuda"))
     offloader = CudaSEWOffloader(manifest)
     offloader.wrap_modules(iter(modules))
-    for module in modules:
-        for parameter in module.mlp.experts.parameters():
-            parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for layer_id in manifest.layer_ids:
+        for name in ("w13_weight", "w2_weight"):
+            host = offloader.host_store.tensor_view(layer_id, name)
+            host.copy_(torch.randn_like(host))
 
     offloader.post_init()
 

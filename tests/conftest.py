@@ -99,4 +99,3 @@ class TinyDecoder(nn.Module):
 @pytest.fixture
 def tiny_decoder_factory():
     return TinyDecoder
-

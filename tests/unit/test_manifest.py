@@ -105,3 +105,29 @@ def test_runtime_validation_rejects_wrong_vllm(tmp_path: Path):
         manifest.validate_runtime(
             vllm_version="0.19.0", dtype="bfloat16", tensor_parallel_size=1
         )
+
+
+def test_model_file_hash_validation_rejects_local_mutation(tmp_path: Path):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    config_path = model_path / "config.json"
+    index_path = model_path / "model.safetensors.index.json"
+    config_path.write_bytes(b'{"model_type":"qwen3_moe"}\n')
+    index_path.write_bytes(b'{"weight_map":{}}\n')
+    payload = _payload()
+    payload["model"]["path"] = str(model_path)
+    payload["model"]["config_sha256"] = hashlib.sha256(
+        config_path.read_bytes()
+    ).hexdigest()
+    payload["model"]["weight_index_sha256"] = hashlib.sha256(
+        index_path.read_bytes()
+    ).hexdigest()
+    manifest_path = tmp_path / "offload_manifest.json"
+    _write_manifest(manifest_path, payload)
+    manifest = OffloadManifest.load(manifest_path)
+
+    manifest.validate_model_files()
+    config_path.write_bytes(b'{"model_type":"changed"}\n')
+
+    with pytest.raises(ManifestValidationError, match="config.json SHA-256"):
+        manifest.validate_model_files()

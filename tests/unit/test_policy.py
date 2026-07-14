@@ -39,4 +39,3 @@ def test_lru_honors_explicit_exclusions():
 
     with pytest.raises(NoEvictableSlotError):
         LruPolicy().choose(bank, excluded={0})
-

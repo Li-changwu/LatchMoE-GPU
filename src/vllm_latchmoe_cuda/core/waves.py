@@ -32,7 +32,9 @@ class ExactWavePlan:
     issue_order: tuple[int, ...]
 
     def all_pair_offsets(self) -> tuple[int, ...]:
-        return tuple(sorted(pair.pair_offset for wave in self.waves for pair in wave.pairs))
+        return tuple(
+            sorted(pair.pair_offset for wave in self.waves for pair in wave.pairs)
+        )
 
     def pair(self, pair_offset: int) -> PairDescriptor:
         for wave in self.waves:
@@ -103,7 +105,14 @@ def plan_exact_waves(topk_ids, topk_weights, *, capacity: int) -> ExactWavePlan:
 
 def validate_pair_coverage(plan: ExactWavePlan, expected_pairs: int) -> None:
     offsets = [pair.pair_offset for wave in plan.waves for pair in wave.pairs]
-    duplicates = sorted({value for value in offsets if offsets.count(value) > 1})
+    seen: set[int] = set()
+    duplicate_values: set[int] = set()
+    for value in offsets:
+        if value in seen:
+            duplicate_values.add(value)
+        else:
+            seen.add(value)
+    duplicates = sorted(duplicate_values)
     if duplicates:
         raise PairIntegrityError(f"duplicate pair offsets: {duplicates}")
     actual = set(offsets)
@@ -137,4 +146,3 @@ def plan_transfer_issue_order(
         return (-int(h2d_bytes_by_wave.get(wave.wave_id, 0)), -missing, wave.wave_id)
 
     return tuple(wave.wave_id for wave in sorted(waves, key=priority))
-

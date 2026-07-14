@@ -51,4 +51,3 @@ class JsonlEventWriter:
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         self.close()
-

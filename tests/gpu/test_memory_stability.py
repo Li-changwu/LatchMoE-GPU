@@ -16,8 +16,9 @@ def test_async_stage_compute_loop_has_bounded_allocator_growth(
     module = tiny_decoder_factory("cuda")
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     runtime = offloader.runtimes[0]
 

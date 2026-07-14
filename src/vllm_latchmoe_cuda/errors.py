@@ -22,7 +22,9 @@ class UnsupportedVllmVersionError(LatchMoEError):
     def __init__(self, *, expected: str, actual: str):
         self.expected = expected
         self.actual = actual
-        super().__init__(f"unsupported vLLM version: expected={expected}, actual={actual}")
+        super().__init__(
+            f"unsupported vLLM version: expected={expected}, actual={actual}"
+        )
 
 
 class LayoutMismatchError(LatchMoEError):
@@ -55,4 +57,3 @@ class StagingDuringCaptureError(LatchMoEError):
 
 class PairIntegrityError(LatchMoEError):
     pass
-

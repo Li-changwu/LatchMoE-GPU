@@ -15,8 +15,9 @@ def _loaded_offloader(tiny_manifest, tiny_decoder_factory):
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
     torch.manual_seed(7)
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     return module, offloader
 
@@ -46,3 +47,17 @@ def test_slot_and_map_addresses_remain_stable(tiny_manifest, tiny_decoder_factor
 
     assert runtime.data_ptrs() == before
 
+
+def test_existing_none_expert_map_attribute_is_replaced_by_stable_buffer(
+    tiny_manifest, tiny_decoder_factory
+):
+    module = tiny_decoder_factory("cuda")
+    module.mlp.experts._expert_map = None
+    offloader = CudaSEWOffloader(tiny_manifest)
+    offloader.wrap_modules(iter((module,)))
+    offloader.post_init()
+
+    runtime = offloader.runtimes[0]
+
+    assert module.mlp.experts._buffers["_expert_map"] is runtime.log2phy
+    assert module.mlp.experts._expert_map.data_ptr() == runtime.log2phy.data_ptr()

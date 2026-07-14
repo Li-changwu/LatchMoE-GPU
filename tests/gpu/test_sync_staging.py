@@ -15,10 +15,9 @@ def _runtime(tiny_manifest, tiny_decoder_factory):
     module = tiny_decoder_factory("cuda")
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(
-            torch.arange(parameter.numel(), dtype=torch.bfloat16).view_as(parameter)
-        )
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.arange(host.numel(), dtype=torch.bfloat16).view_as(host))
     offloader.post_init()
     return offloader.runtimes[0]
 
@@ -31,6 +30,7 @@ def test_sync_stage_copies_exact_expert_and_updates_map(
     snapshot = runtime.stage_sync((3, 1))
 
     mapping = runtime.log2phy.cpu().tolist()
+    assert runtime.pending_map_copy_count == 0
     assert mapping[3] >= 0
     assert mapping[1] >= 0
     assert mapping[0] == -1
@@ -56,4 +56,3 @@ def test_stale_snapshot_is_detected_after_slot_reuse(
 
     with pytest.raises(StaleMappingError):
         runtime.validate_snapshot(stale)
-

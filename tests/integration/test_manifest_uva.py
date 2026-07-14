@@ -23,8 +23,7 @@ def test_uva_selects_only_manifest_parameters(tiny_manifest, tiny_decoder_factor
         "model.layers.0.mlp.experts.w13_weight",
         "model.layers.0.mlp.experts.w2_weight",
     }
-    assert len(offloader.cpu_backing_tensors) == 2
-    assert all(tensor.is_pinned() for tensor in offloader.cpu_backing_tensors)
+    assert not hasattr(offloader, "_cpu_tensors")
     assert untouched.mlp.experts.w13_weight.data_ptr() == untouched_ptr
 
 
@@ -40,6 +39,31 @@ def test_uva_view_and_cpu_backing_observe_same_values(
     assert parameter.weight_loader(parameter, loaded)
     torch.cuda.synchronize()
 
-    backing = offloader.cpu_tensor(0, "w13_weight")
-    assert torch.equal(backing, loaded.to(dtype=torch.bfloat16))
+    observed = parameter.detach().cpu()
+    assert torch.equal(observed, loaded.to(dtype=torch.bfloat16))
     assert getattr(parameter, "_vllm_is_uva_offloaded", False)
+
+
+@pytest.mark.parametrize(
+    ("pin_memory", "use_uva"), [(False, True), (True, False), (False, False)]
+)
+def test_manifest_uva_fails_closed_without_pinned_uva(
+    tiny_manifest, pin_memory, use_uva
+):
+    with pytest.raises(RuntimeError, match="pinned UVA"):
+        ManifestUVAOffloader(
+            tiny_manifest,
+            pin_memory=pin_memory,
+            use_uva=use_uva,
+        )
+
+
+def test_manifest_uva_rejects_missing_manifest_layer(tiny_manifest):
+    offloader = ManifestUVAOffloader(
+        tiny_manifest,
+        pin_memory=True,
+        use_uva=True,
+    )
+
+    with pytest.raises(RuntimeError, match="missing manifest layers"):
+        offloader.wrap_modules(iter(()))

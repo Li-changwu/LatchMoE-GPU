@@ -135,7 +135,9 @@ class OffloadManifest:
             dtype=str(payload["dtype"]),
             tensor_parallel_size=int(payload["tensor_parallel_size"]),
             num_slots=int(payload["num_slots"]),
-            layers=tuple(LayerLayout.from_payload(value) for value in payload["layers"]),
+            layers=tuple(
+                LayerLayout.from_payload(value) for value in payload["layers"]
+            ),
         )
 
     @property
@@ -184,6 +186,26 @@ class OffloadManifest:
                 "tensor parallel size mismatch: "
                 f"expected={self.tensor_parallel_size}, actual={tensor_parallel_size}"
             )
+
+    def validate_model_files(self) -> None:
+        model_path = Path(self.model.path)
+        checks = (
+            ("config.json", self.model.config_sha256),
+            ("model.safetensors.index.json", self.model.weight_index_sha256),
+        )
+        for filename, expected in checks:
+            path = model_path / filename
+            if not path.is_file():
+                raise ManifestValidationError(f"model file is missing: {path}")
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual = digest.hexdigest()
+            if actual != expected:
+                raise ManifestValidationError(
+                    f"{filename} SHA-256 mismatch: expected={expected}, actual={actual}"
+                )
 
     def _validate(self) -> None:
         if self.schema_version != 1:
@@ -237,4 +259,3 @@ class OffloadManifest:
                 raise ManifestValidationError(
                     f"host ranges overlap: {previous[2]} and {current[2]}"
                 )
-

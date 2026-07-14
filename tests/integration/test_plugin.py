@@ -47,7 +47,10 @@ def test_plugin_factory_selects_manifest_backend(
 
 def test_plugin_is_idempotent_and_preserves_native_mode(monkeypatch, plugin):
     native_result = object()
-    native_factory = lambda config: native_result
+
+    def native_factory(config):
+        return native_result
+
     fake_runner = SimpleNamespace(create_offloader=native_factory)
     monkeypatch.setattr(plugin.metadata, "version", lambda _: "0.19.1")
     monkeypatch.setattr(plugin.importlib, "import_module", lambda name: fake_runner)
@@ -59,4 +62,3 @@ def test_plugin_is_idempotent_and_preserves_native_mode(monkeypatch, plugin):
 
     assert fake_runner.create_offloader is first_wrapper
     assert fake_runner.create_offloader(object()) is native_result
-

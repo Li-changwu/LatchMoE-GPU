@@ -21,4 +21,3 @@ class ExpertKey:
     @classmethod
     def from_jsonable(cls, value: dict[str, Any]) -> ExpertKey:
         return cls(layer_id=int(value["layer_id"]), expert_id=int(value["expert_id"]))
-

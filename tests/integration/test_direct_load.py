@@ -47,3 +47,24 @@ def test_checkpoint_loader_writes_directly_to_pinned_store(
         "model.layers.0.mlp.experts.w13_weight",
         "model.layers.0.mlp.experts.w2_weight",
     }
+
+
+def test_offloader_connects_profile_writer_from_environment(
+    monkeypatch, tmp_path, tiny_manifest
+):
+    profile_path = tmp_path / "profile.jsonl"
+    monkeypatch.setenv("VLLM_LATCHMOE_PROFILE_PATH", str(profile_path))
+
+    offloader = CudaSEWOffloader(tiny_manifest, pin_memory=False)
+
+    assert offloader.event_writer is not None
+    offloader.event_writer.write("test_event", layer_id=0)
+    assert '"event":"test_event"' in profile_path.read_text()
+
+
+def test_latchmoe_post_init_rejects_missing_manifest_layer(tiny_manifest):
+    offloader = CudaSEWOffloader(tiny_manifest, pin_memory=False)
+    offloader.wrap_modules(iter(()))
+
+    with pytest.raises(RuntimeError, match="missing manifest layers"):
+        offloader.post_init()

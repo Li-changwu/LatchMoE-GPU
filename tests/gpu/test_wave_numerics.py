@@ -167,9 +167,7 @@ def test_union128_gpu_waves_match_full_reference(tmp_path, workload):
         topk_ids = prefill_ids
     topk_weights = torch.rand(topk_ids.shape, device="cuda")
     topk_weights /= topk_weights.sum(dim=-1, keepdim=True)
-    hidden = torch.randn(
-        (topk_ids.shape[0], 2), dtype=torch.bfloat16, device="cuda"
-    )
+    hidden = torch.randn((topk_ids.shape[0], 2), dtype=torch.bfloat16, device="cuda")
     expected = _capturable_weights_moe(
         full_w13, full_w2, hidden, topk_ids, topk_weights
     )

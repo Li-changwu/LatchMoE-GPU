@@ -1,6 +1,5 @@
 import pytest
 import torch
-from torch import nn
 
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
 from vllm_latchmoe_cuda.runner_adapter import (
@@ -28,12 +27,18 @@ class FakeQuantMethod:
         self.runtime = runtime
         self.calls = 0
 
-    def apply(
-        self, *, layer, x, topk_weights, topk_ids, shared_experts_input
-    ):
+    def apply(self, *, layer, x, topk_weights, topk_ids, shared_experts_input):
         self.calls += 1
         physical = layer.expert_map[topk_ids].long()
         return capturable_slot_moe(self.runtime, x, physical, topk_weights)
+
+
+class RecordingWriter:
+    def __init__(self):
+        self.events = []
+
+    def write(self, event, **fields):
+        self.events.append({"event": event, **fields})
 
 
 def test_instance_adapter_stages_between_router_and_original_quant_kernel(
@@ -77,10 +82,12 @@ def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
     torch.manual_seed(29)
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     runtime = offloader.runtimes[0]
+    runtime.event_writer = RecordingWriter()
     experts = module.mlp.experts
     experts.router = FakeRouter()
     experts.quant_method = FakeQuantMethod(runtime)
@@ -98,3 +105,45 @@ def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
     assert experts.quant_method.calls == 2
     assert runtime.last_wave_trace.pair_count == 4
     assert runtime.last_wave_trace.compute_order == (0, 1)
+    assert runtime.event_writer.events == [
+        {
+            "event": "exact_waves",
+            "layer_id": 0,
+            "pair_count": 4,
+            "wave_count": 2,
+            "compute_order": [0, 1],
+            "issue_order": [0, 1],
+        }
+    ]
+
+
+def test_regular_request_reloads_after_overflow_overwrites_main_slots(
+    tiny_manifest, tiny_decoder_factory
+):
+    module = tiny_decoder_factory("cuda")
+    offloader = CudaSEWOffloader(tiny_manifest)
+    offloader.wrap_modules(iter((module,)))
+    torch.manual_seed(37)
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
+    offloader.post_init()
+    runtime = offloader.runtimes[0]
+    experts = module.mlp.experts
+    experts.router = FakeRouter()
+    experts.quant_method = FakeQuantMethod(runtime)
+    experts._shared_experts = None
+    install_vllm_forward_adapter(experts, runtime)
+    hidden = torch.randn((2, 2), dtype=torch.bfloat16, device="cuda")
+    regular_logits = torch.tensor(
+        [[5.0, 4.0, -3.0, -4.0], [4.0, 5.0, -3.0, -4.0]], device="cuda"
+    )
+    overflow_logits = torch.tensor(
+        [[5.0, 4.0, -3.0, -4.0], [-4.0, -3.0, 5.0, 4.0]], device="cuda"
+    )
+
+    _, before = experts(hidden, regular_logits)
+    experts(hidden, overflow_logits)
+    _, after = experts(hidden, regular_logits)
+
+    torch.testing.assert_close(after, before, rtol=2e-2, atol=2e-2)

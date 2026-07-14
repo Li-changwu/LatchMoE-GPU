@@ -256,3 +256,331 @@ transfer-aware issue order, and union-128 stress tests.
 Run formatting/static checks, real Qwen per-layer comparisons, graph artifact
 runners, and the real greedy E2E capacity/correctness gate. Preserve every
 failure as an artifact and do not convert smoke results into final results.
+
+## 2026-07-13 - Correctness and Artifact Gate (In Progress)
+
+### Resume Audit
+
+- Continued in the isolated worktree
+  `/root/LatchMoE/.worktrees/cuda-latchmoe` on
+  `feature/cuda-latchmoe`; no main-worktree files were changed.
+- Verified the installed target remains vLLM 0.19.1 with PyTorch 2.10.0+cu128
+  and one CUDA device.
+- The RTX A6000 reported 46068 MiB total, 39079 MiB used, and 6407 MiB free.
+  The external allocation is a current environment constraint, not an inferred
+  LatchMoE memory result.
+- Verified the local Qwen checkpoint path and weight-index file remain present.
+
+### Commands and Results
+
+```bash
+/opt/miniconda3/bin/python -m pytest \
+  tests/unit/test_artifacts.py tests/real/test_qwen_layers.py -q
+```
+
+Result: 4 passed and 12 skipped. All 12 skips were the explicit
+`LATCHMOE_RUN_REAL=1` gate for real Qwen layer comparisons; they are not
+recorded as passed real-model cases.
+
+### Current Work
+
+- Complete the correctness and graph artifact runners.
+- Replace the E2E sentinel with a real token-id artifact comparison.
+- Run the smallest real layer gate before attempting wider real-model coverage.
+
+### Graph Smoke Artifacts
+
+```bash
+/opt/miniconda3/bin/python scripts/run_graph_checks.py \
+  --mode eager --kind smoke \
+  --artifact-dir artifacts/graph-eager-smoke
+/opt/miniconda3/bin/python scripts/run_graph_checks.py \
+  --mode piecewise --kind smoke \
+  --artifact-dir artifacts/graph-piecewise-smoke
+```
+
+Both commands exited 0. The artifacts are explicitly scoped as
+`synthetic-runtime` smoke checks. Eager reported two Dynamo graphs, one graph
+break, and zero captured segments. PIECEWISE reported two Dynamo graphs, one
+graph break, and one captured CUDA Graph segment. Both reported stable slot/map
+addresses, matching replay output, and zero allocated-byte growth across the
+measured staging loop. The capture guard was checked by forcing
+`is_current_stream_capturing=True`; this is not a full-model vLLM graph claim.
+
+Artifacts:
+
+- `artifacts/graph-eager-smoke/graph_checks.json`
+- `artifacts/graph-eager-smoke/run_manifest.json`
+- `artifacts/graph-eager-smoke/artifact_inventory.json`
+- `artifacts/graph-piecewise-smoke/graph_checks.json`
+- `artifacts/graph-piecewise-smoke/run_manifest.json`
+- `artifacts/graph-piecewise-smoke/artifact_inventory.json`
+
+### Failures
+
+- The first layer-3 pytest invocation exited during setup because
+  `artifacts/qwen-layer-3`, the parent of `--basetemp`, did not exist. No model
+  weights or CUDA kernels were exercised. Resolution: create the artifact
+  directory before rerunning the exact test node. This setup error is not a
+  LatchMoE correctness result.
+
+### Real Qwen Layer 3 Gate
+
+```bash
+LATCHMOE_RUN_REAL=1 /opt/miniconda3/bin/python -m pytest \
+  'tests/real/test_qwen_layers.py::test_real_qwen_layer_matches_staged_eager_and_waves[3]' \
+  -q --junitxml=artifacts/qwen-layer-3/pytest.xml \
+  --basetemp=artifacts/qwen-layer-3/tmp
+```
+
+The corrected invocation passed one test in 18.61 seconds. The raw layer JSON
+reported eager `max_abs=0.0`; the union-128 path executed four waves covering
+128 pairs and reported `max_abs=0.005475044250488281` and
+`mean_abs=0.00021655255113728344`. Both comparisons passed the fixed
+`rtol=0.02`, `atol=0.02` threshold.
+
+Artifacts:
+
+- `artifacts/qwen-layer-3/pytest.xml`
+- `artifacts/qwen-layer-3/tmp/test_real_qwen_layer_matches_s0/layer_3.json`
+
+This is one real-layer correctness result, not an end-to-end or performance
+result.
+
+### All Manifest Layers - Real Qwen Correctness
+
+```bash
+LATCHMOE_RUN_REAL=1 /opt/miniconda3/bin/python -m pytest \
+  tests/real/test_qwen_layers.py -q \
+  --junitxml=artifacts/qwen-layers-all/pytest.xml \
+  --basetemp=artifacts/qwen-layers-all/tmp
+```
+
+The command exited 0 with 13 passed in 172.91 seconds: one checkpoint-index
+coverage test and 12 real layer comparisons. Structured parsing of the 12 raw
+layer JSON files reported:
+
+- layer ids: `[3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]`;
+- one manifest hash:
+  `55fb0e810af54f463fb8f0844698e30946d12dbedb1b476cdf01ca9633a0ed0b`;
+- eager close: 12/12; maximum absolute error: `0.0`;
+- exact-wave close: 12/12; maximum absolute error:
+  `0.014952659606933594`; maximum layer mean absolute error:
+  `0.00031606023549102247`;
+- every layer recorded four waves and 128 routed pairs.
+
+Artifacts:
+
+- `artifacts/qwen-layers-all/pytest.xml`
+- `artifacts/qwen-layers-all/tmp/**/layer_*.json` (12 raw files)
+- `artifacts/qwen-layers-all/artifact_inventory.json`
+- `artifacts/qwen-layers-all/SHA256SUMS`
+
+The initial structured-summary attempt used `jq`, which is not installed. It
+exited with `jq: command not found` and wrote no file. The successful read-only
+summary used Python's standard JSON parser. No timing or throughput claim is
+derived from these pytest durations.
+
+### Full-Model Greedy Smoke Gate
+
+The artifact runner was executed in four modes with the same frozen manifest,
+BF16, TP=1, three fixed prompts, greedy temperature 0, 16 requested output
+tokens, max model length 512, and a fixed 256 MiB KV cache request:
+
+```bash
+/opt/miniconda3/bin/python scripts/run_correctness.py \
+  --mode uva --kind smoke --artifact-dir artifacts/qwen-uva-smoke \
+  --max-tokens 16 --max-model-len 512 \
+  --gpu-memory-utilization 0.98 --kv-cache-memory-bytes 268435456
+/opt/miniconda3/bin/python scripts/run_correctness.py \
+  --mode latchmoe-eager --kind smoke \
+  --artifact-dir artifacts/qwen-eager-smoke \
+  --max-tokens 16 --max-model-len 512 \
+  --gpu-memory-utilization 0.98 --kv-cache-memory-bytes 268435456
+/opt/miniconda3/bin/python scripts/run_correctness.py \
+  --mode latchmoe-piecewise --kind smoke \
+  --artifact-dir artifacts/qwen-piecewise-smoke \
+  --max-tokens 16 --max-model-len 512 \
+  --gpu-memory-utilization 0.98 --kv-cache-memory-bytes 268435456
+/opt/miniconda3/bin/python scripts/run_correctness.py \
+  --mode latchmoe-waves --kind smoke \
+  --artifact-dir artifacts/qwen-waves-smoke \
+  --max-tokens 16 --max-model-len 512 \
+  --gpu-memory-utilization 0.98 --kv-cache-memory-bytes 268435456
+```
+
+All four commands exited 1 before weight loading. vLLM observed approximately
+6.0 GiB free out of 44.42 GiB and rejected the 0.98 utilization request for
+43.53 GiB. The device concurrently reported approximately 39 GiB in use by an
+external allocation. This is a real environment memory blocker, not a UVA or
+LatchMoE correctness result.
+
+The PIECEWISE stdout confirms vLLM parsed `enforce_eager=False` and
+`cudagraph_mode=PIECEWISE`; it does not prove full-model capture because engine
+startup failed at the memory gate. No `correctness.json`, token comparison, or
+`exact_waves` event was produced, so full-model greedy equivalence remains
+unverified.
+
+Each directory contains `run_manifest.json` with `status=failed` and
+`final_result=false`, `contract.json`, environment, worker command, stdout,
+stderr, `failure.json`, `artifact_inventory.json`, and `SHA256SUMS`:
+
+- `artifacts/qwen-uva-smoke/`
+- `artifacts/qwen-eager-smoke/`
+- `artifacts/qwen-piecewise-smoke/`
+- `artifacts/qwen-waves-smoke/`
+
+## 2026-07-14 - Review Fixes and Final Candidate Gate
+
+### Completed
+
+- Fixed real vLLM `FusedMoE` registration when its pre-existing
+  `_expert_map` attribute is `None`.
+- Kept selected real expert Parameters on the pinned HostStore through vLLM
+  post-load processing. The post-load path no longer materializes or retains a
+  complete selected expert tensor on CUDA, and replaced Parameter references
+  are collectible.
+- Verified the real vLLM Triton `quant_method.apply()` path against the full
+  reference for the selected Qwen layer layout.
+- Cleared regular slot metadata before overflow execution so a
+  regular-to-overflow-to-regular transition cannot publish a stale expert map.
+- Kept the overflow executor outside Dynamo and rejected any capture-time
+  dynamic staging.
+- Published async expert maps from persistent pinned CPU backing with a
+  nonblocking H2D copy and event lifetime guard. Stage 1 synchronous staging
+  retains synchronous map publication.
+- Replaced quadratic routed-pair duplicate checking with an O(n) set-based
+  validation.
+- Removed the controlled UVA adapter's redundant pinned backing allocation.
+- Bound manifest layer id, shape, dtype, and stride fail-closed before direct
+  loading.
+- Extended the graph leak gate to enforce both allocated and reserved CUDA
+  growth limits of 1 MiB.
+- Tightened greedy result comparison across backend roles, model revision,
+  dtype, TP, prompts, prompt token ids, sampling, and the complete eager/wave
+  policy. The UVA reference must now be eager and must not expect a wave event.
+- Closed final-result promotion bypasses. A final measurement now requires at
+  least three distinct successful child measurement manifests with identical
+  contract/source hashes, nonempty unique run ids, valid schema-1 result JSON,
+  and matching result SHA-256 values.
+- Preserved invalid-manifest and runtime failures as structured non-final
+  artifacts.
+
+### Review Findings and TDD Evidence
+
+The first focused review found four Critical issues: a real `FusedMoE`
+registration conflict, post-load full expert GPU materialization, stale slot
+metadata after overflow, and a single-run final-repetition bypass. Those issues
+were fixed before the candidate gates.
+
+A subsequent focused review found two remaining contract issues: incomplete
+child-measurement validation and incomplete UVA graph-policy validation. The
+initial regression command produced exactly two expected failures. Additional
+result schema/hash cases expanded this to seven expected failures before the
+production fix.
+
+The final independent review then reproduced two additional Important
+integrity bypasses: symlinked child/result paths could escape the run root, and
+JSON booleans/floats could pass integer equality checks. It also found two
+Minor diagnostic/coverage gaps for malformed child manifests and the complete
+UVA policy tuple. Twelve new cases failed before the fix. Physical paths now
+use strict resolution and containment checks; JSON integers exclude booleans
+and floats; result paths require strings; malformed children raise the typed
+promotion error; and all four UVA policy fields are parameterized. The focused
+suite then passed 41 tests. The same reviewer reran the bypass probes and
+reported no remaining Critical, Important, or Minor findings with a `Yes`
+readiness verdict.
+
+```bash
+/opt/miniconda3/bin/python -m pytest \
+  tests/unit/test_correctness.py tests/unit/test_artifacts.py -q
+```
+
+### Real Qwen Layer Final Candidate
+
+```bash
+LATCHMOE_RUN_REAL=1 /opt/miniconda3/bin/python -m pytest \
+  tests/real/test_qwen_layers.py -q \
+  --junitxml=artifacts/qwen-layers-final-candidate/pytest.xml \
+  --basetemp=artifacts/qwen-layers-final-candidate/tmp
+```
+
+The run exited 0 with 13 passed: one checkpoint-index coverage case and all 12
+manifest layers. The raw summary reports 12/12 eager comparisons close, 12/12
+exact-wave comparisons close, eager maximum absolute error `0.0`, exact-wave
+maximum absolute error `0.014952659606933594`, four waves per layer, and 128
+routed pairs per layer.
+
+Artifacts:
+
+- `artifacts/qwen-layers-final-candidate/pytest.xml`
+- `artifacts/qwen-layers-final-candidate/summary.json`
+- `artifacts/qwen-layers-final-candidate/tmp/**/layer_*.json`
+- `artifacts/qwen-layers-final-candidate/artifact_inventory.json`
+- `artifacts/qwen-layers-final-candidate/SHA256SUMS`
+
+This is real layer-level correctness evidence. It is not full-model greedy,
+CUDA Graph, latency, throughput, bandwidth, or capacity evidence.
+
+### Synthetic Graph Final Candidates
+
+```bash
+/opt/miniconda3/bin/python scripts/run_graph_checks.py \
+  --mode eager --kind smoke \
+  --artifact-dir artifacts/graph-eager-final-candidate
+/opt/miniconda3/bin/python scripts/run_graph_checks.py \
+  --mode piecewise --kind smoke \
+  --artifact-dir artifacts/graph-piecewise-final-candidate
+```
+
+Both commands exited 0 and explicitly record `scope=synthetic-runtime` and
+`final_result=false`. Eager captured zero segments; PIECEWISE captured one.
+Both report stable slot/map addresses, matching output, rejected capture-time
+staging, and zero allocated/reserved growth under the 1 MiB gates.
+
+Artifacts:
+
+- `artifacts/graph-eager-final-candidate/`
+- `artifacts/graph-piecewise-final-candidate/`
+
+These smoke runs do not establish full-model PIECEWISE capture or performance.
+
+### Current Full Regression
+
+```bash
+/opt/miniconda3/bin/python -m ruff format .
+/opt/miniconda3/bin/python -m pytest tests -q \
+  --junitxml=artifacts/final/pytest-final.xml
+/opt/miniconda3/bin/python -m ruff check .
+/opt/miniconda3/bin/python -m ruff format --check .
+/opt/miniconda3/bin/python \
+  benchmark/scripts/generate_offload_manifest.py --check
+git diff --check
+```
+
+The regression command exited 0 with 123 passed, 13 skipped, and 18 dependency
+deprecation warnings. The skips are the 12 explicit `LATCHMOE_RUN_REAL=1`
+layer gates and one explicit `LATCHMOE_RUN_E2E=1` full greedy gate. The real
+layer gates were run separately above. Ruff, format checking, manifest
+determinism, and `git diff --check` all exited 0.
+
+Artifact:
+
+- `artifacts/final/pytest-final.xml`
+- SHA-256:
+  `3fd9ee19376d1311da47a963e5eae1c29e3b2e027fc7aeba48d9a481cd6e9d3d`
+
+### Remaining Blocker and Next Step
+
+Full-model greedy equivalence, full vLLM PIECEWISE capture, memory feasibility,
+and performance remain unverified. All four controlled full-model smoke modes
+still stop at vLLM's startup memory gate because only approximately 6 GiB of
+the RTX A6000 is free while an external allocation consumes approximately 39
+GiB. No UVA-versus-LatchMoE performance claim can be made from the available
+artifacts.
+
+After the external allocation is released, rerun all four full-model greedy
+modes with the frozen manifest, then execute repeated measurement runs for UVA
+and each LatchMoE mode under the same workload matrix. Only those raw JSON/log
+and profiler artifacts can support the final improve/regress/workload-specific
+claim, which remains subject to user confirmation.

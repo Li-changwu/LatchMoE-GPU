@@ -8,9 +8,7 @@ from .slots import ExpertSlotBank, SlotState
 
 @dataclass(frozen=True)
 class LruPolicy:
-    def choose(
-        self, bank: ExpertSlotBank, *, excluded: set[int] | None = None
-    ) -> int:
+    def choose(self, bank: ExpertSlotBank, *, excluded: set[int] | None = None) -> int:
         excluded = excluded or set()
         empty = [
             slot
@@ -30,4 +28,3 @@ class LruPolicy:
         raise NoEvictableSlotError(
             f"no EMPTY or READY slot is evictable: states=[{states}]"
         )
-

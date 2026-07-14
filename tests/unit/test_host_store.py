@@ -1,5 +1,10 @@
+import gc
+import weakref
+
+import pytest
 import torch
 
+from vllm_latchmoe_cuda.errors import LayoutMismatchError
 from vllm_latchmoe_cuda.host_store import PinnedHostStore
 
 
@@ -31,3 +36,31 @@ def test_bind_parameter_preserves_object_and_weight_loader(
     assert param.weight_loader is loader
     assert param.data.data_ptr() == store.tensor_view(0, "w13_weight").data_ptr()
 
+
+def test_host_store_does_not_retain_replaced_parameter(
+    tiny_manifest, tiny_decoder_factory
+):
+    module = tiny_decoder_factory("cpu")
+    store = PinnedHostStore(tiny_manifest, pin_memory=False)
+    parameter = module.mlp.experts.w13_weight
+    reference = weakref.ref(parameter)
+    store.bind_parameter(0, "w13_weight", parameter)
+    module.mlp.experts.w13_weight = torch.nn.Parameter(
+        torch.empty_like(parameter), requires_grad=False
+    )
+
+    del parameter
+    gc.collect()
+
+    assert reference() is None
+
+
+def test_bind_parameter_rejects_wrong_stride(tiny_manifest):
+    store = PinnedHostStore(tiny_manifest, pin_memory=False)
+    parameter = torch.nn.Parameter(
+        torch.empty((4, 2, 4), dtype=torch.bfloat16).transpose(1, 2),
+        requires_grad=False,
+    )
+
+    with pytest.raises(LayoutMismatchError, match="stride mismatch"):
+        store.bind_parameter(0, "w13_weight", parameter)

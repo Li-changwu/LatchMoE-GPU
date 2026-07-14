@@ -13,4 +13,3 @@ def test_expert_key_json_round_trip():
     key = ExpertKey(layer_id=43, expert_id=127)
 
     assert ExpertKey.from_jsonable(key.to_jsonable()) == key
-

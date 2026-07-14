@@ -19,7 +19,7 @@ from .errors import (
 )
 from .host_store import PinnedHostStore
 from .manifest import LayerLayout
-from .profile import RuntimeCounters
+from .profile import JsonlEventWriter, RuntimeCounters
 from .transfer import (
     CudaTransferEngine,
     ExpertCopy,
@@ -43,6 +43,12 @@ class LayerMappingSnapshot:
 @dataclass(frozen=True)
 class PendingCompute:
     handle: ComputeHandle
+    event: torch.cuda.Event
+
+
+@dataclass(frozen=True)
+class PendingMapCopy:
+    cpu_map: torch.Tensor
     event: torch.cuda.Event
 
 
@@ -101,6 +107,11 @@ class CudaStagePool:
     def issue(
         self, runtime: CudaLayerRuntime, wave: WaveDescriptor, bank_id: int
     ) -> StagedWave:
+        if torch.cuda.is_current_stream_capturing():
+            raise StagingDuringCaptureError(
+                f"wave staging attempted during CUDA Graph capture: "
+                f"layer={runtime.layer_id}, wave={wave.wave_id}"
+            )
         bank = self.banks[bank_id]
         if bank.compute_done is not None:
             self.transfer_engine.stream.wait_event(bank.compute_done)
@@ -138,6 +149,7 @@ class CudaLayerRuntime:
         experts_module: nn.Module,
         device: torch.device,
         stage_pool: CudaStagePool | None = None,
+        event_writer: JsonlEventWriter | None = None,
     ):
         if device.type != "cuda":
             raise ValueError(f"CUDA runtime requires a CUDA device, got {device}")
@@ -164,14 +176,16 @@ class CudaLayerRuntime:
         self.slot_w2_parameter = w2_parameter
         self.slot_w13 = w13_parameter
         self.slot_w2 = w2_parameter
-        self.log2phy = torch.full(
-            (num_experts,), -1, dtype=torch.int32, device=device
-        )
+        self.log2phy = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
         self.expert_map = self.log2phy
         if "_expert_map" in experts_module._buffers:
             experts_module._buffers["_expert_map"] = self.expert_map
         else:
-            experts_module.register_buffer("_expert_map", self.expert_map)
+            if hasattr(experts_module, "_expert_map"):
+                delattr(experts_module, "_expert_map")
+            experts_module.register_buffer(
+                "_expert_map", self.expert_map, persistent=False
+            )
         if not hasattr(type(experts_module), "expert_map"):
             experts_module.expert_map = self.expert_map
         if hasattr(experts_module, "local_num_experts"):
@@ -190,10 +204,16 @@ class CudaLayerRuntime:
             dtype=self.host_w13.dtype,
         )
         self.last_wave_trace: WaveExecutionTrace | None = None
+        self.event_writer = event_writer
         self.mapping_version = 0
         self._active_compute: ComputeHandle | None = None
         self._pending_computes: list[PendingCompute] = []
+        self._pending_map_copies: list[PendingMapCopy] = []
         self._stable_ptrs = self.data_ptrs()
+
+    @property
+    def pending_map_copy_count(self) -> int:
+        return len(self._pending_map_copies)
 
     def data_ptrs(self) -> dict[str, int]:
         return {
@@ -211,15 +231,30 @@ class CudaLayerRuntime:
                 f"expected={self._stable_ptrs}, actual={actual}"
             )
 
+    def invalidate_main_slots(self) -> None:
+        if self._active_compute is not None or self._pending_computes:
+            raise RuntimeError(
+                f"layer {self.layer_id} cannot invalidate slots with pending compute"
+            )
+        for slot in self.bank.slots:
+            if slot.state is SlotState.READY:
+                self.bank.evict(slot.slot_id)
+            elif slot.state is not SlotState.EMPTY:
+                raise RuntimeError(
+                    f"layer {self.layer_id} cannot invalidate slot {slot.slot_id} "
+                    f"while {slot.state.value}"
+                )
+        self.log2phy.fill_(-1)
+        self.mapping_version += 1
+        self.assert_stable_addresses()
+
     def _normalize_active(self, active_experts: Iterable[int]) -> tuple[int, ...]:
         active = tuple(dict.fromkeys(int(value) for value in active_experts))
         invalid = tuple(
             value for value in active if value < 0 or value >= self.num_experts
         )
         if invalid:
-            raise ValueError(
-                f"layer {self.layer_id} has invalid expert ids: {invalid}"
-            )
+            raise ValueError(f"layer {self.layer_id} has invalid expert ids: {invalid}")
         if len(active) > self.num_slots:
             raise ActiveExpertCapacityError(
                 f"layer={self.layer_id}, active_count={len(active)}, "
@@ -270,12 +305,11 @@ class CudaLayerRuntime:
             self.counters.increment("slot_miss")
             self.counters.increment(
                 "h2d_bytes",
-                self.host_w13[expert_id].numel()
-                * self.host_w13.element_size()
+                self.host_w13[expert_id].numel() * self.host_w13.element_size()
                 + self.host_w2[expert_id].numel() * self.host_w2.element_size(),
             )
 
-        snapshot = self._publish_mapping(active, selected)
+        snapshot = self._publish_mapping(active, selected, non_blocking=False)
         self.validate_snapshot(snapshot)
         self.assert_stable_addresses()
         return snapshot
@@ -334,25 +368,41 @@ class CudaLayerRuntime:
                 selected[copy.expert_id] = lease
                 self.counters.increment(
                     "h2d_bytes",
-                    self.host_w13[copy.expert_id].numel()
-                    * self.host_w13.element_size()
+                    self.host_w13[copy.expert_id].numel() * self.host_w13.element_size()
                     + self.host_w2[copy.expert_id].numel()
                     * self.host_w2.element_size(),
                 )
 
-        snapshot = self._publish_mapping(active, selected)
+        snapshot = self._publish_mapping(active, selected, non_blocking=True)
         self.validate_snapshot(snapshot)
         self.assert_stable_addresses()
         return snapshot
 
     def _publish_mapping(
-        self, active: tuple[int, ...], selected: dict[int, SlotLease]
+        self,
+        active: tuple[int, ...],
+        selected: dict[int, SlotLease],
+        *,
+        non_blocking: bool,
     ) -> LayerMappingSnapshot:
-        cpu_map = torch.full((self.num_experts,), -1, dtype=torch.int32)
+        self._pending_map_copies = [
+            pending for pending in self._pending_map_copies if not pending.event.query()
+        ]
+        cpu_map = torch.full(
+            (self.num_experts,),
+            -1,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
         for key, slot_id in self.bank.ready_mapping().items():
             if key.layer_id == self.layer_id:
                 cpu_map[key.expert_id] = slot_id
-        self.log2phy.copy_(cpu_map, non_blocking=False)
+        self.log2phy.copy_(cpu_map, non_blocking=non_blocking)
+        if non_blocking:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.log2phy.device))
+            self._pending_map_copies.append(PendingMapCopy(cpu_map, event))
         self.mapping_version += 1
         return LayerMappingSnapshot(
             layer_id=self.layer_id,
@@ -367,14 +417,17 @@ class CudaLayerRuntime:
                 f"snapshot layer mismatch: expected={self.layer_id}, "
                 f"actual={snapshot.layer_id}"
             )
+        if snapshot.mapping_version != self.mapping_version:
+            raise StaleMappingError(
+                f"stale mapping version: layer={self.layer_id}, "
+                f"expected={self.mapping_version}, actual={snapshot.mapping_version}"
+            )
         for expert_id, lease in zip(snapshot.active_experts, snapshot.leases):
             self.bank.validate_generation(lease.slot_id, lease.generation)
-            mapped = int(self.log2phy[expert_id].item())
-            if mapped != lease.slot_id:
+            if lease.key != ExpertKey(self.layer_id, expert_id):
                 raise StaleMappingError(
-                    f"stale expert mapping: layer={self.layer_id}, "
-                    f"expert={expert_id}, expected_slot={lease.slot_id}, "
-                    f"actual_slot={mapped}"
+                    f"stale expert lease: layer={self.layer_id}, expert={expert_id}, "
+                    f"lease={lease.key}"
                 )
 
     def begin_compute(self, snapshot: LayerMappingSnapshot) -> ComputeHandle:

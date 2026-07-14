@@ -79,11 +79,14 @@ def build_payload(model_path: Path) -> dict[str, object]:
 
 
 def render(model_path: Path) -> str:
-    return json.dumps(
-        document_with_hash(build_payload(model_path)),
-        indent=2,
-        sort_keys=True,
-    ) + "\n"
+    return (
+        json.dumps(
+            document_with_hash(build_payload(model_path)),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 def main() -> int:
@@ -107,4 +110,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

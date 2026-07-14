@@ -25,7 +25,5 @@ def eager_finish_compute(runtime: CudaLayerRuntime) -> None:
 
 
 @torch.compiler.disable
-def eager_needs_exact_waves(
-    runtime: CudaLayerRuntime, topk_ids: torch.Tensor
-) -> bool:
+def eager_needs_exact_waves(runtime: CudaLayerRuntime, topk_ids: torch.Tensor) -> bool:
     return int(torch.unique(topk_ids).numel()) > runtime.num_slots

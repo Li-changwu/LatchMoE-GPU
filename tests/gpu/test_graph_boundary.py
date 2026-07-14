@@ -4,6 +4,7 @@ import torch
 from vllm_latchmoe_cuda.errors import StagingDuringCaptureError
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
 from vllm_latchmoe_cuda.runner_adapter import capturable_slot_moe
+from vllm_latchmoe_cuda.runner_adapter import execute_exact_waves
 from vllm_latchmoe_cuda.split_ops import eager_stage_and_map
 
 
@@ -18,18 +19,34 @@ def _runtime(tiny_manifest, tiny_decoder_factory):
     offloader = CudaSEWOffloader(tiny_manifest)
     offloader.wrap_modules(iter((module,)))
     torch.manual_seed(17)
-    for parameter in module.mlp.experts.parameters():
-        parameter.data.copy_(torch.randn_like(parameter, device="cpu"))
+    for name in ("w13_weight", "w2_weight"):
+        host = offloader.host_store.tensor_view(0, name)
+        host.copy_(torch.randn_like(host))
     offloader.post_init()
     return offloader.runtimes[0]
 
 
-def test_dynamic_staging_rejects_capture(monkeypatch, tiny_manifest, tiny_decoder_factory):
+def test_dynamic_staging_rejects_capture(
+    monkeypatch, tiny_manifest, tiny_decoder_factory
+):
     runtime = _runtime(tiny_manifest, tiny_decoder_factory)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with pytest.raises(StagingDuringCaptureError, match="layer=0"):
         runtime.stage_async((0, 1))
+
+
+def test_exact_wave_staging_rejects_capture(
+    monkeypatch, tiny_manifest, tiny_decoder_factory
+):
+    runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+    hidden = torch.randn((2, 2), dtype=torch.bfloat16, device="cuda")
+    ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device="cuda")
+    weights = torch.full((2, 2), 0.5, dtype=torch.float32, device="cuda")
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    with pytest.raises(StagingDuringCaptureError, match="wave staging"):
+        execute_exact_waves(runtime, hidden, ids, weights)
 
 
 def test_eager_split_produces_a_dynamo_graph_break(tiny_manifest, tiny_decoder_factory):
@@ -49,9 +66,7 @@ def test_eager_split_produces_a_dynamo_graph_break(tiny_manifest, tiny_decoder_f
     assert explanation.graph_break_count >= 1
 
 
-def test_slot_compute_can_be_captured_and_replayed(
-    tiny_manifest, tiny_decoder_factory
-):
+def test_slot_compute_can_be_captured_and_replayed(tiny_manifest, tiny_decoder_factory):
     runtime = _runtime(tiny_manifest, tiny_decoder_factory)
     topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64, device="cuda")
     topk_weights = torch.tensor(
@@ -72,4 +87,3 @@ def test_slot_compute_can_be_captured_and_replayed(
 
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
     assert runtime.data_ptrs() == pointers
-

@@ -52,4 +52,3 @@ def test_generation_changes_on_reuse_and_rejects_stale_snapshot():
     assert second.generation > first.generation
     with pytest.raises(StaleMappingError, match="generation"):
         bank.validate_generation(0, first.generation)
-

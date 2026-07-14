@@ -20,7 +20,9 @@ def load_manifest_from_env() -> OffloadManifest:
     value = os.getenv(MANIFEST_ENV)
     if not value:
         raise RuntimeError(f"{MANIFEST_ENV} must name the frozen offload manifest")
-    return OffloadManifest.load(Path(value))
+    manifest = OffloadManifest.load(Path(value))
+    manifest.validate_model_files()
+    return manifest
 
 
 def register() -> None:
@@ -50,4 +52,3 @@ def register() -> None:
     create_offloader._latchmoe_wrapped = True
     create_offloader._latchmoe_native_factory = current_factory
     runner_module.create_offloader = create_offloader
-

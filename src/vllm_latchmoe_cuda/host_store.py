@@ -13,7 +13,6 @@ from .manifest import OffloadManifest, TensorLayout
 class BoundParameter:
     layer_id: int
     name: str
-    parameter: nn.Parameter
     original_device: torch.device
 
 
@@ -70,6 +69,12 @@ class PinnedHostStore:
                 f"dtype mismatch for layer={layer_id}, parameter={name}: "
                 f"expected={view.dtype}, actual={parameter.dtype}"
             )
+        if tuple(parameter.stride()) != tuple(view.stride()):
+            raise LayoutMismatchError(
+                f"stride mismatch for layer={layer_id}, parameter={name}: "
+                f"expected={tuple(view.stride())}, "
+                f"actual={tuple(parameter.stride())}"
+            )
         key = (layer_id, name)
         if key in self._bindings:
             raise LayoutMismatchError(
@@ -78,10 +83,8 @@ class PinnedHostStore:
         binding = BoundParameter(
             layer_id=layer_id,
             name=name,
-            parameter=parameter,
             original_device=parameter.device,
         )
         parameter.data = view
         self._bindings[key] = binding
         return binding
-
