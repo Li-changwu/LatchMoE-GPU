@@ -77,8 +77,9 @@ It will instruct the operator to fail if vLLM is not exactly 0.19.1.
 ### Checkout and Installation
 
 Use branch `cuda-latchmoe` and record reference implementation commit
-`205caead34b5c27f24ae32fdbdfcd5e18936014a`. Install vLLM first, then install
-the plugin with `python -m pip install -e . --no-deps` so dependency resolution
+`205caead34b5c27f24ae32fdbdfcd5e18936014a`. Install the reference CUDA 12.8
+torch wheel, vLLM, and exact broad-dependency versions before installing the
+plugin with `python -m pip install -e . --no-deps`, so editable installation
 cannot silently replace torch or vLLM. Include an executable version-print and
 entry-point discovery check.
 
@@ -86,8 +87,10 @@ entry-point discovery check.
 
 For exact reproduction, require the model at
 `/root/models/Qwen3-30B-A3B-Instruct-2507` with revision
-`0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe`. Run the frozen manifest check and
-the model-file validation API before CUDA tests.
+`0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe`. Include a fixed-revision
+`snapshot_download` path for empty servers, then run the frozen manifest check,
+model-file validation API, and referenced-shard existence check before CUDA
+tests.
 
 If the operator must use another absolute model path, explain that regenerating
 the manifest changes its canonical hash. Every UVA and LatchMoE run in that
