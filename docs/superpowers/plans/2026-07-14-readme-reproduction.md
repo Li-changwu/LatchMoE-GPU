@@ -126,13 +126,13 @@ Run `git diff -- README.md docs/superpowers/plans/2026-07-14-readme-reproduction
 and `git status --short`. Stage only the README, plan, and synchronized README
 design spec.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git commit -m "docs: add new-server validation runbook"
 ```
 
-- [ ] **Step 3: Push the existing branch**
+- [x] **Step 3: Push the existing branch**
 
 ```bash
 git push origin cuda-latchmoe
