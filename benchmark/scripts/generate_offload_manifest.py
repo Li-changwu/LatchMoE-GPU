@@ -28,6 +28,7 @@ def build_payload(
     model_path: Path,
     revision: str = DEFAULT_REVISION,
     layers: tuple[int, ...] = LAYERS,
+    num_slots: int = 32,
 ) -> dict[str, object]:
     w13_shape = (128, 1536, 2048)
     w2_shape = (128, 2048, 768)
@@ -78,7 +79,7 @@ def build_payload(
         },
         "dtype": "bfloat16",
         "tensor_parallel_size": 1,
-        "num_slots": 32,
+        "num_slots": num_slots,
         "layers": layer_documents,
     }
 
@@ -87,10 +88,11 @@ def render(
     model_path: Path,
     revision: str = DEFAULT_REVISION,
     layers: tuple[int, ...] = LAYERS,
+    num_slots: int = 32,
 ) -> str:
     return (
         json.dumps(
-            document_with_hash(build_payload(model_path, revision, layers)),
+            document_with_hash(build_payload(model_path, revision, layers, num_slots)),
             indent=2,
             sort_keys=True,
         )
@@ -108,12 +110,15 @@ def main() -> int:
         default=",".join(str(layer_id) for layer_id in LAYERS),
         help="comma-separated sorted layer ids",
     )
+    parser.add_argument("--num-slots", type=int, default=32)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     layers = tuple(int(value) for value in args.layers.split(",") if value)
     if not layers or layers != tuple(sorted(set(layers))):
         parser.error("--layers must contain unique sorted layer ids")
-    expected = render(args.model, args.revision, layers)
+    if not 1 <= args.num_slots <= 128:
+        parser.error("--num-slots must be in [1, 128]")
+    expected = render(args.model, args.revision, layers, args.num_slots)
     if args.check:
         if not args.output.is_file() or args.output.read_text() != expected:
             print(f"manifest is stale: {args.output}")

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -61,3 +63,16 @@ def test_existing_none_expert_map_attribute_is_replaced_by_stable_buffer(
 
     assert module.mlp.experts._buffers["_expert_map"] is runtime.log2phy
     assert module.mlp.experts._expert_map.data_ptr() == runtime.log2phy.data_ptr()
+
+
+def test_full_expert_capacity_uses_identity_slots_without_stage_banks(
+    tiny_manifest, tiny_decoder_factory
+):
+    graph_manifest = replace(tiny_manifest, num_slots=tiny_manifest.model.num_experts)
+    _, offloader = _loaded_offloader(graph_manifest, tiny_decoder_factory)
+    runtime = offloader.runtimes[0]
+
+    runtime.stage_sync((3, 1))
+
+    assert runtime.stage_pool is None
+    assert runtime.log2phy.cpu().tolist() == [-1, 1, -1, 3]

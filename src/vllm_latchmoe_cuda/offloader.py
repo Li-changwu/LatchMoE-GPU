@@ -211,20 +211,21 @@ class CudaSEWOffloader(BaseOffloader):
                     w2_shape=tuple(host_w2.shape[1:]),
                     dtype=host_w13.dtype,
                 )
-                self.stage_pool = CudaStagePool(
-                    device=device,
-                    num_slots=self.manifest.num_slots,
-                    w13_shape=tuple(host_w13.shape[1:]),
-                    w2_shape=tuple(host_w2.shape[1:]),
-                    dtype=host_w13.dtype,
-                )
-            elif self.stage_pool is None:
-                raise RuntimeError("LatchMoE stage pools are partially initialized")
-            elif tuple(self.stage_pool.banks[0].w13.shape[1:]) != tuple(
-                host_w13.shape[1:]
-            ) or tuple(self.stage_pool.banks[0].w2.shape[1:]) != tuple(
-                host_w2.shape[1:]
-            ):
+                if self.manifest.num_slots < self.manifest.model.num_experts:
+                    self.stage_pool = CudaStagePool(
+                        device=device,
+                        num_slots=self.manifest.num_slots,
+                        w13_shape=tuple(host_w13.shape[1:]),
+                        w2_shape=tuple(host_w2.shape[1:]),
+                        dtype=host_w13.dtype,
+                    )
+            elif self.stage_pool is not None and tuple(
+                self.stage_pool.banks[0].w13.shape[1:]
+            ) != tuple(host_w13.shape[1:]):
+                raise RuntimeError("offloaded layers do not share one expert layout")
+            elif self.stage_pool is not None and tuple(
+                self.stage_pool.banks[0].w2.shape[1:]
+            ) != tuple(host_w2.shape[1:]):
                 raise RuntimeError("offloaded layers do not share one expert layout")
             self.runtimes[layer_id] = CudaLayerRuntime(
                 layer=self.manifest.layer(layer_id),

@@ -37,7 +37,7 @@ def test_checkpoint_index_contains_every_manifest_expert_tensor():
     reason="set LATCHMOE_RUN_REAL=1 to run real Qwen layer comparisons",
 )
 @pytest.mark.parametrize("layer_id", LAYER_IDS)
-def test_real_qwen_layer_matches_staged_eager_and_waves(layer_id, tmp_path):
+def test_real_qwen_layer_matches_staged_paths(layer_id, tmp_path):
     result = compare_qwen_layer(
         manifest_path=MANIFEST,
         layer_id=layer_id,
@@ -45,4 +45,4 @@ def test_real_qwen_layer_matches_staged_eager_and_waves(layer_id, tmp_path):
     )
 
     assert result["eager_close"] is True
-    assert result["waves_close"] is True
+    assert result["full_union_close"] is True

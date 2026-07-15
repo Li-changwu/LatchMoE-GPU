@@ -17,6 +17,61 @@ SUPPORTED_VLLM_VERSION = "0.19.1"
 MODE_ENV = "VLLM_LATCHMOE_MODE"
 MANIFEST_ENV = "VLLM_LATCHMOE_MANIFEST"
 TELEMETRY_ENV = "VLLM_LATCHMOE_TELEMETRY_PATH"
+PROFILE_ENV = "VLLM_LATCHMOE_PROFILE_PATH"
+
+
+def _instrument_cudagraph_evidence() -> None:
+    evidence_path = os.getenv(PROFILE_ENV) or os.getenv(TELEMETRY_ENV)
+    if not evidence_path:
+        return
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+    from vllm.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
+
+    if getattr(CUDAGraphWrapper, "_latchmoe_evidence_wrapped", False):
+        return
+    original_call = CUDAGraphWrapper.__call__
+    writer = JsonlEventWriter(evidence_path)
+    evidence = {"capture": False, "replay": False}
+
+    def call(self, *args, **kwargs):
+        if evidence["capture"] and evidence["replay"]:
+            return original_call(self, *args, **kwargs)
+        descriptor = None
+        runtime_mode = None
+        had_graph = False
+        if is_forward_context_available():
+            context = get_forward_context()
+            descriptor = context.batch_descriptor
+            runtime_mode = context.cudagraph_runtime_mode
+            if descriptor is not None and runtime_mode == self.runtime_mode:
+                entry = self.concrete_cudagraph_entries.get(descriptor)
+                had_graph = entry is not None and entry.cudagraph is not None
+        output = original_call(self, *args, **kwargs)
+        if descriptor is None or runtime_mode != self.runtime_mode:
+            return output
+        if had_graph and not evidence["replay"]:
+            writer.write(
+                "cudagraph_replay",
+                runtime_mode=self.runtime_mode.name,
+                batch_descriptor=str(descriptor),
+            )
+            evidence["replay"] = True
+        elif not evidence["capture"]:
+            entry = self.concrete_cudagraph_entries.get(descriptor)
+            if entry is not None and entry.cudagraph is not None:
+                writer.write(
+                    "cudagraph_capture",
+                    runtime_mode=self.runtime_mode.name,
+                    batch_descriptor=str(descriptor),
+                )
+                evidence["capture"] = True
+        return output
+
+    CUDAGraphWrapper.__call__ = call
+    CUDAGraphWrapper._latchmoe_evidence_wrapped = True
 
 
 def _instrument_stock_uva(offloader):
@@ -59,6 +114,7 @@ def register() -> None:
         raise UnsupportedVllmVersionError(
             expected=SUPPORTED_VLLM_VERSION, actual=actual_version
         )
+    _instrument_cudagraph_evidence()
     runner_module = importlib.import_module("vllm.v1.worker.gpu_model_runner")
     current_factory = runner_module.create_offloader
     if getattr(current_factory, "_latchmoe_wrapped", False):

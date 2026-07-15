@@ -718,3 +718,114 @@ only the <=32-expert fast path.
   experiment does not measure generated answer quality. Combined with the
   strict greedy mismatch above, performance and quality claims must remain
   separate.
+
+## 2026-07-15: Full-Model PIECEWISE Graph-to-Graph Measurement
+
+### Root Cause and Graph Integration
+
+The previous full-model LatchMoE path was eager and therefore did not test the
+main execution-graph claim. The graph implementation now keeps dynamic expert
+staging outside capture while placing the real vLLM modular Triton MoE kernel
+inside a captured segment:
+
+- `latchmoe::stage_experts` and `latchmoe::finish_experts` are explicit vLLM
+  PIECEWISE splitting operators.
+- `latchmoe::fused_moe_compute` is an opaque custom operator inside the captured
+  segment.
+- Graph mode uses one shared 128-slot identity pool. Logical expert `e` always
+  uses slot `e`, so weight, map, and graph-token addresses remain stable across
+  capture and replay. The pool is 1,207,959,552 bytes (1.125 GiB), not one pool
+  per layer.
+- Compile caching is disabled for benchmark servers because the vLLM AOT key
+  does not encode the Latch manifest and instance-local layer rewrites.
+- `max_num_batched_tokens` is 512 for both backends. A 2048-token Latch graph
+  compile exceeded the available A6000 memory.
+
+A correctness investigation found that vLLM advances
+`ForwardContext.moe_layer_index` inside its stock MoE custom operator. LatchMoE
+bypassed that operator without advancing the index. The first non-offloaded MoE
+layer therefore resolved to layer 0, and every later MoE layer was shifted.
+`vllm_context.advance_moe_layer_index()` now performs the same ordered advance
+in eager mode and in graph-external staging. After this fix, the Latch and UVA
+PIECEWISE smoke prompts produced the same short deterministic output.
+
+### Capture and Replay Evidence
+
+Both formal profiles contain a capture and a later replay with
+`runtime_mode=PIECEWISE`. Both servers pre-captured token sizes 1, 2, 4, and 8
+during startup. Runtime graph metrics repeatedly report PIECEWISE replay for
+decode batches. Prefill chunks such as 512 tokens report runtime mode `NONE`, so
+the supported claim is decode/mixed-batch PIECEWISE graph-to-graph, not a CUDA
+Graph for arbitrary prompt shapes.
+
+### Frozen Contract and Results
+
+- Model: `/home/lcw/model`, Qwen3-30B-A3B, BF16, TP=1.
+- Workload: 50 ShareGPT requests, seed 42, 128 forced output tokens,
+  concurrency 8, request rate `inf`, two warmups, and three repetitions.
+- Manifest:
+  `benchmark/manifests/offload_manifest.qwen3-base-ad44.first12.graph128.local.json`.
+- Manifest hash:
+  `3c5a0c8fad70caf6e1c697d2a2471b798fc93dc3158da6bfddb8f8575f51c5e5`.
+- Workload contract hash:
+  `e90a0c2fb04f968432984e64ced7ea56994c3dda53b00051b8192eaf73ec27bc`.
+- Source-state hash shared by both formal runs:
+  `855bc37b916756aa1cba66eec0ff1323454feadab9fc369d7d90f63cad272786`.
+- Both implementations actually offload `15,798,475,264` bytes.
+
+| Backend / repetition | TTFT p50 ms | TTFT p99 ms | TPOT p50 ms/token | TPOT p99 ms/token | output token/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| UVA graph / 1 | 9942.701 | 90186.894 | 578.740 | 980.697 | 9.9876 |
+| UVA graph / 2 | 9592.722 | 81067.206 | 594.548 | 927.957 | 10.1169 |
+| UVA graph / 3 | 10274.072 | 83348.327 | 569.167 | 969.359 | 10.3244 |
+| Latch graph / 1 | 4276.263 | 46739.238 | 376.666 | 690.005 | 16.1718 |
+| Latch graph / 2 | 3846.913 | 52281.366 | 377.351 | 633.805 | 16.0259 |
+| Latch graph / 3 | 4112.697 | 49741.911 | 381.442 | 587.834 | 16.2434 |
+
+The median-across-repetitions comparison is:
+
+| Metric | official UVA graph | LatchMoE graph | improvement |
+| --- | ---: | ---: | ---: |
+| TTFT p50 | 9942.701 ms | 4112.697 ms | 58.64% lower |
+| TTFT p99 | 83348.327 ms | 49741.911 ms | 40.32% lower |
+| TPOT p50 | 578.740 ms/token | 377.351 ms/token | 34.80% lower |
+| TPOT p99 | 969.359 ms/token | 633.805 ms/token | 34.62% lower |
+| Output throughput | 10.1169 token/s | 16.1718 token/s | 59.85% higher |
+
+### Interpretation and Limits
+
+Graph replay removes launch overhead for both implementations but does not make
+UVA weights device resident. Stock UVA replays kernels whose stable weight
+pointers still address pinned host memory; the GPU continues to fetch those
+weights over PCIe. LatchMoE deduplicates active experts, stages them with bulk
+H2D copies, and replays the MoE compute against HBM slots. The current graph
+path has neither cross-layer prefetch overlap nor persistent cache hits because
+all selected layers share one pool and invalidate it on owner changes. The
+measured advantage is therefore primarily the explicit DMA/HBM data path, not
+an unimplemented overlap claim.
+
+The graph pool deliberately spends 1.125 GiB of device memory that stock UVA
+does not reserve. Equal offload bytes do not imply equal free GPU memory. Stock
+UVA also selects parameters in native order while LatchMoE selects manifest
+experts plus residual stock UVA; exact parameter identities are not controlled.
+
+Generated text is not strictly deterministic across repetitions, even within
+one backend, and only 7-10 of 50 generated strings matched exactly between
+backends in the corresponding repetitions. Fixed token counts and shapes make
+this a serving-performance comparison, not proof of identical routing traces or
+answer quality. Layer-level BF16 numerical checks and the short full-model smoke
+remain the available correctness evidence.
+
+### Formal Artifacts
+
+- Official UVA graph:
+  `artifacts/sharegpt-c8-uva-piecewise-20260715-r1/`.
+- LatchMoE graph:
+  `artifacts/sharegpt-c8-latchmoe-piecewise-20260715-r1/`.
+- Comparison:
+  `artifacts/sharegpt-c8-piecewise-comparison-20260715-r1.json`.
+
+Both run manifests record `status=completed`, `exit_code=0`, and
+`final_result=true`. `sha256sum -c SHA256SUMS` passes for both directories.
+The final suite reports `161 passed, 1 skipped`; the skip is the opt-in full
+Qwen greedy comparison that requires `LATCHMOE_RUN_E2E=1`.

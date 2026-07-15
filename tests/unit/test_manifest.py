@@ -96,6 +96,16 @@ def test_manifest_rejects_overlapping_host_ranges(tmp_path: Path):
         OffloadManifest.load(path)
 
 
+def test_manifest_rejects_more_slots_than_experts(tmp_path: Path):
+    payload = _payload()
+    payload["num_slots"] = 5
+    path = tmp_path / "offload_manifest.json"
+    _write_manifest(path, payload)
+
+    with pytest.raises(ManifestValidationError, match="cannot exceed"):
+        OffloadManifest.load(path)
+
+
 def test_runtime_validation_rejects_wrong_vllm(tmp_path: Path):
     path = tmp_path / "offload_manifest.json"
     _write_manifest(path, _payload())

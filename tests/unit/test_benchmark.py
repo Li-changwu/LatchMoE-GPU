@@ -89,6 +89,30 @@ def test_latchmoe_server_does_not_enable_stock_offload(tiny_manifest):
     assert "--enforce-eager" in command
 
 
+@pytest.mark.parametrize("mode", ["uva-piecewise", "latchmoe-piecewise"])
+def test_piecewise_server_modes_use_identical_graph_policy(mode, tiny_manifest):
+    command = build_server_command(
+        python_executable="/env/bin/python",
+        mode=mode,
+        manifest=tiny_manifest,
+        host="127.0.0.1",
+        port=8026,
+        served_model_name="qwen",
+        max_num_seqs=8,
+        max_model_len=2048,
+        max_num_batched_tokens=2048,
+        kv_cache_memory_bytes=268435456,
+    )
+
+    assert "--enforce-eager" not in command
+    config = json.loads(command[command.index("--compilation-config") + 1])
+    assert config["cudagraph_mode"] == "PIECEWISE"
+    assert config["custom_ops"] == ["+unquantized_fused_moe"]
+    assert command[command.index("--max-cudagraph-capture-size") + 1] == "8"
+    assert "--cudagraph-metrics" in command
+    assert ("--cpu-offload-gb" in command) is mode.startswith("uva")
+
+
 def test_local_benchmark_environment_bypasses_proxies():
     environment = local_benchmark_environment(
         {
@@ -158,6 +182,59 @@ def test_telemetry_proves_offload_bytes_and_device_planner(tiny_manifest, tmp_pa
     assert telemetry["cuda_device_planner_events"] == 1
 
 
+@pytest.mark.parametrize("mode", ["uva-piecewise", "latchmoe-piecewise"])
+def test_piecewise_telemetry_requires_capture_and_replay(mode, tiny_manifest, tmp_path):
+    profile = tmp_path / "profile.jsonl"
+    backend_event = (
+        {
+            "event": "stock_uva",
+            "implementation": "vllm.model_executor.offloader.uva.UVAOffloader",
+            "cpu_offload_bytes": 1024,
+            "cpu_offload_max_bytes": 1024,
+        }
+        if mode.startswith("uva")
+        else {
+            "event": "residual_uva",
+            "cpu_offload_bytes": 64,
+            "cpu_offload_max_bytes": 64,
+        }
+    )
+    profile.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in (
+                backend_event,
+                {"event": "cudagraph_capture", "runtime_mode": "PIECEWISE"},
+                {"event": "cudagraph_replay", "runtime_mode": "PIECEWISE"},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    telemetry = read_offload_telemetry(mode, tiny_manifest, profile)
+
+    assert telemetry["cudagraph_captures"] == 1
+    assert telemetry["cudagraph_replays"] == 1
+    profile.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in (
+                backend_event,
+                {"event": "cudagraph_capture", "runtime_mode": "FULL"},
+                {"event": "cudagraph_replay", "runtime_mode": "FULL"},
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="capture and replay"):
+        read_offload_telemetry(mode, tiny_manifest, profile)
+    profile.write_text(json.dumps(backend_event) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="capture and replay"):
+        read_offload_telemetry(mode, tiny_manifest, profile)
+
+
 def test_comparison_uses_latency_reduction_and_throughput_gain():
     metrics = summarize_repetitions(
         [
@@ -187,3 +264,31 @@ def test_comparison_uses_latency_reduction_and_throughput_gain():
 
     assert result["metrics"]["median_ttft_ms"]["improvement_percent"] == 50
     assert result["metrics"]["output_throughput"]["improvement_percent"] == 100
+
+
+def test_piecewise_comparison_rejects_mixed_graph_policy():
+    metrics = summarize_repetitions(
+        [
+            normalize_benchmark_result(
+                _raw_result(), expected_requests=50, expected_output_len=128
+            )
+            for _ in range(3)
+        ]
+    )
+    common = {
+        "workload_contract_sha256": "a" * 64,
+        "offload_telemetry": {"actual_offload_bytes": 1024},
+        "metrics": metrics,
+    }
+
+    with pytest.raises(ValueError, match="graph policy"):
+        compare_mode_summaries(
+            {**common, "mode": "uva"},
+            {**common, "mode": "latchmoe-piecewise"},
+        )
+
+    result = compare_mode_summaries(
+        {**common, "mode": "uva-piecewise"},
+        {**common, "mode": "latchmoe-piecewise"},
+    )
+    assert result["reference_mode"] == "uva-piecewise"

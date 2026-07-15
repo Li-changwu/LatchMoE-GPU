@@ -146,32 +146,49 @@ def compare_qwen_layer(
     )
     eager_actual = eager_slot_moe(runtime, eager_hidden, eager_ids, eager_weights)
 
-    wave_ids = torch.arange(128, device=device).view(16, 8)
-    wave_weights = torch.rand((16, 8), device=device)
-    wave_weights /= wave_weights.sum(dim=-1, keepdim=True)
-    wave_hidden = torch.randn((16, 2048), dtype=torch.bfloat16, device=device)
-    wave_expected = _capturable_weights_moe(
-        full_w13, full_w2, wave_hidden, wave_ids, wave_weights
+    full_union_ids = torch.arange(128, device=device).view(16, 8)
+    full_union_weights = torch.rand((16, 8), device=device)
+    full_union_weights /= full_union_weights.sum(dim=-1, keepdim=True)
+    full_union_hidden = torch.randn((16, 2048), dtype=torch.bfloat16, device=device)
+    full_union_expected = _capturable_weights_moe(
+        full_w13,
+        full_w2,
+        full_union_hidden,
+        full_union_ids,
+        full_union_weights,
     )
-    wave_actual = execute_exact_waves(runtime, wave_hidden, wave_ids, wave_weights)
+    if runtime.stage_pool is None:
+        full_union_actual = eager_slot_moe(
+            runtime, full_union_hidden, full_union_ids, full_union_weights
+        )
+        full_union_mode = "identity_slots"
+    else:
+        full_union_actual = execute_exact_waves(
+            runtime, full_union_hidden, full_union_ids, full_union_weights
+        )
+        full_union_mode = "exact_waves"
     torch.cuda.synchronize()
 
     eager = _comparison(eager_actual, eager_expected)
-    waves = _comparison(wave_actual, wave_expected)
+    full_union = _comparison(full_union_actual, full_union_expected)
     result: dict[str, object] = {
         "layer_id": layer_id,
         "manifest_sha256": manifest.manifest_sha256,
         "eager_close": eager["close"],
         "eager_max_abs": eager["max_abs"],
         "eager_mean_abs": eager["mean_abs"],
-        "waves_close": waves["close"],
-        "waves_max_abs": waves["max_abs"],
-        "waves_mean_abs": waves["mean_abs"],
+        "full_union_close": full_union["close"],
+        "full_union_max_abs": full_union["max_abs"],
+        "full_union_mean_abs": full_union["mean_abs"],
+        "full_union_mode": full_union_mode,
         "rtol": eager["rtol"],
         "atol": eager["atol"],
-        "wave_count": len(runtime.last_wave_trace.compute_order),
-        "wave_pair_count": runtime.last_wave_trace.pair_count,
     }
+    if runtime.last_wave_trace is not None:
+        result.update(
+            wave_count=len(runtime.last_wave_trace.compute_order),
+            wave_pair_count=runtime.last_wave_trace.pair_count,
+        )
     artifact_path = Path(artifact_path)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     artifact_path.write_text(

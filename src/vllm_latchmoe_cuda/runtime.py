@@ -220,19 +220,22 @@ class CudaLayerRuntime:
         self.policy = LruPolicy()
         self.counters = RuntimeCounters()
         self.transfer_engine = self.main_slot_pool.transfer_engine
-        self.stage_pool = stage_pool or CudaStagePool(
-            device=device,
-            num_slots=num_slots,
-            w13_shape=tuple(self.host_w13.shape[1:]),
-            w2_shape=tuple(self.host_w2.shape[1:]),
-            dtype=self.host_w13.dtype,
-        )
+        self.stage_pool = stage_pool
+        if self.stage_pool is None and num_slots < num_experts:
+            self.stage_pool = CudaStagePool(
+                device=device,
+                num_slots=num_slots,
+                w13_shape=tuple(self.host_w13.shape[1:]),
+                w2_shape=tuple(self.host_w2.shape[1:]),
+                dtype=self.host_w13.dtype,
+            )
         self.last_wave_trace: WaveExecutionTrace | None = None
         self.event_writer = event_writer
         self.mapping_version = 0
         self._active_compute: ComputeHandle | None = None
         self._pending_computes: list[PendingCompute] = []
         self._pending_map_copies: list[PendingMapCopy] = []
+        self.graph_token = torch.zeros((), dtype=torch.int64, device=device)
         self._stable_ptrs = self.data_ptrs()
 
     @property
@@ -245,6 +248,7 @@ class CudaLayerRuntime:
             "slot_w2": self.slot_w2.data_ptr(),
             "log2phy": self.log2phy.data_ptr(),
             "expert_map": self.expert_map.data_ptr(),
+            "graph_token": self.graph_token.data_ptr(),
         }
 
     def assert_stable_addresses(self) -> None:
@@ -286,6 +290,11 @@ class CudaLayerRuntime:
             )
         return active
 
+    def _choose_slot(self, expert_id: int, reserved: set[int]) -> int:
+        if self.num_slots == self.num_experts:
+            return expert_id
+        return self.policy.choose(self.bank, excluded=reserved)
+
     def stage_sync(self, active_experts: Iterable[int]) -> LayerMappingSnapshot:
         self.main_slot_pool.acquire(
             self, torch.cuda.current_stream(self.slot_w13.device)
@@ -311,7 +320,7 @@ class CudaLayerRuntime:
         for expert_id in active:
             if expert_id in selected:
                 continue
-            slot_id = self.policy.choose(self.bank, excluded=reserved)
+            slot_id = self._choose_slot(expert_id, reserved)
             slot = self.bank.slots[slot_id]
             if slot.state is SlotState.READY:
                 self.bank.evict(slot_id)
@@ -370,7 +379,7 @@ class CudaLayerRuntime:
         for expert_id in active:
             if expert_id in selected:
                 continue
-            slot_id = self.policy.choose(self.bank, excluded=reserved)
+            slot_id = self._choose_slot(expert_id, reserved)
             slot = self.bank.slots[slot_id]
             if slot.state is SlotState.READY:
                 self.bank.evict(slot_id)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -11,6 +13,7 @@ from .split_ops import (
     eager_needs_exact_waves,
     eager_prepare_compute,
 )
+from .vllm_context import advance_moe_layer_index
 
 
 def capturable_slot_moe(
@@ -55,6 +58,8 @@ def execute_exact_waves(
     transfer_aware: bool = True,
     kernel_callback=None,
 ) -> torch.Tensor:
+    if runtime.stage_pool is None:
+        raise RuntimeError("exact waves require a CUDA stage pool")
     runtime.release_pending_for_transfer()
     plan = plan_device_exact_waves(
         topk_ids,
@@ -208,12 +213,61 @@ def install_vllm_forward_adapter(
         raise TypeError("shared experts are not supported by the Qwen3 target adapter")
 
     original_forward = experts_module.forward
+    graph_mode = os.getenv("VLLM_LATCHMOE_GRAPH_MODE") == "piecewise"
+    graph_runtime_id = None
+    graph_stage = None
+    graph_compute = None
+    graph_finish = None
+    if graph_mode:
+        if runtime.num_slots != runtime.num_experts:
+            raise RuntimeError(
+                "LatchMoE PIECEWISE requires one stable slot per expert: "
+                f"slots={runtime.num_slots}, experts={runtime.num_experts}"
+            )
+        from vllm.config import get_cached_compilation_config
+
+        from .graph_ops import (
+            GRAPH_SPLITTING_OPS,
+            graph_finish_experts,
+            graph_fused_moe_compute,
+            graph_stage_experts,
+            register_graph_runtime,
+        )
+
+        compilation_config = get_cached_compilation_config()
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
+        for op in GRAPH_SPLITTING_OPS:
+            if op not in compilation_config.splitting_ops:
+                compilation_config.splitting_ops.append(op)
+        graph_runtime_id = register_graph_runtime(runtime, experts_module)
+        graph_stage = graph_stage_experts
+        graph_compute = graph_fused_moe_compute
+        graph_finish = graph_finish_experts
 
     def latchmoe_forward(hidden_states: torch.Tensor, router_logits: torch.Tensor):
         topk_weights, topk_ids = experts_module.router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
+        if graph_mode:
+            assert graph_runtime_id is not None
+            assert (
+                graph_stage is not None
+                and graph_compute is not None
+                and graph_finish is not None
+            )
+            graph_stage(runtime, graph_runtime_id, topk_ids)
+            result = graph_compute(
+                runtime,
+                graph_runtime_id,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+            )
+            graph_finish(runtime, graph_runtime_id, result)
+            return None, result
+        advance_moe_layer_index(experts_module)
         if eager_needs_exact_waves(runtime, topk_ids):
 
             def original_kernel(pair_hidden, logical_ids, pair_weights):

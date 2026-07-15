@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shutdown-timeout-s", type=float, default=30.0)
     parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=2048)
-    parser.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=512)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=268435456)
     return parser.parse_args()
 
@@ -113,16 +113,19 @@ def _server_environment(
         "VLLM_LATCHMOE_MANIFEST",
         "VLLM_LATCHMOE_PROFILE_PATH",
         "VLLM_LATCHMOE_TELEMETRY_PATH",
+        "VLLM_LATCHMOE_GRAPH_MODE",
     ):
         environment.pop(name, None)
     environment.update(
         {
             "VLLM_PLUGINS": "latchmoe_cuda",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
             "HF_HUB_OFFLINE": "1",
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
-    if mode == "uva":
+    if mode.startswith("uva"):
         environment["VLLM_LATCHMOE_TELEMETRY_PATH"] = str(profile_path)
     else:
         environment.update(
@@ -132,6 +135,8 @@ def _server_environment(
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
             }
         )
+        if mode.endswith("piecewise"):
+            environment["VLLM_LATCHMOE_GRAPH_MODE"] = "piecewise"
     return environment
 
 

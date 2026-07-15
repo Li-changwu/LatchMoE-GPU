@@ -218,6 +218,8 @@ class OffloadManifest:
             raise ManifestValidationError("only tensor_parallel_size=1 is supported")
         if self.num_slots <= 0:
             raise ManifestValidationError("num_slots must be positive")
+        if self.num_slots > self.model.num_experts:
+            raise ManifestValidationError("num_slots cannot exceed model.num_experts")
         if not self.layers:
             raise ManifestValidationError("at least one offload layer is required")
         if self.layer_ids != tuple(sorted(set(self.layer_ids))):

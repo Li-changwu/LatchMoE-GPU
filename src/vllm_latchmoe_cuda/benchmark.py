@@ -12,7 +12,12 @@ from .correctness import STOCK_UVA_CPU_OFFLOAD_GB
 from .manifest import OffloadManifest, canonical_json_bytes
 
 
-BENCHMARK_MODES = ("uva", "latchmoe-eager", "latchmoe-piecewise")
+BENCHMARK_MODES = (
+    "uva",
+    "uva-piecewise",
+    "latchmoe-eager",
+    "latchmoe-piecewise",
+)
 SUMMARY_METRICS = (
     "median_ttft_ms",
     "mean_ttft_ms",
@@ -97,14 +102,25 @@ def build_server_command(
         "--seed",
         "0",
         "--no-enable-prefix-caching",
-        "--disable-log-stats",
     ]
-    if mode == "uva":
+    if mode.startswith("uva"):
         command.extend(["--cpu-offload-gb", str(STOCK_UVA_CPU_OFFLOAD_GB)])
-    if mode != "latchmoe-piecewise":
-        command.append("--enforce-eager")
+    if mode.endswith("piecewise"):
+        command.extend(
+            [
+                "--compilation-config",
+                (
+                    '{"cudagraph_mode":"PIECEWISE",'
+                    '"custom_ops":["+unquantized_fused_moe"]}'
+                ),
+                "--max-cudagraph-capture-size",
+                str(max_num_seqs),
+                "--cudagraph-metrics",
+            ]
+        )
     else:
-        command.extend(["--compilation-config", '{"cudagraph_mode":"PIECEWISE"}'])
+        command.append("--enforce-eager")
+        command.append("--disable-log-stats")
     return command
 
 
@@ -239,7 +255,26 @@ def read_offload_telemetry(
         for line in path.read_text(encoding="utf-8").splitlines()
         if line
     ]
-    if mode == "uva":
+    graph_mode = mode.endswith("piecewise")
+    captures = [
+        event
+        for event in events
+        if event.get("event") == "cudagraph_capture"
+        and event.get("runtime_mode") == "PIECEWISE"
+    ]
+    replays = [
+        event
+        for event in events
+        if event.get("event") == "cudagraph_replay"
+        and event.get("runtime_mode") == "PIECEWISE"
+    ]
+    if graph_mode and (not captures or not replays):
+        raise RuntimeError("PIECEWISE measurement has no CUDA graph capture and replay")
+    graph_telemetry = {
+        "cudagraph_captures": len(captures),
+        "cudagraph_replays": len(replays),
+    }
+    if mode.startswith("uva"):
         matches = [event for event in events if event.get("event") == "stock_uva"]
         if len(matches) != 1:
             raise RuntimeError("official UVA telemetry is missing or duplicated")
@@ -252,6 +287,7 @@ def read_offload_telemetry(
             "implementation": implementation,
             "actual_offload_bytes": int(event["cpu_offload_bytes"]),
             "configured_budget_bytes": int(event["cpu_offload_max_bytes"]),
+            **graph_telemetry,
         }
     residual = [event for event in events if event.get("event") == "residual_uva"]
     if len(residual) != 1:
@@ -263,7 +299,7 @@ def read_offload_telemetry(
         if event.get("pair_planner_mode") == "cuda_device"
         and event.get("scatter_mode") == "layer_index_add"
     ]
-    if not wave_events:
+    if not graph_mode and not wave_events:
         raise RuntimeError("ShareGPT measurement did not exercise exact waves")
     if wave_events and len(device_wave_events) != len(wave_events):
         raise RuntimeError("not every exact wave used the CUDA device planner")
@@ -279,16 +315,21 @@ def read_offload_telemetry(
         "configured_budget_bytes": manifest_bytes + int(event["cpu_offload_max_bytes"]),
         "exact_wave_events": len(wave_events),
         "cuda_device_planner_events": len(device_wave_events),
+        **graph_telemetry,
     }
 
 
 def compare_mode_summaries(
     uva: dict[str, Any], latchmoe: dict[str, Any]
 ) -> dict[str, Any]:
-    if uva.get("mode") != "uva":
+    reference_mode = str(uva.get("mode", ""))
+    candidate_mode = str(latchmoe.get("mode", ""))
+    if not reference_mode.startswith("uva"):
         raise ValueError("reference summary must be official UVA")
-    if not str(latchmoe.get("mode", "")).startswith("latchmoe-"):
+    if not candidate_mode.startswith("latchmoe-"):
         raise ValueError("candidate summary must be LatchMoE")
+    if reference_mode.endswith("piecewise") != candidate_mode.endswith("piecewise"):
+        raise ValueError("benchmark graph policy differs")
     if uva.get("workload_contract_sha256") != latchmoe.get("workload_contract_sha256"):
         raise ValueError("benchmark workload contracts differ")
     uva_bytes = uva["offload_telemetry"]["actual_offload_bytes"]
@@ -316,8 +357,8 @@ def compare_mode_summaries(
         }
     return {
         "schema_version": 1,
-        "reference_mode": "uva",
-        "candidate_mode": latchmoe["mode"],
+        "reference_mode": reference_mode,
+        "candidate_mode": candidate_mode,
         "workload_contract_sha256": uva["workload_contract_sha256"],
         "actual_offload_bytes": uva_bytes,
         "metrics": comparison,
