@@ -31,7 +31,8 @@ from vllm_latchmoe_cuda.manifest import OffloadManifest
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = (
-    ROOT / "benchmark/manifests/offload_manifest.qwen3-base-ad44.first12.local.json"
+    ROOT / "benchmark/manifests/"
+    "offload_manifest.qwen3-base-ad44.first12.graph128.local.json"
 )
 DEFAULT_DATASET = Path("/home/lcw/datasets/ShareGPT_V3_unfiltered_cleaned_split.json")
 SHAREGPT_REVISION = "192ab2185289094fc556ec8ce5ce1e8e587154ca"
@@ -204,11 +205,16 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "seed": args.seed,
         "request_rate": "inf",
         "max_concurrency": args.max_concurrency,
+        "warmup_requests": args.warmup_requests,
+        "repetitions": args.repetitions,
         "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "kv_cache_memory_bytes": args.kv_cache_memory_bytes,
+        "gpu_memory_utilization": 0.98,
         "prefix_caching": False,
+        "server_log_stats": False,
+        "compile_cache": False,
     }
     workload_contract_sha256 = payload_sha256(workload_contract)
     mode_contract = {**workload_contract, "mode": args.mode}
@@ -333,6 +339,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "mode": args.mode,
         "workload_contract_sha256": workload_contract_sha256,
         "mode_contract_sha256": mode_contract_sha256,
+        "source_state_sha256": source_state_sha256,
         "dataset_sha256": dataset_sha256,
         "repetitions": args.repetitions,
         "offload_telemetry": telemetry,

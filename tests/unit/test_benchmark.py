@@ -5,6 +5,7 @@ import pytest
 from vllm_latchmoe_cuda.benchmark import (
     build_client_command,
     build_server_command,
+    compare_ablation_summaries,
     compare_mode_summaries,
     local_benchmark_environment,
     normalize_benchmark_result,
@@ -63,6 +64,7 @@ def test_commands_lock_official_uva_and_identical_sharegpt_workload(tiny_manifes
     assert server[0] == "/env/bin/vllm"
     assert server[server.index("--cpu-offload-gb") + 1] == "14.0"
     assert "--enforce-eager" in server
+    assert "--disable-log-stats" in server
     assert "--no-enable-prefix-caching" in server
     assert client[client.index("--dataset-name") + 1] == "sharegpt"
     assert client[client.index("--num-prompts") + 1] == "50"
@@ -109,7 +111,8 @@ def test_piecewise_server_modes_use_identical_graph_policy(mode, tiny_manifest):
     assert config["cudagraph_mode"] == "PIECEWISE"
     assert config["custom_ops"] == ["+unquantized_fused_moe"]
     assert command[command.index("--max-cudagraph-capture-size") + 1] == "8"
-    assert "--cudagraph-metrics" in command
+    assert "--disable-log-stats" in command
+    assert "--cudagraph-metrics" not in command
     assert ("--cpu-offload-gb" in command) is mode.startswith("uva")
 
 
@@ -292,3 +295,66 @@ def test_piecewise_comparison_rejects_mixed_graph_policy():
         {**common, "mode": "latchmoe-piecewise"},
     )
     assert result["reference_mode"] == "uva-piecewise"
+
+
+def test_ablation_comparison_requires_one_contract_source_and_offload_budget():
+    metrics = summarize_repetitions(
+        [
+            normalize_benchmark_result(
+                _raw_result(), expected_requests=50, expected_output_len=128
+            )
+            for _ in range(3)
+        ]
+    )
+    faster = summarize_repetitions(
+        [
+            normalize_benchmark_result(
+                _raw_result(0.5), expected_requests=50, expected_output_len=128
+            )
+            for _ in range(3)
+        ]
+    )
+    common = {
+        "workload_contract_sha256": "a" * 64,
+        "source_state_sha256": "b" * 64,
+        "offload_telemetry": {"actual_offload_bytes": 1024},
+    }
+    summaries = {
+        "uva_eager": {**common, "mode": "uva", "metrics": metrics},
+        "uva_piecewise": {
+            **common,
+            "mode": "uva-piecewise",
+            "metrics": faster,
+        },
+        "latchmoe_eager": {
+            **common,
+            "mode": "latchmoe-eager",
+            "metrics": faster,
+        },
+        "latchmoe_piecewise": {
+            **common,
+            "mode": "latchmoe-piecewise",
+            "metrics": faster,
+        },
+    }
+
+    result = compare_ablation_summaries(**summaries)
+
+    assert (
+        result["graph_effect"]["uva"]["metrics"]["median_tpot_ms"][
+            "improvement_percent"
+        ]
+        == 50
+    )
+    assert (
+        result["latchmoe_effect"]["piecewise"]["metrics"]["output_throughput"][
+            "improvement_percent"
+        ]
+        == 0
+    )
+    summaries["latchmoe_piecewise"] = {
+        **summaries["latchmoe_piecewise"],
+        "source_state_sha256": "c" * 64,
+    }
+    with pytest.raises(ValueError, match="source states differ"):
+        compare_ablation_summaries(**summaries)

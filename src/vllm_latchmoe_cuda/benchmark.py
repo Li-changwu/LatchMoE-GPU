@@ -102,6 +102,7 @@ def build_server_command(
         "--seed",
         "0",
         "--no-enable-prefix-caching",
+        "--disable-log-stats",
     ]
     if mode.startswith("uva"):
         command.extend(["--cpu-offload-gb", str(STOCK_UVA_CPU_OFFLOAD_GB)])
@@ -115,12 +116,10 @@ def build_server_command(
                 ),
                 "--max-cudagraph-capture-size",
                 str(max_num_seqs),
-                "--cudagraph-metrics",
             ]
         )
     else:
         command.append("--enforce-eager")
-        command.append("--disable-log-stats")
     return command
 
 
@@ -362,4 +361,83 @@ def compare_mode_summaries(
         "workload_contract_sha256": uva["workload_contract_sha256"],
         "actual_offload_bytes": uva_bytes,
         "metrics": comparison,
+    }
+
+
+def _compare_execution_policies(
+    eager: dict[str, Any], piecewise: dict[str, Any]
+) -> dict[str, Any]:
+    comparison: dict[str, Any] = {}
+    for metric in SUMMARY_METRICS:
+        eager_value = float(eager["metrics"][metric]["median"])
+        piecewise_value = float(piecewise["metrics"][metric]["median"])
+        if metric.endswith("throughput"):
+            change = (piecewise_value / eager_value - 1.0) * 100.0
+            direction = "higher_is_better"
+        else:
+            change = (eager_value - piecewise_value) / eager_value * 100.0
+            direction = "lower_is_better"
+        comparison[metric] = {
+            "eager": eager_value,
+            "piecewise": piecewise_value,
+            "improvement_percent": change,
+            "direction": direction,
+        }
+    return {
+        "eager_mode": eager["mode"],
+        "piecewise_mode": piecewise["mode"],
+        "metrics": comparison,
+    }
+
+
+def compare_ablation_summaries(
+    *,
+    uva_eager: dict[str, Any],
+    uva_piecewise: dict[str, Any],
+    latchmoe_eager: dict[str, Any],
+    latchmoe_piecewise: dict[str, Any],
+) -> dict[str, Any]:
+    summaries = {
+        "uva": uva_eager,
+        "uva-piecewise": uva_piecewise,
+        "latchmoe-eager": latchmoe_eager,
+        "latchmoe-piecewise": latchmoe_piecewise,
+    }
+    for expected_mode, summary in summaries.items():
+        if summary.get("mode") != expected_mode:
+            raise ValueError(
+                f"expected {expected_mode} summary, got {summary.get('mode')!r}"
+            )
+
+    workload_hashes = {
+        summary.get("workload_contract_sha256") for summary in summaries.values()
+    }
+    if len(workload_hashes) != 1 or None in workload_hashes:
+        raise ValueError("2x2 benchmark workload contracts differ")
+    source_hashes = {
+        summary.get("source_state_sha256") for summary in summaries.values()
+    }
+    if len(source_hashes) != 1 or None in source_hashes:
+        raise ValueError("2x2 benchmark source states differ")
+    offload_bytes = {
+        int(summary["offload_telemetry"]["actual_offload_bytes"])
+        for summary in summaries.values()
+    }
+    if len(offload_bytes) != 1:
+        raise ValueError("2x2 benchmark actual offload bytes differ")
+
+    return {
+        "schema_version": 1,
+        "design": "offloader_x_execution_policy_2x2",
+        "workload_contract_sha256": workload_hashes.pop(),
+        "source_state_sha256": source_hashes.pop(),
+        "actual_offload_bytes": offload_bytes.pop(),
+        "latchmoe_effect": {
+            "eager": compare_mode_summaries(uva_eager, latchmoe_eager),
+            "piecewise": compare_mode_summaries(uva_piecewise, latchmoe_piecewise),
+        },
+        "graph_effect": {
+            "uva": _compare_execution_policies(uva_eager, uva_piecewise),
+            "latchmoe": _compare_execution_policies(latchmoe_eager, latchmoe_piecewise),
+        },
     }
