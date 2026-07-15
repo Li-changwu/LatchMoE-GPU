@@ -5,6 +5,7 @@ from collections.abc import Generator
 from types import MethodType
 from typing import Any
 
+import torch
 from torch import nn
 from vllm.model_executor.offloader.base import BaseOffloader
 
@@ -59,6 +60,20 @@ def _resolve_parameter(module: nn.Module, dotted_name: str) -> nn.Parameter:
     return current
 
 
+def _move_unbound_state_to_device(
+    module: nn.Module,
+    *,
+    device: torch.device,
+    bound_parameter_ids: set[int],
+) -> None:
+    for parameter in module.parameters():
+        if id(parameter) not in bound_parameter_ids and parameter.device != device:
+            parameter.data = parameter.data.to(device)
+    for buffer in module.buffers():
+        if buffer.device != device:
+            buffer.data = buffer.data.to(device)
+
+
 class CudaSEWOffloader(BaseOffloader):
     """Manifest-selected CUDA expert offloader attached by make_layers()."""
 
@@ -89,20 +104,47 @@ class CudaSEWOffloader(BaseOffloader):
         self._wrapped = True
         modules: list[nn.Module] = []
         selected = set(self.manifest.layer_ids)
-        for relative_index, module in enumerate(modules_generator):
+        modules_iterator = iter(modules_generator)
+        relative_index = 0
+        while True:
             layer_id = self.first_layer_id + relative_index
+            target_device = torch.get_default_device()
+            construct_on_cpu = layer_id in selected and target_device.type != "cpu"
+            try:
+                if construct_on_cpu:
+                    with torch.device("cpu"):
+                        module = next(modules_iterator)
+                else:
+                    module = next(modules_iterator)
+            except StopIteration:
+                break
             modules.append(module)
             if layer_id not in selected:
+                relative_index += 1
                 continue
             layout = self.manifest.layer(layer_id)
+            bound_parameter_ids: set[int] = set()
             for tensor in layout.tensors:
                 parameter = _resolve_parameter(module, tensor.parameter_name)
-                self.host_store.bind_parameter(layer_id, tensor.name, parameter)
+                self.host_store.bind_parameter(
+                    layer_id,
+                    tensor.name,
+                    parameter,
+                    original_device=target_device if construct_on_cpu else None,
+                )
+                bound_parameter_ids.add(id(parameter))
                 self.bound_parameter_names.add(
                     f"model.layers.{layer_id}.{tensor.parameter_name}"
                 )
+            if construct_on_cpu:
+                _move_unbound_state_to_device(
+                    module,
+                    device=target_device,
+                    bound_parameter_ids=bound_parameter_ids,
+                )
             _install_post_load_filter(module.get_submodule("mlp.experts"))
             self.bound_layers[layer_id] = module
+            relative_index += 1
         return modules
 
     def post_init(self) -> None:

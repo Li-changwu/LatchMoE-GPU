@@ -1,10 +1,40 @@
 import pytest
 import torch
+from torch import nn
 
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
 
 
 pytestmark = pytest.mark.cuda
+
+
+class _LazyExperts(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w13_weight = nn.Parameter(
+            torch.empty((4, 4, 2), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.w2_weight = nn.Parameter(
+            torch.empty((4, 2, 2), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.w13_weight.weight_loader = lambda *args, **kwargs: True
+        self.w2_weight.weight_loader = lambda *args, **kwargs: True
+
+
+class _LazyMlp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = _LazyExperts()
+
+
+class _LazyDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = _LazyMlp()
+        self.non_expert = nn.Parameter(
+            torch.empty((2, 2), dtype=torch.bfloat16), requires_grad=False
+        )
+        self.register_buffer("state_buffer", torch.empty(2, dtype=torch.bfloat16))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -27,6 +57,31 @@ def test_wrap_modules_redirects_before_checkpoint_load(
     assert w2_parameter.device.type == "cpu"
     assert w13_parameter.is_pinned()
     assert w2_parameter.is_pinned()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_selected_lazy_layer_constructs_experts_off_device(tiny_manifest):
+    observed_devices: list[str] = []
+
+    def modules():
+        module = _LazyDecoder()
+        observed_devices.append(module.mlp.experts.w13_weight.device.type)
+        yield module
+
+    offloader = CudaSEWOffloader(tiny_manifest)
+    with torch.device("cuda"):
+        (module,) = offloader.wrap_modules(modules())
+
+    assert observed_devices == ["cpu"]
+    assert module.mlp.experts.w13_weight.device.type == "cpu"
+    assert module.mlp.experts.w2_weight.device.type == "cpu"
+    assert module.non_expert.device.type == "cuda"
+    assert module.state_buffer.device.type == "cuda"
+    assert offloader.host_store.bindings[0].original_device.type == "cuda"
+
+    offloader.post_init()
+
+    assert offloader.runtimes[0].slot_w13.device.type == "cuda"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

@@ -56,7 +56,12 @@ class PinnedHostStore:
             raise KeyError(f"no host tensor for layer={layer_id}, name={name}") from exc
 
     def bind_parameter(
-        self, layer_id: int, name: str, parameter: nn.Parameter
+        self,
+        layer_id: int,
+        name: str,
+        parameter: nn.Parameter,
+        *,
+        original_device: torch.device | None = None,
     ) -> BoundParameter:
         view = self.tensor_view(layer_id, name)
         if tuple(parameter.shape) != tuple(view.shape):
@@ -83,7 +88,9 @@ class PinnedHostStore:
         binding = BoundParameter(
             layer_id=layer_id,
             name=name,
-            original_device=parameter.device,
+            original_device=(
+                parameter.device if original_device is None else original_device
+            ),
         )
         parameter.data = view
         self._bindings[key] = binding
