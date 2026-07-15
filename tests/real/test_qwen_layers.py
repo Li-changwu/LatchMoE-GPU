@@ -15,6 +15,7 @@ MANIFEST = Path(
         str(ROOT / "benchmark/manifests/offload_manifest.json"),
     )
 )
+LAYER_IDS = OffloadManifest.load(MANIFEST).layer_ids
 
 
 def test_checkpoint_index_contains_every_manifest_expert_tensor():
@@ -35,7 +36,7 @@ def test_checkpoint_index_contains_every_manifest_expert_tensor():
     os.getenv("LATCHMOE_RUN_REAL") != "1",
     reason="set LATCHMOE_RUN_REAL=1 to run real Qwen layer comparisons",
 )
-@pytest.mark.parametrize("layer_id", [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47])
+@pytest.mark.parametrize("layer_id", LAYER_IDS)
 def test_real_qwen_layer_matches_staged_eager_and_waves(layer_id, tmp_path):
     result = compare_qwen_layer(
         manifest_path=MANIFEST,

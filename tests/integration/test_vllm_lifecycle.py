@@ -11,7 +11,11 @@ from vllm.model_executor.model_loader.utils import device_loading_context
 from vllm.v1.worker.workspace import init_workspace_manager
 
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
-from vllm_latchmoe_cuda.runner_adapter import capturable_slot_moe
+from vllm_latchmoe_cuda.runner_adapter import (
+    _capturable_weights_moe,
+    capturable_slot_moe,
+    execute_exact_waves,
+)
 
 
 pytestmark = [
@@ -87,6 +91,8 @@ def test_real_triton_quant_method_uses_staged_slots_and_expert_map(tiny_manifest
     offloader.host_store.tensor_view(0, "w2_weight").copy_(
         torch.randn_like(offloader.host_store.tensor_view(0, "w2_weight"))
     )
+    full_w13 = offloader.host_store.tensor_view(0, "w13_weight").to("cuda")
+    full_w2 = offloader.host_store.tensor_view(0, "w2_weight").to("cuda")
     with device_loading_context(experts, torch.device("cuda")):
         experts.quant_method.process_weights_after_loading(experts)
     offloader.post_init()
@@ -110,3 +116,32 @@ def test_real_triton_quant_method_uses_staged_slots_and_expert_map(tiny_manifest
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+    wave_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device="cuda")
+    wave_weights = torch.tensor(
+        [[0.6, 0.4], [0.25, 0.75]], dtype=torch.float32, device="cuda"
+    )
+
+    def kernel_callback(pair_hidden, logical_ids, pair_weights):
+        return experts.quant_method.apply(
+            layer=experts,
+            x=pair_hidden,
+            topk_weights=pair_weights,
+            topk_ids=logical_ids,
+            shared_experts_input=pair_hidden,
+        )
+
+    wave_expected = _capturable_weights_moe(
+        full_w13, full_w2, hidden, wave_ids, wave_weights
+    )
+    wave_actual = execute_exact_waves(
+        runtime,
+        hidden.clone(),
+        wave_ids,
+        wave_weights,
+        kernel_callback=kernel_callback,
+    )
+
+    torch.testing.assert_close(
+        wave_actual.float(), wave_expected.float(), rtol=2e-2, atol=2e-2
+    )

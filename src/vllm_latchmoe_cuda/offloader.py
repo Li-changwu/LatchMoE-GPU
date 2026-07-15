@@ -191,6 +191,18 @@ class CudaSEWOffloader(BaseOffloader):
             device = bindings["w13_weight"].original_device
             host_w13 = self.host_store.tensor_view(layer_id, "w13_weight")
             host_w2 = self.host_store.tensor_view(layer_id, "w2_weight")
+            if self.event_writer is not None:
+                intermediate = host_w2.shape[-1]
+                self.event_writer.write(
+                    "host_store_sample",
+                    layer_id=layer_id,
+                    gate_0_0=float(host_w13[0, 0, 0]),
+                    up_0_0=float(host_w13[0, intermediate, 0]),
+                    down_0_0=float(host_w2[0, 0, 0]),
+                    gate_last=float(host_w13[-1, intermediate - 1, -1]),
+                    up_last=float(host_w13[-1, -1, -1]),
+                    down_last=float(host_w2[-1, -1, -1]),
+                )
             if self.main_slot_pool is None:
                 self.main_slot_pool = CudaMainSlotPool(
                     device=device,
