@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import statistics
 from pathlib import Path
 from typing import Any, Sequence
@@ -22,6 +23,24 @@ SUMMARY_METRICS = (
     "output_throughput",
     "request_throughput",
 )
+
+
+def local_benchmark_environment(
+    environment: dict[str, str] | None = None,
+) -> dict[str, str]:
+    result = dict(os.environ if environment is None else environment)
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        result.pop(name, None)
+    result["NO_PROXY"] = "127.0.0.1,localhost"
+    result["no_proxy"] = "127.0.0.1,localhost"
+    return result
 
 
 def file_sha256(path: str | Path) -> str:

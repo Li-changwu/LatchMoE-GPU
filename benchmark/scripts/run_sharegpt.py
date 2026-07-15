@@ -20,6 +20,7 @@ from vllm_latchmoe_cuda.benchmark import (
     build_client_command,
     build_server_command,
     file_sha256,
+    local_benchmark_environment,
     normalize_benchmark_result,
     payload_sha256,
     read_offload_telemetry,
@@ -281,6 +282,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
                 completed = subprocess.run(
                     client_command,
                     cwd=ROOT,
+                    env=local_benchmark_environment(),
                     stdout=client_log,
                     stderr=subprocess.STDOUT,
                     text=True,

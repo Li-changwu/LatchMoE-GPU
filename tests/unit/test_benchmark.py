@@ -6,6 +6,7 @@ from vllm_latchmoe_cuda.benchmark import (
     build_client_command,
     build_server_command,
     compare_mode_summaries,
+    local_benchmark_environment,
     normalize_benchmark_result,
     read_offload_telemetry,
     summarize_repetitions,
@@ -86,6 +87,22 @@ def test_latchmoe_server_does_not_enable_stock_offload(tiny_manifest):
 
     assert "--cpu-offload-gb" not in command
     assert "--enforce-eager" in command
+
+
+def test_local_benchmark_environment_bypasses_proxies():
+    environment = local_benchmark_environment(
+        {
+            "HTTP_PROXY": "socks5://proxy:1080",
+            "https_proxy": "socks5://proxy:1080",
+            "PATH": "/bin",
+        }
+    )
+
+    assert "HTTP_PROXY" not in environment
+    assert "https_proxy" not in environment
+    assert environment["NO_PROXY"] == "127.0.0.1,localhost"
+    assert environment["no_proxy"] == "127.0.0.1,localhost"
+    assert environment["PATH"] == "/bin"
 
 
 def test_normalize_and_summarize_require_three_complete_fixed_length_runs():
