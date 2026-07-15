@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from vllm_latchmoe_cuda.correctness import (
+    STOCK_UVA_CPU_OFFLOAD_GB,
     CorrectnessMismatchError,
     build_engine_kwargs,
     compare_greedy_results,
@@ -81,6 +82,43 @@ def test_engine_kwargs_lock_target_and_piecewise_mode(tiny_manifest):
     assert kwargs["tensor_parallel_size"] == 1
     assert kwargs["enforce_eager"] is False
     assert kwargs["compilation_config"] == {"cudagraph_mode": "PIECEWISE"}
+
+
+def test_engine_kwargs_enable_stock_uva_with_fixed_budget(tiny_manifest):
+    kwargs = build_engine_kwargs(
+        manifest=tiny_manifest,
+        mode=resolve_correctness_mode("uva"),
+        max_model_len=512,
+        gpu_memory_utilization=0.98,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+    )
+
+    assert kwargs["cpu_offload_gb"] == STOCK_UVA_CPU_OFFLOAD_GB == 14.0
+
+
+def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
+    from scripts.run_correctness import _worker_environment
+
+    monkeypatch.setenv("VLLM_LATCHMOE_MODE", "stale")
+    monkeypatch.setenv("VLLM_LATCHMOE_MANIFEST", "stale")
+    monkeypatch.setenv("VLLM_LATCHMOE_PROFILE_PATH", "stale")
+    manifest_path = Path("tiny_manifest.json")
+    profile_path = Path("profile.jsonl")
+
+    uva = _worker_environment(
+        resolve_correctness_mode("uva"), manifest_path, profile_path
+    )
+    latchmoe = _worker_environment(
+        resolve_correctness_mode("latchmoe-eager"), manifest_path, profile_path
+    )
+
+    assert uva["VLLM_PLUGINS"] == "latchmoe_cuda"
+    assert "VLLM_LATCHMOE_MODE" not in uva
+    assert "VLLM_LATCHMOE_MANIFEST" not in uva
+    assert "VLLM_LATCHMOE_PROFILE_PATH" not in uva
+    assert latchmoe["VLLM_LATCHMOE_MODE"] == "latchmoe"
+    assert latchmoe["VLLM_LATCHMOE_MANIFEST"] == str(manifest_path)
+    assert latchmoe["VLLM_LATCHMOE_PROFILE_PATH"] == str(profile_path)
 
 
 def test_greedy_comparison_requires_exact_token_ids():

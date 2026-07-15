@@ -12,6 +12,9 @@ class CorrectnessMismatchError(AssertionError):
     pass
 
 
+STOCK_UVA_CPU_OFFLOAD_GB = 14.0
+
+
 @dataclass(frozen=True)
 class CorrectnessMode:
     name: str
@@ -179,7 +182,7 @@ def build_engine_kwargs(
     compilation_config = None
     if not mode.enforce_eager:
         compilation_config = {"cudagraph_mode": "PIECEWISE"}
-    return {
+    kwargs: dict[str, object] = {
         "model": manifest.model.path,
         "revision": manifest.model.revision,
         "dtype": "bfloat16",
@@ -192,6 +195,9 @@ def build_engine_kwargs(
         "seed": 0,
         "disable_log_stats": True,
     }
+    if mode.name == "uva":
+        kwargs["cpu_offload_gb"] = STOCK_UVA_CPU_OFFLOAD_GB
+    return kwargs
 
 
 def run_vllm_greedy(
@@ -257,6 +263,9 @@ def run_vllm_greedy(
         "model_revision": manifest.model.revision,
         "dtype": manifest.dtype,
         "tensor_parallel_size": manifest.tensor_parallel_size,
+        "uva_implementation": "vllm-stock" if mode.name == "uva" else None,
+        "cpu_offload_gb": STOCK_UVA_CPU_OFFLOAD_GB if mode.name == "uva" else 0.0,
+        "manifest_controls_offload_selection": mode.name != "uva",
         "prompts": list(prompts),
         "sampling": {"temperature": 0.0, "max_tokens": max_tokens, "seed": 0},
         "outputs": outputs,

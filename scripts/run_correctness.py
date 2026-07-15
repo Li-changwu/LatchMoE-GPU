@@ -10,6 +10,8 @@ from pathlib import Path
 
 from vllm_latchmoe_cuda.artifacts import ArtifactRun, RunKind
 from vllm_latchmoe_cuda.correctness import (
+    STOCK_UVA_CPU_OFFLOAD_GB,
+    CorrectnessMode,
     compare_greedy_results,
     load_prompts,
     require_greedy_match,
@@ -128,6 +130,34 @@ def _environment() -> dict[str, object]:
     return snapshot
 
 
+def _worker_environment(
+    mode: CorrectnessMode, manifest_path: Path, profile_path: Path
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    for key in (
+        "VLLM_LATCHMOE_MODE",
+        "VLLM_LATCHMOE_MANIFEST",
+        "VLLM_LATCHMOE_PROFILE_PATH",
+    ):
+        environment.pop(key, None)
+    environment.update(
+        {
+            "VLLM_PLUGINS": "latchmoe_cuda",
+            "HF_HUB_OFFLINE": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+        }
+    )
+    if mode.backend == "latchmoe":
+        environment.update(
+            {
+                "VLLM_LATCHMOE_MODE": mode.backend,
+                "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
+                "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
+            }
+        )
+    return environment
+
+
 def _execute_driver(args, run: ArtifactRun) -> None:
     manifest = OffloadManifest.load(args.manifest)
     manifest.validate_model_files()
@@ -147,6 +177,9 @@ def _execute_driver(args, run: ArtifactRun) -> None:
             "backend": mode.backend,
             "enforce_eager": mode.enforce_eager,
             "expect_waves": mode.expect_waves,
+            "uva_implementation": "vllm-stock" if mode.name == "uva" else None,
+            "cpu_offload_gb": (STOCK_UVA_CPU_OFFLOAD_GB if mode.name == "uva" else 0.0),
+            "manifest_controls_offload_selection": mode.name != "uva",
         },
     )
     result_path = run.path / "correctness.json"
@@ -175,16 +208,10 @@ def _execute_driver(args, run: ArtifactRun) -> None:
     if args.prompts_json is not None:
         worker_command.extend(["--prompts-json", str(args.prompts_json.resolve())])
     run.write_json("worker_command.json", worker_command)
-    environment = os.environ.copy()
-    environment.update(
-        {
-            "VLLM_PLUGINS": "latchmoe_cuda",
-            "VLLM_LATCHMOE_MODE": mode.backend,
-            "VLLM_LATCHMOE_MANIFEST": str(args.manifest.resolve()),
-            "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path.resolve()),
-            "HF_HUB_OFFLINE": "1",
-            "TOKENIZERS_PARALLELISM": "false",
-        }
+    environment = _worker_environment(
+        mode,
+        args.manifest.resolve(),
+        profile_path.resolve(),
     )
     with (
         (run.path / "stdout.log").open("w", encoding="utf-8") as stdout,
