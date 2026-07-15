@@ -12,6 +12,7 @@ from vllm_latchmoe_cuda.manifest import document_with_hash
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = Path("/root/models/Qwen3-30B-A3B-Instruct-2507")
 DEFAULT_OUTPUT = ROOT / "benchmark/manifests/offload_manifest.json"
+DEFAULT_REVISION = "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
 LAYERS = (3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47)
 
 
@@ -23,7 +24,9 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_payload(model_path: Path) -> dict[str, object]:
+def build_payload(
+    model_path: Path, revision: str = DEFAULT_REVISION
+) -> dict[str, object]:
     w13_shape = (128, 1536, 2048)
     w2_shape = (128, 2048, 768)
     w13_numel = 128 * 1536 * 2048
@@ -60,7 +63,7 @@ def build_payload(model_path: Path) -> dict[str, object]:
         "schema_version": 1,
         "model": {
             "path": str(model_path),
-            "revision": "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
+            "revision": revision,
             "config_sha256": sha256_file(model_path / "config.json"),
             "weight_index_sha256": sha256_file(
                 model_path / "model.safetensors.index.json"
@@ -78,10 +81,10 @@ def build_payload(model_path: Path) -> dict[str, object]:
     }
 
 
-def render(model_path: Path) -> str:
+def render(model_path: Path, revision: str = DEFAULT_REVISION) -> str:
     return (
         json.dumps(
-            document_with_hash(build_payload(model_path)),
+            document_with_hash(build_payload(model_path, revision)),
             indent=2,
             sort_keys=True,
         )
@@ -93,9 +96,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    expected = render(args.model)
+    expected = render(args.model, args.revision)
     if args.check:
         if not args.output.is_file() or args.output.read_text() != expected:
             print(f"manifest is stale: {args.output}")

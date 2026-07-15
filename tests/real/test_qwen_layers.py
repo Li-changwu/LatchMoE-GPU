@@ -9,7 +9,12 @@ from vllm_latchmoe_cuda.real_weights import compare_qwen_layer, layer_checkpoint
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MANIFEST = ROOT / "benchmark/manifests/offload_manifest.json"
+MANIFEST = Path(
+    os.environ.get(
+        "LATCHMOE_REAL_MANIFEST",
+        str(ROOT / "benchmark/manifests/offload_manifest.json"),
+    )
+)
 
 
 def test_checkpoint_index_contains_every_manifest_expert_tensor():
