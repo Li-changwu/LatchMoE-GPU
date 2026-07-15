@@ -52,6 +52,20 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _source_state_sha256(
+    git_commit: str | None, diff_sha256: str, untracked: dict[str, str]
+) -> str:
+    combined = hashlib.sha256()
+    combined.update((git_commit or "").encode("ascii"))
+    combined.update(b"\0")
+    combined.update(diff_sha256.encode("ascii"))
+    for relative, digest in sorted(untracked.items()):
+        combined.update(relative.encode("utf-8"))
+        combined.update(b"\0")
+        combined.update(digest.encode("ascii"))
+    return combined.hexdigest()
+
+
 def _source_provenance() -> dict[str, object]:
     status_bytes = _git_bytes(["status", "--porcelain=v1"])
     diff = _git_bytes(["diff", "--binary", "HEAD"]) or b""
@@ -66,12 +80,7 @@ def _source_provenance() -> dict[str, object]:
             if path.is_file():
                 untracked[relative] = _file_sha256(path)
     diff_sha256 = hashlib.sha256(diff).hexdigest()
-    combined = hashlib.sha256()
-    combined.update(diff_sha256.encode("ascii"))
-    for relative, digest in sorted(untracked.items()):
-        combined.update(relative.encode("utf-8"))
-        combined.update(b"\0")
-        combined.update(digest.encode("ascii"))
+    git_commit = _git_value(["rev-parse", "HEAD"])
     status = (
         status_bytes.decode("utf-8", errors="replace").splitlines()
         if status_bytes is not None
@@ -82,7 +91,7 @@ def _source_provenance() -> dict[str, object]:
         "git_dirty": bool(status),
         "git_diff_sha256": diff_sha256,
         "untracked_file_sha256": untracked,
-        "source_state_sha256": combined.hexdigest(),
+        "source_state_sha256": _source_state_sha256(git_commit, diff_sha256, untracked),
     }
 
 

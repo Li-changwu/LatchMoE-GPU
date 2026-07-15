@@ -350,6 +350,7 @@ def test_ablation_comparison_requires_one_contract_source_and_offload_budget():
     common = {
         "workload_contract_sha256": "a" * 64,
         "source_state_sha256": "b" * 64,
+        "git_commit": "d" * 40,
         "offload_telemetry": {"actual_offload_bytes": 1024},
     }
     summaries = {
@@ -390,4 +391,11 @@ def test_ablation_comparison_requires_one_contract_source_and_offload_budget():
         "source_state_sha256": "c" * 64,
     }
     with pytest.raises(ValueError, match="source states differ"):
+        compare_ablation_summaries(**summaries)
+    summaries["latchmoe_piecewise"] = {
+        **summaries["latchmoe_piecewise"],
+        "source_state_sha256": "b" * 64,
+        "git_commit": "e" * 40,
+    }
+    with pytest.raises(ValueError, match="git commits differ"):
         compare_ablation_summaries(**summaries)

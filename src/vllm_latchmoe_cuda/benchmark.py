@@ -438,6 +438,9 @@ def compare_ablation_summaries(
     }
     if len(source_hashes) != 1 or None in source_hashes:
         raise ValueError("2x2 benchmark source states differ")
+    git_commits = {summary.get("git_commit") for summary in summaries.values()}
+    if len(git_commits) != 1 or None in git_commits:
+        raise ValueError("2x2 benchmark git commits differ")
     offload_bytes = {
         int(summary["offload_telemetry"]["actual_offload_bytes"])
         for summary in summaries.values()
@@ -450,6 +453,7 @@ def compare_ablation_summaries(
         "design": "offloader_x_execution_policy_2x2",
         "workload_contract_sha256": workload_hashes.pop(),
         "source_state_sha256": source_hashes.pop(),
+        "git_commit": git_commits.pop(),
         "actual_offload_bytes": offload_bytes.pop(),
         "latchmoe_effect": {
             "eager": compare_mode_summaries(uva_eager, latchmoe_eager),

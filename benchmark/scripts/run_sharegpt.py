@@ -245,6 +245,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
     run.write_json("server_command.json", server_command)
     run_manifest = json.loads((run.path / "run_manifest.json").read_text())
     source_state_sha256 = run_manifest["source_state_sha256"]
+    git_commit = run_manifest["git_commit"]
     environment = _server_environment(args.mode, manifest_path, profile_path)
 
     server_log = (run.path / "server.log").open("w", encoding="utf-8")
@@ -340,6 +341,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "workload_contract_sha256": workload_contract_sha256,
         "mode_contract_sha256": mode_contract_sha256,
         "source_state_sha256": source_state_sha256,
+        "git_commit": git_commit,
         "dataset_sha256": dataset_sha256,
         "repetitions": args.repetitions,
         "offload_telemetry": telemetry,

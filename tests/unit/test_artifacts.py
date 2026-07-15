@@ -8,6 +8,7 @@ from vllm_latchmoe_cuda.artifacts import (
     ArtifactRun,
     InvalidResultPromotionError,
     RunKind,
+    _source_state_sha256,
 )
 
 
@@ -24,6 +25,15 @@ def _valid_child(index: int, result_path: Path) -> dict[str, object]:
         "result_artifact": "result.json",
         "result_sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
     }
+
+
+def test_source_state_hash_includes_git_commit():
+    clean_diff = hashlib.sha256(b"").hexdigest()
+
+    first = _source_state_sha256("a" * 40, clean_diff, {})
+    second = _source_state_sha256("b" * 40, clean_diff, {})
+
+    assert first != second
 
 
 def test_smoke_artifact_cannot_be_promoted(tmp_path: Path):
