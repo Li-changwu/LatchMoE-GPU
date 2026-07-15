@@ -231,6 +231,7 @@ class CudaLayerRuntime:
             )
         self.last_wave_trace: WaveExecutionTrace | None = None
         self.event_writer = event_writer
+        self.direct_slots_profiled = False
         self.mapping_version = 0
         self._active_compute: ComputeHandle | None = None
         self._pending_computes: list[PendingCompute] = []

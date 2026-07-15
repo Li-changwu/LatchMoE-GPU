@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -183,6 +184,38 @@ def test_telemetry_proves_offload_bytes_and_device_planner(tiny_manifest, tmp_pa
     assert telemetry["actual_offload_bytes"] == tiny_manifest.total_elements * 2 + 64
     assert telemetry["exact_wave_events"] == 1
     assert telemetry["cuda_device_planner_events"] == 1
+
+
+def test_full_capacity_eager_telemetry_requires_every_direct_slot_layer(
+    tiny_manifest, tmp_path
+):
+    full_capacity_manifest = replace(tiny_manifest, num_slots=4)
+    profile = tmp_path / "profile.jsonl"
+    backend = {
+        "event": "residual_uva",
+        "cpu_offload_bytes": 64,
+        "cpu_offload_max_bytes": 64,
+    }
+    direct = {
+        "event": "direct_slots",
+        "layer_id": 0,
+        "active_experts": 4,
+        "slot_capacity": 4,
+    }
+    profile.write_text(
+        "\n".join(json.dumps(event) for event in (backend, direct)) + "\n",
+        encoding="utf-8",
+    )
+
+    telemetry = read_offload_telemetry(
+        "latchmoe-eager", full_capacity_manifest, profile
+    )
+
+    assert telemetry["direct_slot_events"] == 1
+    assert telemetry["exact_wave_events"] == 0
+    profile.write_text(json.dumps(backend) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="every full-capacity direct-slot layer"):
+        read_offload_telemetry("latchmoe-eager", full_capacity_manifest, profile)
 
 
 @pytest.mark.parametrize("mode", ["uva-piecewise", "latchmoe-piecewise"])

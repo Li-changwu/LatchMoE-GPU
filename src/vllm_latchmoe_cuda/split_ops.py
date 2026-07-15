@@ -16,6 +16,14 @@ def eager_stage_and_map(
 @torch.compiler.disable
 def eager_prepare_compute(runtime: CudaLayerRuntime, topk_ids: torch.Tensor) -> None:
     active = tuple(int(value) for value in torch.unique(topk_ids).cpu().tolist())
+    if runtime.event_writer is not None and not runtime.direct_slots_profiled:
+        runtime.event_writer.write(
+            "direct_slots",
+            layer_id=runtime.layer_id,
+            active_experts=len(active),
+            slot_capacity=runtime.num_slots,
+        )
+        runtime.direct_slots_profiled = True
     runtime.prepare_compute_async(active)
 
 

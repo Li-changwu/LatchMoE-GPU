@@ -292,16 +292,34 @@ def read_offload_telemetry(
     if len(residual) != 1:
         raise RuntimeError("LatchMoE residual UVA telemetry is missing or duplicated")
     wave_events = [event for event in events if event.get("event") == "exact_waves"]
+    direct_slot_events = [
+        event for event in events if event.get("event") == "direct_slots"
+    ]
     device_wave_events = [
         event
         for event in wave_events
         if event.get("pair_planner_mode") == "cuda_device"
         and event.get("scatter_mode") == "layer_index_add"
     ]
-    if not graph_mode and not wave_events:
+    full_capacity = manifest.num_slots == manifest.model.num_experts
+    if not graph_mode and full_capacity:
+        direct_layers = {int(event["layer_id"]) for event in direct_slot_events}
+        if direct_layers != set(manifest.layer_ids):
+            raise RuntimeError(
+                "ShareGPT measurement did not exercise every full-capacity "
+                "direct-slot layer"
+            )
+    elif not graph_mode and not wave_events:
         raise RuntimeError("ShareGPT measurement did not exercise exact waves")
     if wave_events and len(device_wave_events) != len(wave_events):
         raise RuntimeError("not every exact wave used the CUDA device planner")
+    if any(
+        int(event.get("active_experts", -1)) < 0
+        or int(event.get("active_experts", -1)) > manifest.num_slots
+        or int(event.get("slot_capacity", -1)) != manifest.num_slots
+        for event in direct_slot_events
+    ):
+        raise RuntimeError("invalid full-capacity direct-slot telemetry")
     event = residual[0]
     manifest_bytes = manifest.total_elements * 2
     residual_bytes = int(event["cpu_offload_bytes"])
@@ -314,6 +332,7 @@ def read_offload_telemetry(
         "configured_budget_bytes": manifest_bytes + int(event["cpu_offload_max_bytes"]),
         "exact_wave_events": len(wave_events),
         "cuda_device_planner_events": len(device_wave_events),
+        "direct_slot_events": len(direct_slot_events),
         **graph_telemetry,
     }
 
