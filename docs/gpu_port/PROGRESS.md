@@ -4,14 +4,18 @@
 
 - Target runtime: vLLM 0.19.1 only.
 - vLLM tag commit: `b1388b1fbf5aaef47937fabe98931211684666a6`.
-- Model: `/root/models/Qwen3-30B-A3B-Instruct-2507`.
-- Model revision: `0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe`.
+- Formal local model: `/home/lcw/model`, Qwen3-30B-A3B, revision
+  `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`.
 - Dtype / parallelism: BF16 / TP=1.
-- Main offload manifest: 12 layers, 32 slots, approximately 14 GiB expert
-  offload target.
-- Baseline: controlled vLLM CUDA-UVA reading the identical manifest.
-- Final performance claim: reserved for repeated real experiments and user
-  confirmation.
+- Formal local offload manifest: layers 0-11, 32 slots, 13.5 GiB manifest
+  expert weights plus residual stock UVA for byte parity.
+- Baseline: official `vllm.model_executor.offloader.uva.UVAOffloader` with the
+  same actual offload byte count.
+- Formal workload: 50 ShareGPT requests, 128 forced output tokens,
+  concurrency 8, two warmups and three measurements per backend.
+- The original `/root/models/Qwen3-30B-A3B-Instruct-2507` contract below is
+  retained as implementation history; it is not the 2026-07-15 measurement
+  contract.
 
 ## 2026-07-13 - Read-Only Audit and Design
 
@@ -584,3 +588,133 @@ modes with the frozen manifest, then execute repeated measurement runs for UVA
 and each LatchMoE mode under the same workload matrix. Only those raw JSON/log
 and profiler artifacts can support the final improve/regress/workload-specific
 claim, which remains subject to user confirmation.
+
+## 2026-07-15 - CUDA Device Planner and Formal ShareGPT Measurement
+
+### Local Runtime and Port Completion
+
+- Moved all active work onto the requested `cuda-latchmoe` branch without
+  creating a new branch. The formal measurements bind to clean source commit
+  `63a7ed49f4fa1b83d307bf7e28c291af9a31be0d`.
+- Added support for the local `/home/lcw/model` Qwen3-30B-A3B checkpoint and
+  revision `ad44e777bcd18fa416d9da3bd8f70d33ebb85d39`.
+- Selected layers 0-11 in
+  `offload_manifest.qwen3-base-ad44.first12.local.json`. Each layer has all 128
+  BF16 experts and 32 persistent CUDA slots.
+- Kept direct checkpoint loading into the pinned HostStore, stable slot/map
+  addresses, the protected LRU state machine, transfer stream/events, shared
+  double stage banks, and capacity-bounded exact pair waves from the NPU design.
+- Replaced routed-pair CPU planning with a CUDA device planner. Only the active
+  expert set, at most 128 integer IDs, crosses to CPU. Pair offsets, logical and
+  physical IDs, and routing weights stay on CUDA.
+- Replaced per-wave scatter with one layer-level `index_add_`. Formal profile
+  events report `pair_planner_mode=cuda_device` and
+  `scatter_mode=layer_index_add`.
+- Added the repeated ShareGPT server runner and summary comparator. The runner
+  uses vLLM 0.19.1 `bench serve` metrics, enforces final-result promotion
+  rules, validates equal actual offload bytes, and bypasses proxy variables for
+  localhost traffic.
+
+### Correctness Evidence and Boundary
+
+- Final full test result with the local manifest and real-layer gate:
+  `150 passed, 1 skipped`. The only skip is the strict full-model greedy comparison that
+  requires an external UVA reference artifact. All 12 local real-layer tests
+  executed.
+- A real vLLM Triton slot comparison reported maximum absolute error
+  `0.00390625` and mean absolute error approximately `3.53e-4`; it passed the
+  BF16 numerical tolerance.
+- Checkpoint samples matched their safetensors values and the real Triton
+  layer-level numerical tests passed.
+- A strict full-model greedy run did not reproduce UVA token-for-token. The
+  evidence is consistent with small BF16 differences accumulating across the
+  12 modified layers and changing an argmax near a decision boundary, but it
+  does not prove that this is the only cause. Therefore the supported claim is
+  layer-level numerical agreement within BF16 tolerance, not strict E2E token
+  equivalence or output-quality equivalence.
+
+### Frozen ShareGPT Contract
+
+- Dataset:
+  `/home/lcw/datasets/ShareGPT_V3_unfiltered_cleaned_split.json`.
+- Dataset revision: `192ab2185289094fc556ec8ce5ce1e8e587154ca`.
+- Size: `672837942` bytes; 94,145 records, of which 92,886 contain at least two
+  turns.
+- SHA-256:
+  `35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4`.
+- Workload contract SHA-256:
+  `bcda4b8da72118cc86fec7dba75258697b492247f927c659a335afb4f10af65b`.
+- Exactly 50 requests selected with seed 42; no oversampling; request rate
+  `inf`; maximum concurrency 8.
+- Every request forces 128 output tokens with temperature 0 and `ignore_eos`.
+  Each repetition contains 14,278 input and 6,400 output tokens.
+- Both servers use BF16, TP=1, eager execution, `max_num_seqs=8`,
+  `max_model_len=2048`, `max_num_batched_tokens=2048`, a 256 MiB explicit KV
+  cache request, and disabled prefix caching.
+- Each backend starts one server, runs two warmup requests, then runs three
+  independent measurements against that same server.
+- The official UVA baseline and LatchMoE both actually offload
+  `15,798,475,264` bytes. LatchMoE consists of `14,495,514,624` manifest bytes
+  plus `1,302,960,640` residual stock-UVA bytes. Stock UVA selects parameters in
+  its native order; the byte count, not the exact parameter set, is controlled.
+
+### Raw Measurement Results
+
+All repetitions completed 50/50 requests with zero failures. Durations were
+270.444, 266.733, and 268.123 seconds for LatchMoE; the metric table retains the
+unrounded values in each `measurement.json`.
+
+| Backend / repetition | TTFT p50 ms | TTFT p99 ms | TPOT p50 ms/token | TPOT p99 ms/token | output token/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| UVA / 1 | 8482.381 | 70348.791 | 504.165 | 858.751 | 11.8830 |
+| UVA / 2 | 7753.382 | 65598.260 | 517.315 | 863.793 | 11.9639 |
+| UVA / 3 | 7912.819 | 67985.256 | 499.073 | 827.669 | 12.0545 |
+| LatchMoE / 1 | 4698.312 | 37694.233 | 244.752 | 396.570 | 23.6648 |
+| LatchMoE / 2 | 3523.201 | 33762.247 | 258.502 | 378.561 | 23.9940 |
+| LatchMoE / 3 | 4541.042 | 35582.418 | 243.907 | 401.222 | 23.8696 |
+
+The comparison takes the median across the three repetitions independently for
+each metric:
+
+| Metric | official UVA | LatchMoE eager | improvement |
+| --- | ---: | ---: | ---: |
+| TTFT p50 | 7912.819 ms | 4541.042 ms | 42.61% lower |
+| TTFT p99 | 67985.256 ms | 35582.418 ms | 47.66% lower |
+| TPOT p50 | 504.165 ms/token | 244.752 ms/token | 51.45% lower |
+| TPOT p99 | 858.751 ms/token | 396.570 ms/token | 53.82% lower |
+| Output throughput | 11.9639 token/s | 23.8696 token/s | 99.51% higher |
+
+The LatchMoE profile contains 3,394 `exact_waves` events. Real requests use two
+to four waves, and the largest recorded layer event contains 15,480 routed
+pairs. This confirms the benchmark exercised the device planner rather than
+only the <=32-expert fast path.
+
+### Formal Artifacts and Integrity
+
+- Official UVA: `artifacts/sharegpt-c8-uva-20260715/`.
+- LatchMoE eager:
+  `artifacts/sharegpt-c8-latchmoe-eager-20260715/`.
+- Comparison: `artifacts/sharegpt-c8-comparison-20260715.json`.
+- Both formal `run_manifest.json` files record `status=completed`,
+  `exit_code=0`, `final_result=true`, clean source, and the same source commit.
+- `sha256sum -c SHA256SUMS` passes in both formal artifact directories.
+- The UVA telemetry identifies the official implementation as
+  `vllm.model_executor.offloader.uva.UVAOffloader`; LatchMoE telemetry identifies
+  `vllm_latchmoe_cuda.offloader.CudaSEWOffloader` and its residual official UVA.
+- `artifacts/sharegpt-c1-uva-20260715/` preserves a 50/50 request failure caused
+  by localhost SOCKS proxying. `artifacts/sharegpt-c1-uva-20260715-r2/`
+  preserves the deliberately interrupted concurrency-1 attempt. Neither failed
+  artifact was overwritten or promoted.
+
+### Scope and Capacity Limits
+
+- This is an eager-versus-eager result. It must not be presented as a
+  full-model PIECEWISE CUDA Graph result.
+- The LatchMoE server reached approximately 45.37 GiB allocated/used device
+  memory during measurement, leaving approximately 117 MiB free. The run did
+  not OOM, but the margin is too small to claim portable capacity safety across
+  other drivers, allocator states, concurrency levels, or model revisions.
+- Fixed 128-token `ignore_eos` output makes serving work comparable, but the
+  experiment does not measure generated answer quality. Combined with the
+  strict greedy mismatch above, performance and quality claims must remain
+  separate.
