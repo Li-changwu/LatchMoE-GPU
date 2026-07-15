@@ -10,6 +10,7 @@ from pathlib import Path
 
 from vllm_latchmoe_cuda.artifacts import ArtifactRun, RunKind
 from vllm_latchmoe_cuda.correctness import (
+    CORRECTNESS_MAX_NUM_SEQS,
     STOCK_UVA_CPU_OFFLOAD_GB,
     CorrectnessMismatchError,
     CorrectnessMode,
@@ -228,6 +229,7 @@ def _execute_driver(args, run: ArtifactRun) -> None:
             "vllm_version": manifest.vllm.version,
             "dtype": manifest.dtype,
             "tensor_parallel_size": manifest.tensor_parallel_size,
+            "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
             "mode": mode.name,
             "backend": mode.backend,
             "enforce_eager": mode.enforce_eager,

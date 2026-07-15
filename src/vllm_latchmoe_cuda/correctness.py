@@ -13,6 +13,7 @@ class CorrectnessMismatchError(AssertionError):
 
 
 STOCK_UVA_CPU_OFFLOAD_GB = 14.0
+CORRECTNESS_MAX_NUM_SEQS = 32
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,7 @@ def compare_greedy_results(
         ("model_revision", "model revision"),
         ("dtype", "dtype"),
         ("tensor_parallel_size", "tensor parallel size"),
+        ("max_num_seqs", "maximum sequence count"),
         ("sampling", "sampling configuration"),
         ("prompts", "prompt list"),
     )
@@ -192,6 +194,7 @@ def build_engine_kwargs(
         "gpu_memory_utilization": gpu_memory_utilization,
         "kv_cache_memory_bytes": kv_cache_memory_bytes,
         "max_model_len": max_model_len,
+        "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
         "seed": 0,
         "disable_log_stats": True,
     }
@@ -263,6 +266,7 @@ def run_vllm_greedy(
         "model_revision": manifest.model.revision,
         "dtype": manifest.dtype,
         "tensor_parallel_size": manifest.tensor_parallel_size,
+        "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
         "uva_implementation": "vllm-stock" if mode.name == "uva" else None,
         "cpu_offload_gb": STOCK_UVA_CPU_OFFLOAD_GB if mode.name == "uva" else 0.0,
         "manifest_controls_offload_selection": mode.name != "uva",

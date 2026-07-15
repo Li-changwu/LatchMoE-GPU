@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from vllm_latchmoe_cuda.correctness import (
+    CORRECTNESS_MAX_NUM_SEQS,
     STOCK_UVA_CPU_OFFLOAD_GB,
     CorrectnessMismatchError,
     build_engine_kwargs,
@@ -30,6 +31,7 @@ def _result(mode: str, token_ids: list[list[int]]) -> dict[str, object]:
         "model_revision": "revision-1",
         "dtype": "bfloat16",
         "tensor_parallel_size": 1,
+        "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
         "prompts": ["alpha", "beta"],
         "sampling": {"temperature": 0.0, "max_tokens": 16, "seed": 0},
         "outputs": [
@@ -80,6 +82,7 @@ def test_engine_kwargs_lock_target_and_piecewise_mode(tiny_manifest):
     assert kwargs["model"] == tiny_manifest.model.path
     assert kwargs["dtype"] == "bfloat16"
     assert kwargs["tensor_parallel_size"] == 1
+    assert kwargs["max_num_seqs"] == CORRECTNESS_MAX_NUM_SEQS == 32
     assert kwargs["enforce_eager"] is False
     assert kwargs["compilation_config"] == {"cudagraph_mode": "PIECEWISE"}
 
