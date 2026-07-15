@@ -11,6 +11,7 @@ from pathlib import Path
 from vllm_latchmoe_cuda.artifacts import ArtifactRun, RunKind
 from vllm_latchmoe_cuda.correctness import (
     STOCK_UVA_CPU_OFFLOAD_GB,
+    CorrectnessMismatchError,
     CorrectnessMode,
     compare_greedy_results,
     load_prompts,
@@ -130,6 +131,57 @@ def _environment() -> dict[str, object]:
     return snapshot
 
 
+def _profile_events(path: Path) -> list[dict[str, object]]:
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+
+
+def _offload_telemetry(
+    mode: CorrectnessMode, manifest: OffloadManifest, profile_path: Path
+) -> dict[str, object]:
+    events = _profile_events(profile_path)
+    if mode.name == "uva":
+        matches = [event for event in events if event.get("event") == "stock_uva"]
+        if len(matches) != 1:
+            raise RuntimeError("stock UVA run produced no unique stock_uva event")
+        event = matches[0]
+        implementation = event.get("implementation")
+        if implementation != "vllm.model_executor.offloader.uva.UVAOffloader":
+            raise RuntimeError(f"unexpected UVA implementation: {implementation}")
+        return {
+            "schema_version": 1,
+            "mode": mode.name,
+            "implementation": implementation,
+            "manifest_bytes": 0,
+            "residual_uva_bytes": int(event["cpu_offload_bytes"]),
+            "actual_offload_bytes": int(event["cpu_offload_bytes"]),
+            "configured_budget_bytes": int(event["cpu_offload_max_bytes"]),
+        }
+    matches = [event for event in events if event.get("event") == "residual_uva"]
+    if len(matches) != 1:
+        raise RuntimeError("LatchMoE run produced no unique residual_uva event")
+    event = matches[0]
+    manifest_bytes = manifest.total_elements * 2
+    residual_bytes = int(event["cpu_offload_bytes"])
+    return {
+        "schema_version": 1,
+        "mode": mode.name,
+        "implementation": "vllm_latchmoe_cuda.offloader.CudaSEWOffloader",
+        "residual_implementation": "vllm.model_executor.offloader.uva.UVAOffloader",
+        "manifest_bytes": manifest_bytes,
+        "residual_uva_bytes": residual_bytes,
+        "actual_offload_bytes": manifest_bytes + residual_bytes,
+        "configured_budget_bytes": (
+            manifest_bytes + int(event["cpu_offload_max_bytes"])
+        ),
+    }
+
+
 def _worker_environment(
     mode: CorrectnessMode, manifest_path: Path, profile_path: Path
 ) -> dict[str, str]:
@@ -138,6 +190,7 @@ def _worker_environment(
         "VLLM_LATCHMOE_MODE",
         "VLLM_LATCHMOE_MANIFEST",
         "VLLM_LATCHMOE_PROFILE_PATH",
+        "VLLM_LATCHMOE_TELEMETRY_PATH",
     ):
         environment.pop(key, None)
     environment.update(
@@ -155,6 +208,8 @@ def _worker_environment(
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
             }
         )
+    else:
+        environment["VLLM_LATCHMOE_TELEMETRY_PATH"] = str(profile_path)
     return environment
 
 
@@ -229,12 +284,33 @@ def _execute_driver(args, run: ArtifactRun) -> None:
         raise WorkerProcessError(completed.returncode, run.path / "stderr.log")
     if not result_path.is_file():
         raise RuntimeError("correctness worker produced no correctness.json")
+    telemetry = _offload_telemetry(mode, manifest, profile_path)
+    run.write_json("offload_telemetry.json", telemetry)
     if args.reference_json is not None:
         reference = json.loads(args.reference_json.read_text(encoding="utf-8"))
         candidate = json.loads(result_path.read_text(encoding="utf-8"))
         comparison = compare_greedy_results(reference, candidate)
+        reference_telemetry_path = args.reference_json.parent / "offload_telemetry.json"
+        if not reference_telemetry_path.is_file():
+            raise RuntimeError(
+                f"reference has no offload telemetry: {reference_telemetry_path}"
+            )
+        reference_telemetry = json.loads(
+            reference_telemetry_path.read_text(encoding="utf-8")
+        )
+        offload_bytes_match = (
+            reference_telemetry.get("actual_offload_bytes")
+            == telemetry["actual_offload_bytes"]
+        )
+        comparison["reference_actual_offload_bytes"] = reference_telemetry.get(
+            "actual_offload_bytes"
+        )
+        comparison["candidate_actual_offload_bytes"] = telemetry["actual_offload_bytes"]
+        comparison["offload_bytes_match"] = offload_bytes_match
         run.write_json("comparison.json", comparison)
         require_greedy_match(reference, candidate)
+        if not offload_bytes_match:
+            raise CorrectnessMismatchError("actual offload bytes differ")
 
 
 def _driver_main(argv: list[str]) -> int:

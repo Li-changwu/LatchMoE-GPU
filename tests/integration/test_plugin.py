@@ -1,7 +1,10 @@
+import json
 import importlib
 from types import SimpleNamespace
 
 import pytest
+import torch
+from vllm.model_executor.offloader.uva import UVAOffloader
 
 import vllm_latchmoe_cuda.plugin as plugin_module
 from vllm_latchmoe_cuda.errors import UnsupportedVllmVersionError
@@ -70,3 +73,26 @@ def test_plugin_is_idempotent_and_preserves_native_mode(monkeypatch, plugin):
 
     assert fake_runner.create_offloader is first_wrapper
     assert fake_runner.create_offloader(object()) is native_result
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_stock_uva_telemetry_preserves_official_instance(
+    monkeypatch, plugin, tiny_decoder_factory, tmp_path
+):
+    native = UVAOffloader(cpu_offload_max_bytes=64)
+    fake_runner = SimpleNamespace(create_offloader=lambda config: native)
+    profile_path = tmp_path / "profile.jsonl"
+    monkeypatch.setattr(plugin.metadata, "version", lambda _: "0.19.1")
+    monkeypatch.setattr(plugin.importlib, "import_module", lambda name: fake_runner)
+    monkeypatch.delenv("VLLM_LATCHMOE_MODE", raising=False)
+    monkeypatch.setenv("VLLM_LATCHMOE_TELEMETRY_PATH", str(profile_path))
+
+    plugin.register()
+    created = fake_runner.create_offloader(object())
+    created.wrap_modules(iter((tiny_decoder_factory("cuda"),)))
+
+    assert created is native
+    assert type(created) is UVAOffloader
+    event = json.loads(profile_path.read_text())
+    assert event["implementation"] == ("vllm.model_executor.offloader.uva.UVAOffloader")
+    assert event["cpu_offload_bytes"] == 64

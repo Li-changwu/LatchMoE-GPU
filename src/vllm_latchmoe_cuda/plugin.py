@@ -2,18 +2,46 @@ from __future__ import annotations
 
 import importlib
 import os
+from types import MethodType
 from importlib import metadata
 from pathlib import Path
 
 from .errors import UnsupportedVllmVersionError
 from .manifest import OffloadManifest
 from .offloader import TOTAL_OFFLOAD_BUDGET_BYTES, CudaSEWOffloader
+from .profile import JsonlEventWriter
 from .uva import ManifestUVAOffloader
 
 
 SUPPORTED_VLLM_VERSION = "0.19.1"
 MODE_ENV = "VLLM_LATCHMOE_MODE"
 MANIFEST_ENV = "VLLM_LATCHMOE_MANIFEST"
+TELEMETRY_ENV = "VLLM_LATCHMOE_TELEMETRY_PATH"
+
+
+def _instrument_stock_uva(offloader):
+    telemetry_path = os.getenv(TELEMETRY_ENV)
+    if not telemetry_path:
+        return offloader
+    from vllm.model_executor.offloader.uva import UVAOffloader
+
+    if not isinstance(offloader, UVAOffloader):
+        return offloader
+    original_wrap = offloader.wrap_modules
+    writer = JsonlEventWriter(telemetry_path)
+
+    def wrap_modules(self, modules_generator):
+        modules = original_wrap(modules_generator)
+        writer.write(
+            "stock_uva",
+            implementation=f"{type(self).__module__}.{type(self).__name__}",
+            cpu_offload_max_bytes=self.cpu_offload_max_bytes,
+            cpu_offload_bytes=self.cpu_offload_bytes,
+        )
+        return modules
+
+    offloader.wrap_modules = MethodType(wrap_modules, offloader)
+    return offloader
 
 
 def load_manifest_from_env() -> OffloadManifest:
@@ -39,7 +67,7 @@ def register() -> None:
     def create_offloader(offload_config):
         mode = os.getenv(MODE_ENV, "").strip().lower()
         if not mode:
-            return current_factory(offload_config)
+            return _instrument_stock_uva(current_factory(offload_config))
         manifest = load_manifest_from_env()
         if mode == "latchmoe":
             residual_uva_max_bytes = max(

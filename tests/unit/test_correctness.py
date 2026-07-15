@@ -116,9 +116,11 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     assert "VLLM_LATCHMOE_MODE" not in uva
     assert "VLLM_LATCHMOE_MANIFEST" not in uva
     assert "VLLM_LATCHMOE_PROFILE_PATH" not in uva
+    assert uva["VLLM_LATCHMOE_TELEMETRY_PATH"] == str(profile_path)
     assert latchmoe["VLLM_LATCHMOE_MODE"] == "latchmoe"
     assert latchmoe["VLLM_LATCHMOE_MANIFEST"] == str(manifest_path)
     assert latchmoe["VLLM_LATCHMOE_PROFILE_PATH"] == str(profile_path)
+    assert "VLLM_LATCHMOE_TELEMETRY_PATH" not in latchmoe
 
 
 def test_greedy_comparison_requires_exact_token_ids():

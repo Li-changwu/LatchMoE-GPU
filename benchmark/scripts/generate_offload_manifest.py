@@ -25,15 +25,17 @@ def sha256_file(path: Path) -> str:
 
 
 def build_payload(
-    model_path: Path, revision: str = DEFAULT_REVISION
+    model_path: Path,
+    revision: str = DEFAULT_REVISION,
+    layers: tuple[int, ...] = LAYERS,
 ) -> dict[str, object]:
     w13_shape = (128, 1536, 2048)
     w2_shape = (128, 2048, 768)
     w13_numel = 128 * 1536 * 2048
     w2_numel = 128 * 2048 * 768
     offset = 0
-    layers: list[dict[str, object]] = []
-    for layer_id in LAYERS:
+    layer_documents: list[dict[str, object]] = []
+    for layer_id in layers:
         tensors = [
             {
                 "name": "w13_weight",
@@ -56,7 +58,7 @@ def build_payload(
                 "nbytes": w2_numel * 2,
             },
         ]
-        layers.append({"layer_id": layer_id, "tensors": tensors})
+        layer_documents.append({"layer_id": layer_id, "tensors": tensors})
         offset += w13_numel + w2_numel
 
     return {
@@ -77,14 +79,18 @@ def build_payload(
         "dtype": "bfloat16",
         "tensor_parallel_size": 1,
         "num_slots": 32,
-        "layers": layers,
+        "layers": layer_documents,
     }
 
 
-def render(model_path: Path, revision: str = DEFAULT_REVISION) -> str:
+def render(
+    model_path: Path,
+    revision: str = DEFAULT_REVISION,
+    layers: tuple[int, ...] = LAYERS,
+) -> str:
     return (
         json.dumps(
-            document_with_hash(build_payload(model_path, revision)),
+            document_with_hash(build_payload(model_path, revision, layers)),
             indent=2,
             sort_keys=True,
         )
@@ -97,9 +103,17 @@ def main() -> int:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--revision", default=DEFAULT_REVISION)
+    parser.add_argument(
+        "--layers",
+        default=",".join(str(layer_id) for layer_id in LAYERS),
+        help="comma-separated sorted layer ids",
+    )
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    expected = render(args.model, args.revision)
+    layers = tuple(int(value) for value in args.layers.split(",") if value)
+    if not layers or layers != tuple(sorted(set(layers))):
+        parser.error("--layers must contain unique sorted layer ids")
+    expected = render(args.model, args.revision, layers)
     if args.check:
         if not args.output.is_file() or args.output.read_text() != expected:
             print(f"manifest is stale: {args.output}")
