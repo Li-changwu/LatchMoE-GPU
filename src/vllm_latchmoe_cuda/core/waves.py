@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..errors import PairIntegrityError
 
@@ -45,6 +45,31 @@ class ExactWavePlan:
 
     def with_issue_order(self, issue_order: Sequence[int]) -> ExactWavePlan:
         return replace(self, issue_order=tuple(int(value) for value in issue_order))
+
+
+@dataclass(frozen=True)
+class DeviceWaveDescriptor:
+    wave_id: int
+    experts: tuple[int, ...]
+    pair_offsets: Any
+    token_indices: Any
+    logical_ids: Any
+    physical_ids: Any
+    pair_weights: Any
+    expert_map: Any
+
+
+@dataclass(frozen=True)
+class DeviceExactWavePlan:
+    capacity: int
+    top_k: int
+    num_tokens: int
+    waves: tuple[DeviceWaveDescriptor, ...]
+    compute_order: tuple[int, ...]
+
+    @property
+    def pair_count(self) -> int:
+        return sum(int(wave.pair_offsets.numel()) for wave in self.waves)
 
 
 def _as_nested_list(value) -> list[list[float | int]]:
@@ -100,6 +125,85 @@ def plan_exact_waves(topk_ids, topk_weights, *, capacity: int) -> ExactWavePlan:
     order = tuple(range(len(waves)))
     plan = ExactWavePlan(capacity, top_k, len(ids), waves, order, order)
     validate_pair_coverage(plan, expected_pairs=len(ids) * top_k)
+    return plan
+
+
+def plan_device_exact_waves(
+    topk_ids,
+    topk_weights,
+    *,
+    capacity: int,
+    num_experts: int,
+) -> DeviceExactWavePlan:
+    """Build pair descriptors with device tensor operations.
+
+    Only the unique expert list crosses to the host because H2D staging needs
+    host-side source indices. Routed pair ids and weights remain on device.
+    """
+    import torch
+
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+    if topk_ids.ndim != 2 or topk_ids.numel() == 0:
+        raise ValueError("routing tensors must be non-empty rank-2 tensors")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError("topk_ids and topk_weights must have the same shape")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must use an integer dtype")
+
+    active = tuple(
+        int(value)
+        for value in torch.unique(topk_ids, sorted=True).detach().cpu().tolist()
+    )
+    invalid = tuple(expert for expert in active if expert < 0 or expert >= num_experts)
+    if invalid:
+        raise ValueError(f"invalid expert ids: {invalid}")
+
+    top_k = int(topk_ids.shape[1])
+    flat_ids = topk_ids.reshape(-1).long()
+    flat_weights = topk_weights.reshape(-1)
+    waves: list[DeviceWaveDescriptor] = []
+    for wave_id, start in enumerate(range(0, len(active), capacity)):
+        experts = active[start : start + capacity]
+        expert_tensor = torch.tensor(experts, dtype=torch.long, device=topk_ids.device)
+        expert_map = torch.full(
+            (num_experts,), -1, dtype=torch.int32, device=topk_ids.device
+        )
+        expert_map[expert_tensor] = torch.arange(
+            len(experts), dtype=torch.int32, device=topk_ids.device
+        )
+        flat_physical = expert_map[flat_ids]
+        pair_offsets = torch.nonzero(flat_physical >= 0, as_tuple=False).flatten()
+        waves.append(
+            DeviceWaveDescriptor(
+                wave_id=wave_id,
+                experts=experts,
+                pair_offsets=pair_offsets,
+                token_indices=torch.div(pair_offsets, top_k, rounding_mode="floor"),
+                logical_ids=flat_ids.index_select(0, pair_offsets).reshape(-1, 1),
+                physical_ids=(
+                    flat_physical.index_select(0, pair_offsets).long().reshape(-1, 1)
+                ),
+                pair_weights=flat_weights.index_select(0, pair_offsets).reshape(-1, 1),
+                expert_map=expert_map,
+            )
+        )
+
+    order = tuple(range(len(waves)))
+    plan = DeviceExactWavePlan(
+        capacity=capacity,
+        top_k=top_k,
+        num_tokens=int(topk_ids.shape[0]),
+        waves=tuple(waves),
+        compute_order=order,
+    )
+    if plan.pair_count != int(topk_ids.numel()):
+        raise PairIntegrityError(
+            f"device pair coverage mismatch: expected={topk_ids.numel()}, "
+            f"actual={plan.pair_count}"
+        )
     return plan
 
 

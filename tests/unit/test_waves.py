@@ -5,6 +5,7 @@ from vllm_latchmoe_cuda.core.waves import (
     ExactWavePlan,
     PairDescriptor,
     WaveDescriptor,
+    plan_device_exact_waves,
     plan_exact_waves,
     plan_transfer_issue_order,
     validate_pair_coverage,
@@ -77,3 +78,28 @@ def test_transfer_issue_order_does_not_change_compute_order():
 
     assert plan.compute_order == (0, 1)
     assert issue_order == (1, 0)
+
+
+def test_device_wave_plan_keeps_pair_descriptors_on_device():
+    ids = torch.tensor([[5, 2], [9, 5]], dtype=torch.int64)
+    weights = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+
+    plan = plan_device_exact_waves(ids, weights, capacity=2, num_experts=16)
+
+    assert plan.pair_count == ids.numel()
+    assert tuple(wave.experts for wave in plan.waves) == ((2, 5), (9,))
+    assert plan.waves[0].pair_offsets.tolist() == [0, 1, 3]
+    assert plan.waves[0].token_indices.tolist() == [0, 0, 1]
+    assert plan.waves[0].logical_ids.flatten().tolist() == [5, 2, 5]
+    assert plan.waves[0].physical_ids.flatten().tolist() == [1, 0, 1]
+    torch.testing.assert_close(
+        plan.waves[0].pair_weights.flatten(), torch.tensor([0.1, 0.2, 0.4])
+    )
+
+
+def test_device_wave_plan_rejects_out_of_range_experts():
+    ids = torch.tensor([[0, 16]], dtype=torch.int64)
+    weights = torch.ones_like(ids, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="invalid expert ids"):
+        plan_device_exact_waves(ids, weights, capacity=2, num_experts=16)

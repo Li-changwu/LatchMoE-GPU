@@ -4,11 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .core.waves import (
-    plan_exact_waves,
-    plan_transfer_issue_order,
-    validate_pair_coverage,
-)
+from .core.waves import plan_device_exact_waves
 from .runtime import CudaLayerRuntime, WaveExecutionTrace
 from .split_ops import (
     eager_finish_compute,
@@ -60,8 +56,12 @@ def execute_exact_waves(
     kernel_callback=None,
 ) -> torch.Tensor:
     runtime.release_pending_for_transfer()
-    plan = plan_exact_waves(topk_ids, topk_weights, capacity=runtime.num_slots)
-    validate_pair_coverage(plan, expected_pairs=topk_ids.numel())
+    plan = plan_device_exact_waves(
+        topk_ids,
+        topk_weights,
+        capacity=runtime.num_slots,
+        num_experts=runtime.num_experts,
+    )
     bytes_per_expert = (
         runtime.host_w13[0].numel() * runtime.host_w13.element_size()
         + runtime.host_w2[0].numel() * runtime.host_w2.element_size()
@@ -70,10 +70,12 @@ def execute_exact_waves(
         wave.wave_id: len(wave.experts) * bytes_per_expert for wave in plan.waves
     }
     preferred = (
-        plan_transfer_issue_order(
-            plan.waves,
-            ready_experts=frozenset(),
-            h2d_bytes_by_wave=h2d_bytes,
+        tuple(
+            wave.wave_id
+            for wave in sorted(
+                plan.waves,
+                key=lambda wave: (-h2d_bytes[wave.wave_id], wave.wave_id),
+            )
         )
         if transfer_aware
         else plan.compute_order
@@ -89,6 +91,8 @@ def execute_exact_waves(
         dtype=torch.float32,
         device=hidden_states.device,
     )
+    pair_outputs: list[torch.Tensor] = []
+    scatter_indices: list[torch.Tensor] = []
     main_slots_overwritten = False
 
     if kernel_callback is not None:
@@ -118,44 +122,25 @@ def execute_exact_waves(
             staged = issued.pop(wave_id)
             bank = runtime.stage_pool.wait_ready(staged)
             wave = wave_by_id[wave_id]
-            token_indices = torch.tensor(
-                [pair.token_index for pair in wave.pairs],
-                dtype=torch.long,
-                device=hidden_states.device,
-            )
-            logical_ids = torch.tensor(
-                [[pair.expert_id] for pair in wave.pairs],
-                dtype=torch.long,
-                device=hidden_states.device,
-            )
-            physical_by_expert = {
-                expert: position for position, expert in enumerate(wave.experts)
-            }
-            physical_ids = torch.tensor(
-                [[physical_by_expert[pair.expert_id]] for pair in wave.pairs],
-                dtype=torch.long,
-                device=hidden_states.device,
-            )
-            pair_weights = torch.tensor(
-                [[pair.weight] for pair in wave.pairs],
-                dtype=topk_weights.dtype,
-                device=hidden_states.device,
-            )
-            pair_hidden = hidden_states.index_select(0, token_indices)
+            pair_hidden = hidden_states.index_select(0, wave.token_indices)
             if kernel_callback is None:
                 pair_output = _capturable_weights_moe(
-                    bank.w13, bank.w2, pair_hidden, physical_ids, pair_weights
+                    bank.w13,
+                    bank.w2,
+                    pair_hidden,
+                    wave.physical_ids,
+                    wave.pair_weights,
                 )
             else:
                 main_slots_overwritten = True
                 runtime.slot_w13.copy_(bank.w13)
                 runtime.slot_w2.copy_(bank.w2)
-                wave_map = torch.full_like(runtime.log2phy, -1)
-                for expert, position in physical_by_expert.items():
-                    wave_map[expert] = position
-                runtime.log2phy.copy_(wave_map)
-                pair_output = kernel_callback(pair_hidden, logical_ids, pair_weights)
-            output.index_add_(0, token_indices, pair_output.float())
+                runtime.log2phy.copy_(wave.expert_map)
+                pair_output = kernel_callback(
+                    pair_hidden, wave.logical_ids, wave.pair_weights
+                )
+            pair_outputs.append(pair_output.float())
+            scatter_indices.append(wave.token_indices)
             runtime.stage_pool.record_compute_done(bank.bank_id)
             completed.add(wave_id)
             free_banks.append(bank.bank_id)
@@ -164,8 +149,10 @@ def execute_exact_waves(
         if main_slots_overwritten:
             runtime.invalidate_main_slots()
 
+    output.index_add_(0, torch.cat(scatter_indices), torch.cat(pair_outputs))
+
     runtime.last_wave_trace = WaveExecutionTrace(
-        pair_count=topk_ids.numel(),
+        pair_count=plan.pair_count,
         compute_order=plan.compute_order,
         issue_order=tuple(issue_log),
         buffer_by_wave=tuple(sorted(buffer_by_wave.items())),
@@ -178,6 +165,8 @@ def execute_exact_waves(
             wave_count=len(runtime.last_wave_trace.compute_order),
             compute_order=list(runtime.last_wave_trace.compute_order),
             issue_order=list(runtime.last_wave_trace.issue_order),
+            pair_planner_mode="cuda_device",
+            scatter_mode="layer_index_add",
         )
     return output.to(dtype=hidden_states.dtype)
 

@@ -113,6 +113,8 @@ def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
             "wave_count": 2,
             "compute_order": [0, 1],
             "issue_order": [0, 1],
+            "pair_planner_mode": "cuda_device",
+            "scatter_mode": "layer_index_add",
         }
     ]
 
