@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .errors import UnsupportedVllmVersionError
 from .manifest import OffloadManifest
-from .offloader import CudaSEWOffloader
+from .offloader import TOTAL_OFFLOAD_BUDGET_BYTES, CudaSEWOffloader
 from .uva import ManifestUVAOffloader
 
 
@@ -42,7 +42,12 @@ def register() -> None:
             return current_factory(offload_config)
         manifest = load_manifest_from_env()
         if mode == "latchmoe":
-            return CudaSEWOffloader(manifest)
+            residual_uva_max_bytes = max(
+                0, TOTAL_OFFLOAD_BUDGET_BYTES - manifest.total_elements * 2
+            )
+            return CudaSEWOffloader(
+                manifest, residual_uva_max_bytes=residual_uva_max_bytes
+            )
         if mode == "uva":
             return ManifestUVAOffloader(manifest)
         raise ValueError(

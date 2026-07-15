@@ -8,14 +8,16 @@ from typing import Any
 import torch
 from torch import nn
 from vllm.model_executor.offloader.base import BaseOffloader
+from vllm.model_executor.offloader.uva import UVAOffloader
 
 from .host_store import PinnedHostStore
 from .manifest import OffloadManifest
 from .profile import JsonlEventWriter
-from .runtime import CudaLayerRuntime, CudaStagePool
+from .runtime import CudaLayerRuntime, CudaMainSlotPool, CudaStagePool
 
 
 _EXPERT_WEIGHT_NAMES = frozenset({"w13_weight", "w2_weight"})
+TOTAL_OFFLOAD_BUDGET_BYTES = 14 * 1024**3
 
 
 def _post_load_named_parameters(
@@ -36,7 +38,7 @@ def _post_load_named_parameters(
 
 def _install_post_load_filter(experts_module: nn.Module) -> None:
     if "named_parameters" in experts_module.__dict__:
-        raise RuntimeError("FusedMoE already has an instance named_parameters override")
+        raise RuntimeError("module already has an instance named_parameters override")
     experts_module.named_parameters = MethodType(
         _post_load_named_parameters, experts_module
     )
@@ -83,15 +85,24 @@ class CudaSEWOffloader(BaseOffloader):
         *,
         pin_memory: bool = True,
         first_layer_id: int = 0,
+        residual_uva_max_bytes: int = 0,
     ):
         self.manifest = manifest
         self.host_store = PinnedHostStore(manifest, pin_memory=pin_memory)
         self.first_layer_id = first_layer_id
+        if residual_uva_max_bytes < 0:
+            raise ValueError("residual_uva_max_bytes must be non-negative")
+        self.residual_uva = (
+            UVAOffloader(cpu_offload_max_bytes=residual_uva_max_bytes)
+            if residual_uva_max_bytes
+            else None
+        )
         self.bound_parameter_names: set[str] = set()
         self.bound_layers: dict[int, nn.Module] = {}
         self.runtimes: dict[int, CudaLayerRuntime] = {}
         self._wrapped = False
         self._post_initialized = False
+        self.main_slot_pool: CudaMainSlotPool | None = None
         self.stage_pool: CudaStagePool | None = None
         profile_path = os.getenv("VLLM_LATCHMOE_PROFILE_PATH")
         self.event_writer = JsonlEventWriter(profile_path) if profile_path else None
@@ -145,6 +156,21 @@ class CudaSEWOffloader(BaseOffloader):
             _install_post_load_filter(module.get_submodule("mlp.experts"))
             self.bound_layers[layer_id] = module
             relative_index += 1
+        if self.residual_uva is not None:
+            filtered_modules = tuple(self.bound_layers.values())
+            for module in filtered_modules:
+                _install_post_load_filter(module)
+            try:
+                modules = self.residual_uva.wrap_modules(iter(modules))
+            finally:
+                for module in filtered_modules:
+                    _remove_post_load_filter(module)
+            if self.event_writer is not None:
+                self.event_writer.write(
+                    "residual_uva",
+                    cpu_offload_max_bytes=self.residual_uva.cpu_offload_max_bytes,
+                    cpu_offload_bytes=self.residual_uva.cpu_offload_bytes,
+                )
         return modules
 
     def post_init(self) -> None:
@@ -165,7 +191,14 @@ class CudaSEWOffloader(BaseOffloader):
             device = bindings["w13_weight"].original_device
             host_w13 = self.host_store.tensor_view(layer_id, "w13_weight")
             host_w2 = self.host_store.tensor_view(layer_id, "w2_weight")
-            if self.stage_pool is None:
+            if self.main_slot_pool is None:
+                self.main_slot_pool = CudaMainSlotPool(
+                    device=device,
+                    num_slots=self.manifest.num_slots,
+                    w13_shape=tuple(host_w13.shape[1:]),
+                    w2_shape=tuple(host_w2.shape[1:]),
+                    dtype=host_w13.dtype,
+                )
                 self.stage_pool = CudaStagePool(
                     device=device,
                     num_slots=self.manifest.num_slots,
@@ -173,6 +206,8 @@ class CudaSEWOffloader(BaseOffloader):
                     w2_shape=tuple(host_w2.shape[1:]),
                     dtype=host_w13.dtype,
                 )
+            elif self.stage_pool is None:
+                raise RuntimeError("LatchMoE stage pools are partially initialized")
             elif tuple(self.stage_pool.banks[0].w13.shape[1:]) != tuple(
                 host_w13.shape[1:]
             ) or tuple(self.stage_pool.banks[0].w2.shape[1:]) != tuple(
@@ -186,6 +221,7 @@ class CudaSEWOffloader(BaseOffloader):
                 host_store=self.host_store,
                 experts_module=experts_module,
                 device=device,
+                main_slot_pool=self.main_slot_pool,
                 stage_pool=self.stage_pool,
                 event_writer=self.event_writer,
             )

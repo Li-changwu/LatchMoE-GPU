@@ -91,6 +91,9 @@ def execute_exact_waves(
     )
     main_slots_overwritten = False
 
+    if kernel_callback is not None:
+        runtime.acquire_main_slots_for_current_stream()
+
     def issue(wave_id: int) -> None:
         bank_id = free_banks.pop(0)
         issued[wave_id] = runtime.stage_pool.issue(

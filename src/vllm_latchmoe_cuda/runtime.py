@@ -138,6 +138,32 @@ class CudaStagePool:
         self.banks[bank_id].compute_done = event
 
 
+class CudaMainSlotPool:
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        num_slots: int,
+        w13_shape: tuple[int, ...],
+        w2_shape: tuple[int, ...],
+        dtype: torch.dtype,
+    ):
+        self.device = device
+        self.w13 = torch.empty((num_slots, *w13_shape), dtype=dtype, device=device)
+        self.w2 = torch.empty((num_slots, *w2_shape), dtype=dtype, device=device)
+        self.transfer_engine = CudaTransferEngine(device)
+        self.owner: CudaLayerRuntime | None = None
+
+    def acquire(self, runtime: CudaLayerRuntime, stream: torch.cuda.Stream) -> None:
+        if self.owner is runtime:
+            runtime._release_pending_to_stream(stream)
+            return
+        if self.owner is not None:
+            self.owner._release_pending_to_stream(stream)
+        runtime.invalidate_main_slots()
+        self.owner = runtime
+
+
 class CudaLayerRuntime:
     def __init__(
         self,
@@ -148,6 +174,7 @@ class CudaLayerRuntime:
         host_store: PinnedHostStore,
         experts_module: nn.Module,
         device: torch.device,
+        main_slot_pool: CudaMainSlotPool | None = None,
         stage_pool: CudaStagePool | None = None,
         event_writer: JsonlEventWriter | None = None,
     ):
@@ -160,18 +187,15 @@ class CudaLayerRuntime:
         self.host_w2 = host_store.tensor_view(layer.layer_id, "w2_weight")
         w13_parameter = getattr(experts_module, "w13_weight")
         w2_parameter = getattr(experts_module, "w2_weight")
-        slot_w13 = torch.empty(
-            (num_slots, *self.host_w13.shape[1:]),
+        self.main_slot_pool = main_slot_pool or CudaMainSlotPool(
+            device=device,
+            num_slots=num_slots,
+            w13_shape=tuple(self.host_w13.shape[1:]),
+            w2_shape=tuple(self.host_w2.shape[1:]),
             dtype=self.host_w13.dtype,
-            device=device,
         )
-        slot_w2 = torch.empty(
-            (num_slots, *self.host_w2.shape[1:]),
-            dtype=self.host_w2.dtype,
-            device=device,
-        )
-        w13_parameter.data = slot_w13
-        w2_parameter.data = slot_w2
+        w13_parameter.data = self.main_slot_pool.w13
+        w2_parameter.data = self.main_slot_pool.w2
         self.slot_w13_parameter = w13_parameter
         self.slot_w2_parameter = w2_parameter
         self.slot_w13 = w13_parameter
@@ -195,7 +219,7 @@ class CudaLayerRuntime:
         self.bank = ExpertSlotBank(num_slots)
         self.policy = LruPolicy()
         self.counters = RuntimeCounters()
-        self.transfer_engine = CudaTransferEngine(device)
+        self.transfer_engine = self.main_slot_pool.transfer_engine
         self.stage_pool = stage_pool or CudaStagePool(
             device=device,
             num_slots=num_slots,
@@ -263,6 +287,9 @@ class CudaLayerRuntime:
         return active
 
     def stage_sync(self, active_experts: Iterable[int]) -> LayerMappingSnapshot:
+        self.main_slot_pool.acquire(
+            self, torch.cuda.current_stream(self.slot_w13.device)
+        )
         self.assert_stable_addresses()
         active = self._normalize_active(active_experts)
         selected: dict[int, SlotLease] = {}
@@ -320,6 +347,7 @@ class CudaLayerRuntime:
                 f"dynamic staging attempted during CUDA Graph capture: "
                 f"layer={self.layer_id}"
             )
+        self.main_slot_pool.acquire(self, self.transfer_engine.stream)
         self.assert_stable_addresses()
         active = self._normalize_active(active_experts)
         selected: dict[int, SlotLease] = {}
@@ -462,9 +490,15 @@ class CudaLayerRuntime:
         return pending
 
     def release_pending_for_transfer(self) -> None:
-        if not self._pending_computes:
-            return
+        self._release_pending_to_stream(self.transfer_engine.stream)
+
+    def _release_pending_to_stream(self, stream: torch.cuda.Stream) -> None:
         for pending in self._pending_computes:
-            self.transfer_engine.stream.wait_event(pending.event)
+            stream.wait_event(pending.event)
             self.bank.end_compute(pending.handle)
         self._pending_computes.clear()
+
+    def acquire_main_slots_for_current_stream(self) -> None:
+        self.main_slot_pool.acquire(
+            self, torch.cuda.current_stream(self.slot_w13.device)
+        )

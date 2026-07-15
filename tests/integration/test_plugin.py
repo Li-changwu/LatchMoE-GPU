@@ -5,7 +5,10 @@ import pytest
 
 import vllm_latchmoe_cuda.plugin as plugin_module
 from vllm_latchmoe_cuda.errors import UnsupportedVllmVersionError
-from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
+from vllm_latchmoe_cuda.offloader import (
+    TOTAL_OFFLOAD_BUDGET_BYTES,
+    CudaSEWOffloader,
+)
 from vllm_latchmoe_cuda.uva import ManifestUVAOffloader
 
 
@@ -43,6 +46,11 @@ def test_plugin_factory_selects_manifest_backend(
     created = fake_runner.create_offloader(object())
 
     assert isinstance(created, expected_type)
+    if mode == "latchmoe":
+        assert created.residual_uva is not None
+        assert created.residual_uva.cpu_offload_max_bytes == (
+            TOTAL_OFFLOAD_BUDGET_BYTES - tiny_manifest.total_elements * 2
+        )
 
 
 def test_plugin_is_idempotent_and_preserves_native_mode(monkeypatch, plugin):

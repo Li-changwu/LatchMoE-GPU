@@ -87,3 +87,12 @@ def test_two_layers_share_the_same_double_stage_pool(
     assert offloader.runtimes[0].stage_pool is offloader.runtimes[1].stage_pool
     assert offloader.runtimes[0].stage_pool is offloader.stage_pool
     assert len(offloader.stage_pool.banks) == 2
+    assert (
+        offloader.runtimes[0].main_slot_pool
+        is offloader.runtimes[1].main_slot_pool
+        is offloader.main_slot_pool
+    )
+    assert (
+        offloader.runtimes[0].slot_w13.data_ptr()
+        == offloader.runtimes[1].slot_w13.data_ptr()
+    )

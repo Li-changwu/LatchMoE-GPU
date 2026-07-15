@@ -1,8 +1,11 @@
+from dataclasses import replace
+
 import pytest
 import torch
 
 from vllm_latchmoe_cuda.core.slots import SlotState
 from vllm_latchmoe_cuda.errors import NoEvictableSlotError, StaleMappingError
+from vllm_latchmoe_cuda.manifest import LayerLayout
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
 from vllm_latchmoe_cuda.transfer import ExpertCopy, contiguous_copy_runs
 
@@ -79,3 +82,39 @@ def test_async_map_publication_uses_pinned_lifetime_guard(
     runtime.stage_async((0, 1))
     with pytest.raises(StaleMappingError, match="mapping version"):
         runtime.validate_snapshot(first)
+
+
+def test_shared_main_slots_wait_and_reload_across_layers(
+    tiny_manifest, tiny_decoder_factory
+):
+    first_layout = tiny_manifest.layers[0]
+    second_layout = LayerLayout(
+        layer_id=1,
+        tensors=tuple(
+            replace(tensor, offset_elements=tensor.offset_elements + 48)
+            for tensor in first_layout.tensors
+        ),
+    )
+    manifest = replace(tiny_manifest, layers=(first_layout, second_layout))
+    modules = (tiny_decoder_factory("cuda"), tiny_decoder_factory("cuda"))
+    offloader = CudaSEWOffloader(manifest)
+    offloader.wrap_modules(iter(modules))
+    for name in ("w13_weight", "w2_weight"):
+        offloader.host_store.tensor_view(0, name).zero_()
+        offloader.host_store.tensor_view(1, name).fill_(1)
+    offloader.post_init()
+    first = offloader.runtimes[0]
+    second = offloader.runtimes[1]
+
+    first.prepare_compute_async((0, 1))
+    first.finish_compute_async()
+    second_snapshot = second.stage_async((0, 1))
+    torch.cuda.synchronize()
+
+    assert not first._pending_computes
+    assert torch.count_nonzero(second.slot_w13[second_snapshot.slot_ids]).item() > 0
+
+    first_snapshot = first.stage_async((0, 1))
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(first.slot_w13[first_snapshot.slot_ids]).item() == 0

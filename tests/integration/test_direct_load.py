@@ -104,6 +104,23 @@ def test_checkpoint_loader_writes_directly_to_pinned_store(
     }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_residual_stock_uva_skips_manifest_bound_parameters(
+    tiny_manifest, tiny_decoder_factory
+):
+    selected = tiny_decoder_factory("cuda")
+    remaining = tiny_decoder_factory("cuda")
+    offloader = CudaSEWOffloader(tiny_manifest, residual_uva_max_bytes=64)
+
+    offloader.wrap_modules(iter((selected, remaining)))
+
+    assert offloader.residual_uva is not None
+    assert offloader.residual_uva.cpu_offload_bytes == 64
+    assert not getattr(selected.mlp.experts.w13_weight, "_vllm_is_uva_offloaded", False)
+    assert not getattr(selected.mlp.experts.w2_weight, "_vllm_is_uva_offloaded", False)
+    assert getattr(remaining.mlp.experts.w13_weight, "_vllm_is_uva_offloaded", False)
+
+
 def test_offloader_connects_profile_writer_from_environment(
     monkeypatch, tmp_path, tiny_manifest
 ):
