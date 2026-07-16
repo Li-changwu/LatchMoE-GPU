@@ -34,10 +34,14 @@ def _instrument_cudagraph_evidence() -> None:
         return
     original_call = CUDAGraphWrapper.__call__
     writer = JsonlEventWriter(evidence_path)
-    evidence = {"capture": False, "replay": False}
+    evidence: dict[str, set[str]] = {"capture": set(), "replay": set()}
 
     def call(self, *args, **kwargs):
-        if evidence["capture"] and evidence["replay"]:
+        wrapper_mode = self.runtime_mode.name
+        if (
+            wrapper_mode in evidence["capture"]
+            and wrapper_mode in evidence["replay"]
+        ):
             return original_call(self, *args, **kwargs)
         descriptor = None
         runtime_mode = None
@@ -52,14 +56,14 @@ def _instrument_cudagraph_evidence() -> None:
         output = original_call(self, *args, **kwargs)
         if descriptor is None or runtime_mode != self.runtime_mode:
             return output
-        if had_graph and not evidence["replay"]:
+        if had_graph and wrapper_mode not in evidence["replay"]:
             writer.write(
                 "cudagraph_replay",
                 runtime_mode=self.runtime_mode.name,
                 batch_descriptor=str(descriptor),
             )
-            evidence["replay"] = True
-        elif not evidence["capture"]:
+            evidence["replay"].add(wrapper_mode)
+        elif wrapper_mode not in evidence["capture"]:
             entry = self.concrete_cudagraph_entries.get(descriptor)
             if entry is not None and entry.cudagraph is not None:
                 writer.write(
@@ -67,7 +71,7 @@ def _instrument_cudagraph_evidence() -> None:
                     runtime_mode=self.runtime_mode.name,
                     batch_descriptor=str(descriptor),
                 )
-                evidence["capture"] = True
+                evidence["capture"].add(wrapper_mode)
         return output
 
     CUDAGraphWrapper.__call__ = call

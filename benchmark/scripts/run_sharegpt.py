@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument(
+        "--exploratory",
+        action="store_true",
+        help="allow exactly one repetition without promoting it to a final result",
+    )
     parser.add_argument("--num-prompts", type=int, default=50)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--max-concurrency", type=int, default=1)
@@ -171,7 +176,9 @@ def _write_child_manifest(
 
 
 def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
-    if args.repetitions < 3:
+    if args.exploratory and args.repetitions != 1:
+        raise ValueError("exploratory measurements require exactly 1 repetition")
+    if not args.exploratory and args.repetitions < 3:
         raise ValueError("final measurements require at least 3 repetitions")
     if args.num_prompts != 50:
         raise ValueError("the frozen ShareGPT contract requires exactly 50 prompts")
@@ -207,6 +214,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "max_concurrency": args.max_concurrency,
         "warmup_requests": args.warmup_requests,
         "repetitions": args.repetitions,
+        "exploratory": args.exploratory,
         "max_num_seqs": args.max_num_seqs,
         "max_model_len": args.max_model_len,
         "max_num_batched_tokens": args.max_num_batched_tokens,
@@ -344,12 +352,17 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "git_commit": git_commit,
         "dataset_sha256": dataset_sha256,
         "repetitions": args.repetitions,
+        "exploratory": args.exploratory,
+        "final_result": not args.exploratory,
         "offload_telemetry": telemetry,
-        "metrics": summarize_repetitions(repetitions),
+        "metrics": summarize_repetitions(
+            repetitions, minimum_repetitions=1 if args.exploratory else 3
+        ),
     }
     run.write_json("summary.json", summary)
     run.record_completion(exit_code=0)
-    run.mark_final(repetition_manifests=child_manifests)
+    if not args.exploratory:
+        run.mark_final(repetition_manifests=child_manifests)
 
 
 def main() -> int:

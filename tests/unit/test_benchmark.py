@@ -117,6 +117,30 @@ def test_piecewise_server_modes_use_identical_graph_policy(mode, tiny_manifest):
     assert ("--cpu-offload-gb" in command) is mode.startswith("uva")
 
 
+def test_uva_full_and_piecewise_uses_vllm_default_graph_policy(tiny_manifest):
+    command = build_server_command(
+        python_executable="/env/bin/python",
+        mode="uva-full-and-piecewise",
+        manifest=tiny_manifest,
+        host="127.0.0.1",
+        port=8026,
+        served_model_name="qwen",
+        max_num_seqs=8,
+        max_model_len=2048,
+        max_num_batched_tokens=512,
+        kv_cache_memory_bytes=268435456,
+    )
+
+    assert "--enforce-eager" not in command
+    assert "--cpu-offload-gb" in command
+    config = json.loads(command[command.index("--compilation-config") + 1])
+    assert config == {
+        "cudagraph_mode": "FULL_AND_PIECEWISE",
+        "custom_ops": ["+unquantized_fused_moe"],
+    }
+    assert command[command.index("--max-cudagraph-capture-size") + 1] == "8"
+
+
 def test_local_benchmark_environment_bypasses_proxies():
     environment = local_benchmark_environment(
         {
@@ -147,6 +171,10 @@ def test_normalize_and_summarize_require_three_complete_fixed_length_runs():
     assert summary["output_throughput"]["median"] == pytest.approx(64.0)
     with pytest.raises(ValueError, match="at least 3"):
         summarize_repetitions(normalized[:2])
+
+    one_shot = summarize_repetitions(normalized[:1], minimum_repetitions=1)
+    assert one_shot["median_ttft_ms"]["median"] == pytest.approx(100.0)
+    assert one_shot["median_ttft_ms"]["stdev"] is None
 
 
 def test_normalize_rejects_early_eos():
@@ -269,6 +297,43 @@ def test_piecewise_telemetry_requires_capture_and_replay(mode, tiny_manifest, tm
     profile.write_text(json.dumps(backend_event) + "\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="capture and replay"):
         read_offload_telemetry(mode, tiny_manifest, profile)
+
+
+def test_full_and_piecewise_telemetry_requires_full_replay(tiny_manifest, tmp_path):
+    profile = tmp_path / "profile.jsonl"
+    backend = {
+        "event": "stock_uva",
+        "implementation": "vllm.model_executor.offloader.uva.UVAOffloader",
+        "cpu_offload_bytes": 1024,
+        "cpu_offload_max_bytes": 1024,
+    }
+    events = (
+        backend,
+        {"event": "cudagraph_capture", "runtime_mode": "PIECEWISE"},
+        {"event": "cudagraph_replay", "runtime_mode": "PIECEWISE"},
+        {"event": "cudagraph_capture", "runtime_mode": "FULL"},
+        {"event": "cudagraph_replay", "runtime_mode": "FULL"},
+    )
+    profile.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
+    )
+
+    telemetry = read_offload_telemetry(
+        "uva-full-and-piecewise", tiny_manifest, profile
+    )
+
+    assert telemetry["required_cudagraph_runtime_mode"] == "FULL"
+    assert telemetry["cudagraph_captures"] == 1
+    assert telemetry["cudagraph_replays"] == 1
+    assert telemetry["observed_cudagraph_capture_modes"] == ["FULL", "PIECEWISE"]
+    assert telemetry["observed_cudagraph_replay_modes"] == ["FULL", "PIECEWISE"]
+
+    profile.write_text(
+        "\n".join(json.dumps(event) for event in events[:-1]) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="FULL measurement"):
+        read_offload_telemetry("uva-full-and-piecewise", tiny_manifest, profile)
 
 
 def test_comparison_uses_latency_reduction_and_throughput_gain():

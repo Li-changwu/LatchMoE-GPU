@@ -15,6 +15,7 @@ from .manifest import OffloadManifest, canonical_json_bytes
 BENCHMARK_MODES = (
     "uva",
     "uva-piecewise",
+    "uva-full-and-piecewise",
     "latchmoe-eager",
     "latchmoe-piecewise",
 )
@@ -106,7 +107,19 @@ def build_server_command(
     ]
     if mode.startswith("uva"):
         command.extend(["--cpu-offload-gb", str(STOCK_UVA_CPU_OFFLOAD_GB)])
-    if mode.endswith("piecewise"):
+    if mode == "uva-full-and-piecewise":
+        command.extend(
+            [
+                "--compilation-config",
+                (
+                    '{"cudagraph_mode":"FULL_AND_PIECEWISE",'
+                    '"custom_ops":["+unquantized_fused_moe"]}'
+                ),
+                "--max-cudagraph-capture-size",
+                str(max_num_seqs),
+            ]
+        )
+    elif mode.endswith("piecewise"):
         command.extend(
             [
                 "--compilation-config",
@@ -228,9 +241,15 @@ def normalize_benchmark_result(
 
 def summarize_repetitions(
     repetitions: Sequence[dict[str, Any]],
+    *,
+    minimum_repetitions: int = 3,
 ) -> dict[str, dict[str, Any]]:
-    if len(repetitions) < 3:
-        raise ValueError("final benchmark summaries require at least 3 repetitions")
+    if minimum_repetitions < 1:
+        raise ValueError("minimum_repetitions must be positive")
+    if len(repetitions) < minimum_repetitions:
+        raise ValueError(
+            f"benchmark summary requires at least {minimum_repetitions} repetitions"
+        )
     summary: dict[str, dict[str, Any]] = {}
     for metric in SUMMARY_METRICS:
         values = [float(item["metrics"][metric]) for item in repetitions]
@@ -238,7 +257,7 @@ def summarize_repetitions(
             "values": values,
             "mean": statistics.fmean(values),
             "median": statistics.median(values),
-            "stdev": statistics.stdev(values),
+            "stdev": statistics.stdev(values) if len(values) > 1 else None,
             "min": min(values),
             "max": max(values),
         }
@@ -254,24 +273,39 @@ def read_offload_telemetry(
         for line in path.read_text(encoding="utf-8").splitlines()
         if line
     ]
-    graph_mode = mode.endswith("piecewise")
+    required_runtime_mode = None
+    if mode == "uva-full-and-piecewise":
+        required_runtime_mode = "FULL"
+    elif mode.endswith("piecewise"):
+        required_runtime_mode = "PIECEWISE"
+    all_captures = [
+        event for event in events if event.get("event") == "cudagraph_capture"
+    ]
+    all_replays = [
+        event for event in events if event.get("event") == "cudagraph_replay"
+    ]
     captures = [
         event
-        for event in events
-        if event.get("event") == "cudagraph_capture"
-        and event.get("runtime_mode") == "PIECEWISE"
+        for event in all_captures
+        if event.get("runtime_mode") == required_runtime_mode
     ]
     replays = [
         event
-        for event in events
-        if event.get("event") == "cudagraph_replay"
-        and event.get("runtime_mode") == "PIECEWISE"
+        for event in all_replays
+        if event.get("runtime_mode") == required_runtime_mode
     ]
-    if graph_mode and (not captures or not replays):
-        raise RuntimeError("PIECEWISE measurement has no CUDA graph capture and replay")
+    if required_runtime_mode and (not captures or not replays):
+        raise RuntimeError(
+            f"{required_runtime_mode} measurement has no CUDA graph capture and replay"
+        )
+    capture_modes = sorted({str(event.get("runtime_mode")) for event in all_captures})
+    replay_modes = sorted({str(event.get("runtime_mode")) for event in all_replays})
     graph_telemetry = {
         "cudagraph_captures": len(captures),
         "cudagraph_replays": len(replays),
+        "required_cudagraph_runtime_mode": required_runtime_mode,
+        "observed_cudagraph_capture_modes": capture_modes,
+        "observed_cudagraph_replay_modes": replay_modes,
     }
     if mode.startswith("uva"):
         matches = [event for event in events if event.get("event") == "stock_uva"]
@@ -302,14 +336,14 @@ def read_offload_telemetry(
         and event.get("scatter_mode") == "layer_index_add"
     ]
     full_capacity = manifest.num_slots == manifest.model.num_experts
-    if not graph_mode and full_capacity:
+    if required_runtime_mode is None and full_capacity:
         direct_layers = {int(event["layer_id"]) for event in direct_slot_events}
         if direct_layers != set(manifest.layer_ids):
             raise RuntimeError(
                 "ShareGPT measurement did not exercise every full-capacity "
                 "direct-slot layer"
             )
-    elif not graph_mode and not wave_events:
+    elif required_runtime_mode is None and not wave_events:
         raise RuntimeError("ShareGPT measurement did not exercise exact waves")
     if wave_events and len(device_wave_events) != len(wave_events):
         raise RuntimeError("not every exact wave used the CUDA device planner")
