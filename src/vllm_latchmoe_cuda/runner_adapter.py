@@ -8,6 +8,7 @@ from torch import nn
 
 from .core.waves import plan_device_exact_waves
 from .runtime import CudaLayerRuntime, WaveExecutionTrace
+from .routing import active_experts_from_topk
 from .split_ops import (
     eager_finish_compute,
     eager_needs_exact_waves,
@@ -48,6 +49,69 @@ def _capturable_weights_moe(
     return (expert_output * topk_weights.unsqueeze(-1)).sum(dim=1)
 
 
+def _resolve_modular_moe_kernel(experts_module: nn.Module):
+    quant_method = experts_module.quant_method
+    kernel = getattr(quant_method, "moe_kernel", None)
+    if kernel is None:
+        kernel = getattr(quant_method, "kernel", None)
+    return kernel
+
+
+def _apply_modular_moe_kernel(
+    experts_module: nn.Module,
+    *,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    global_num_experts: int,
+    expert_map: torch.Tensor | None,
+) -> torch.Tensor:
+    kernel = _resolve_modular_moe_kernel(experts_module)
+    if kernel is None:
+        raise RuntimeError("LatchMoE requires the vLLM modular MoE kernel")
+    result = kernel.apply(
+        hidden_states=hidden_states,
+        w1=w13,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=experts_module.activation,
+        global_num_experts=global_num_experts,
+        expert_map=expert_map,
+        apply_router_weight_on_input=experts_module.apply_router_weight_on_input,
+        shared_experts_input=hidden_states,
+    )
+    if isinstance(result, tuple):
+        raise TypeError("unexpected shared-expert result from Qwen3 routed experts")
+    return result
+
+
+def _validate_piecewise_slot_capacity(
+    *,
+    num_slots: int,
+    num_experts: int,
+    top_k: int,
+    max_capture_size: int | None,
+) -> int:
+    if num_slots >= num_experts:
+        return num_experts
+    if not max_capture_size or top_k <= 0:
+        raise RuntimeError(
+            "finite-slot LatchMoE PIECEWISE requires finalized "
+            "max_cudagraph_capture_size and FusedMoE.top_k"
+        )
+    required_slots = min(num_experts, int(max_capture_size) * top_k)
+    if num_slots < required_slots:
+        raise RuntimeError(
+            "finite-slot LatchMoE PIECEWISE capture can overflow: "
+            f"slots={num_slots}, required={required_slots}, "
+            f"max_capture_size={max_capture_size}, top_k={top_k}"
+        )
+    return required_slots
+
+
 @torch.compiler.disable
 def execute_exact_waves(
     runtime: CudaLayerRuntime,
@@ -57,15 +121,27 @@ def execute_exact_waves(
     *,
     transfer_aware: bool = True,
     kernel_callback=None,
+    stage_kernel_callback=None,
+    active_experts=None,
 ) -> torch.Tensor:
     if runtime.stage_pool is None:
         raise RuntimeError("exact waves require a CUDA stage pool")
-    runtime.release_pending_for_transfer()
+    if kernel_callback is not None and stage_kernel_callback is not None:
+        raise ValueError("only one exact-wave kernel callback may be provided")
+    main_slots_overwritten = False
+    if runtime.stage_pool.reuses_main_slots:
+        runtime.main_slot_pool.acquire(
+            runtime, runtime.stage_pool.transfer_engine.stream
+        )
+        main_slots_overwritten = True
+    else:
+        runtime.release_pending_for_transfer()
     plan = plan_device_exact_waves(
         topk_ids,
         topk_weights,
-        capacity=runtime.num_slots,
+        capacity=runtime.stage_pool.num_slots,
         num_experts=runtime.num_experts,
+        active_experts=active_experts,
     )
     bytes_per_expert = (
         runtime.host_w13[0].numel() * runtime.host_w13.element_size()
@@ -98,8 +174,6 @@ def execute_exact_waves(
     )
     pair_outputs: list[torch.Tensor] = []
     scatter_indices: list[torch.Tensor] = []
-    main_slots_overwritten = False
-
     if kernel_callback is not None:
         runtime.acquire_main_slots_for_current_stream()
 
@@ -128,7 +202,15 @@ def execute_exact_waves(
             bank = runtime.stage_pool.wait_ready(staged)
             wave = wave_by_id[wave_id]
             pair_hidden = hidden_states.index_select(0, wave.token_indices)
-            if kernel_callback is None:
+            if stage_kernel_callback is not None:
+                pair_output = stage_kernel_callback(
+                    bank.w13,
+                    bank.w2,
+                    pair_hidden,
+                    wave.physical_ids,
+                    wave.pair_weights,
+                )
+            elif kernel_callback is None:
                 pair_output = _capturable_weights_moe(
                     bank.w13,
                     bank.w2,
@@ -138,8 +220,9 @@ def execute_exact_waves(
                 )
             else:
                 main_slots_overwritten = True
-                runtime.slot_w13.copy_(bank.w13)
-                runtime.slot_w2.copy_(bank.w2)
+                wave_slots = int(bank.w13.shape[0])
+                runtime.slot_w13.narrow(0, 0, wave_slots).copy_(bank.w13)
+                runtime.slot_w2.narrow(0, 0, wave_slots).copy_(bank.w2)
                 runtime.log2phy.copy_(wave.expert_map)
                 pair_output = kernel_callback(
                     pair_hidden, wave.logical_ids, wave.pair_weights
@@ -147,6 +230,9 @@ def execute_exact_waves(
             pair_outputs.append(pair_output.float())
             scatter_indices.append(wave.token_indices)
             runtime.stage_pool.record_compute_done(bank.bank_id)
+            if runtime.stage_pool.reuses_main_slots and bank.bank_id == 0:
+                assert bank.compute_done is not None
+                runtime.main_slot_pool.record_external_compute_done(bank.compute_done)
             completed.add(wave_id)
             free_banks.append(bank.bank_id)
             free_banks.sort()
@@ -186,7 +272,7 @@ def eager_slot_moe(
         raise ValueError("topk_ids and topk_weights must have identical shapes")
     if hidden_states.shape[0] != topk_ids.shape[0]:
         raise ValueError("routing row count must equal hidden-state row count")
-    active = tuple(int(value) for value in torch.unique(topk_ids).cpu().tolist())
+    active = active_experts_from_topk(topk_ids)
     snapshot = runtime.stage_sync(active)
     handle = runtime.begin_compute(snapshot)
     try:
@@ -219,11 +305,6 @@ def install_vllm_forward_adapter(
     graph_compute = None
     graph_finish = None
     if graph_mode:
-        if runtime.num_slots != runtime.num_experts:
-            raise RuntimeError(
-                "LatchMoE PIECEWISE requires one stable slot per expert: "
-                f"slots={runtime.num_slots}, experts={runtime.num_experts}"
-            )
         from vllm.config import get_cached_compilation_config
 
         from .graph_ops import (
@@ -235,6 +316,12 @@ def install_vllm_forward_adapter(
         )
 
         compilation_config = get_cached_compilation_config()
+        _validate_piecewise_slot_capacity(
+            num_slots=runtime.num_slots,
+            num_experts=runtime.num_experts,
+            top_k=int(getattr(experts_module, "top_k", 0)),
+            max_capture_size=compilation_config.max_cudagraph_capture_size,
+        )
         if compilation_config.splitting_ops is None:
             compilation_config.splitting_ops = []
         for op in GRAPH_SPLITTING_OPS:
@@ -269,28 +356,50 @@ def install_vllm_forward_adapter(
             return None, result
         advance_moe_layer_index(experts_module)
         if eager_needs_exact_waves(runtime, topk_ids):
+            if _resolve_modular_moe_kernel(experts_module) is not None:
 
-            def original_kernel(pair_hidden, logical_ids, pair_weights):
-                pair_result = experts_module.quant_method.apply(
-                    layer=experts_module,
-                    x=pair_hidden,
-                    topk_weights=pair_weights,
-                    topk_ids=logical_ids,
-                    shared_experts_input=pair_hidden,
-                )
-                if isinstance(pair_result, tuple):
-                    raise TypeError(
-                        "unexpected shared-expert result from Qwen3 routed experts"
+                def stage_kernel(w13, w2, pair_hidden, physical_ids, pair_weights):
+                    return _apply_modular_moe_kernel(
+                        experts_module,
+                        hidden_states=pair_hidden,
+                        topk_weights=pair_weights,
+                        topk_ids=physical_ids,
+                        w13=w13,
+                        w2=w2,
+                        global_num_experts=int(w13.shape[0]),
+                        expert_map=None,
                     )
-                return pair_result
 
-            result = execute_exact_waves(
-                runtime,
-                hidden_states,
-                topk_ids,
-                topk_weights,
-                kernel_callback=original_kernel,
-            )
+                result = execute_exact_waves(
+                    runtime,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    stage_kernel_callback=stage_kernel,
+                )
+            else:
+
+                def original_kernel(pair_hidden, logical_ids, pair_weights):
+                    pair_result = experts_module.quant_method.apply(
+                        layer=experts_module,
+                        x=pair_hidden,
+                        topk_weights=pair_weights,
+                        topk_ids=logical_ids,
+                        shared_experts_input=pair_hidden,
+                    )
+                    if isinstance(pair_result, tuple):
+                        raise TypeError(
+                            "unexpected shared-expert result from Qwen3 routed experts"
+                        )
+                    return pair_result
+
+                result = execute_exact_waves(
+                    runtime,
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    kernel_callback=original_kernel,
+                )
             return None, result
         eager_prepare_compute(runtime, topk_ids)
         try:

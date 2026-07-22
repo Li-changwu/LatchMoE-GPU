@@ -86,20 +86,42 @@ class CudaStagePool:
         w2_shape: tuple[int, ...],
         dtype: torch.dtype,
         buffer_count: int = 2,
+        primary_w13: torch.Tensor | None = None,
+        primary_w2: torch.Tensor | None = None,
     ):
         if buffer_count != 2:
             raise ValueError("LatchMoE B2 requires exactly two stage banks")
         self.device = device
         self.num_slots = num_slots
         self.transfer_engine = CudaTransferEngine(device)
-        self.banks = tuple(
-            StageBank(
-                bank_id=index,
+        if (primary_w13 is None) != (primary_w2 is None):
+            raise ValueError("both primary stage tensors must be provided together")
+        self.reuses_main_slots = primary_w13 is not None
+        if primary_w13 is not None and primary_w2 is not None:
+            if (
+                tuple(primary_w13.shape[1:]) != w13_shape
+                or tuple(primary_w2.shape[1:]) != w2_shape
+            ):
+                raise ValueError("primary stage tensors have an incompatible layout")
+            if primary_w13.shape[0] < num_slots or primary_w2.shape[0] < num_slots:
+                raise ValueError("primary stage tensors are smaller than wave capacity")
+            first = StageBank(
+                bank_id=0,
+                w13=primary_w13.narrow(0, 0, num_slots),
+                w2=primary_w2.narrow(0, 0, num_slots),
+            )
+        else:
+            first = StageBank(
+                bank_id=0,
                 w13=torch.empty((num_slots, *w13_shape), dtype=dtype, device=device),
                 w2=torch.empty((num_slots, *w2_shape), dtype=dtype, device=device),
             )
-            for index in range(buffer_count)
+        second = StageBank(
+            bank_id=1,
+            w13=torch.empty((num_slots, *w13_shape), dtype=dtype, device=device),
+            w2=torch.empty((num_slots, *w2_shape), dtype=dtype, device=device),
         )
+        self.banks = (first, second)
 
     def data_ptrs(self) -> tuple[tuple[int, int], ...]:
         return tuple((bank.w13.data_ptr(), bank.w2.data_ptr()) for bank in self.banks)
@@ -153,8 +175,12 @@ class CudaMainSlotPool:
         self.w2 = torch.empty((num_slots, *w2_shape), dtype=dtype, device=device)
         self.transfer_engine = CudaTransferEngine(device)
         self.owner: CudaLayerRuntime | None = None
+        self.external_compute_done: torch.cuda.Event | None = None
 
     def acquire(self, runtime: CudaLayerRuntime, stream: torch.cuda.Stream) -> None:
+        if self.external_compute_done is not None:
+            stream.wait_event(self.external_compute_done)
+            self.external_compute_done = None
         if self.owner is runtime:
             runtime._release_pending_to_stream(stream)
             return
@@ -162,6 +188,9 @@ class CudaMainSlotPool:
             self.owner._release_pending_to_stream(stream)
         runtime.invalidate_main_slots()
         self.owner = runtime
+
+    def record_external_compute_done(self, event: torch.cuda.Event) -> None:
+        self.external_compute_done = event
 
 
 class CudaLayerRuntime:
@@ -228,6 +257,8 @@ class CudaLayerRuntime:
                 w13_shape=tuple(self.host_w13.shape[1:]),
                 w2_shape=tuple(self.host_w2.shape[1:]),
                 dtype=self.host_w13.dtype,
+                primary_w13=self.main_slot_pool.w13,
+                primary_w2=self.main_slot_pool.w2,
             )
         self.last_wave_trace: WaveExecutionTrace | None = None
         self.event_writer = event_writer
@@ -236,12 +267,23 @@ class CudaLayerRuntime:
         self._active_compute: ComputeHandle | None = None
         self._pending_computes: list[PendingCompute] = []
         self._pending_map_copies: list[PendingMapCopy] = []
+        self._free_map_buffers = [self._new_cpu_map(), self._new_cpu_map()]
+        self._graph_overflow_active: tuple[int, ...] | None = None
         self.graph_token = torch.zeros((), dtype=torch.int64, device=device)
         self._stable_ptrs = self.data_ptrs()
 
     @property
     def pending_map_copy_count(self) -> int:
         return len(self._pending_map_copies)
+
+    @property
+    def map_buffer_count(self) -> int:
+        return len(self._free_map_buffers) + len(self._pending_map_copies)
+
+    def _new_cpu_map(self) -> torch.Tensor:
+        return torch.empty(
+            (self.num_experts,), dtype=torch.int32, device="cpu", pin_memory=True
+        )
 
     def data_ptrs(self) -> dict[str, int]:
         return {
@@ -277,19 +319,43 @@ class CudaLayerRuntime:
         self.mapping_version += 1
         self.assert_stable_addresses()
 
-    def _normalize_active(self, active_experts: Iterable[int]) -> tuple[int, ...]:
+    def _normalize_active(
+        self, active_experts: Iterable[int], *, enforce_capacity: bool = True
+    ) -> tuple[int, ...]:
         active = tuple(dict.fromkeys(int(value) for value in active_experts))
         invalid = tuple(
             value for value in active if value < 0 or value >= self.num_experts
         )
         if invalid:
             raise ValueError(f"layer {self.layer_id} has invalid expert ids: {invalid}")
-        if len(active) > self.num_slots:
+        if enforce_capacity and len(active) > self.num_slots:
             raise ActiveExpertCapacityError(
                 f"layer={self.layer_id}, active_count={len(active)}, "
                 f"slot_count={self.num_slots}"
             )
         return active
+
+    @property
+    def graph_overflow_active(self) -> tuple[int, ...] | None:
+        return self._graph_overflow_active
+
+    def prepare_graph_compute(self, active_experts: Iterable[int]) -> bool:
+        """Stage a graph-safe working set or defer an overflow to exact waves."""
+        active = self._normalize_active(active_experts, enforce_capacity=False)
+        if len(active) > self.num_slots:
+            if self._active_compute is not None:
+                raise RuntimeError(f"layer {self.layer_id} already has active compute")
+            self._graph_overflow_active = active
+            return False
+        self._graph_overflow_active = None
+        self.prepare_compute_async(active)
+        return True
+
+    def finish_graph_compute(self) -> PendingCompute | None:
+        if self._graph_overflow_active is not None:
+            self._graph_overflow_active = None
+            return None
+        return self.finish_compute_async()
 
     def _choose_slot(self, expert_id: int, reserved: set[int]) -> int:
         if self.num_slots == self.num_experts:
@@ -423,16 +489,19 @@ class CudaLayerRuntime:
         *,
         non_blocking: bool,
     ) -> LayerMappingSnapshot:
-        self._pending_map_copies = [
-            pending for pending in self._pending_map_copies if not pending.event.query()
-        ]
-        cpu_map = torch.full(
-            (self.num_experts,),
-            -1,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
+        still_pending: list[PendingMapCopy] = []
+        for pending in self._pending_map_copies:
+            if pending.event.query():
+                self._free_map_buffers.append(pending.cpu_map)
+            else:
+                still_pending.append(pending)
+        self._pending_map_copies = still_pending
+        cpu_map = (
+            self._free_map_buffers.pop()
+            if self._free_map_buffers
+            else self._new_cpu_map()
         )
+        cpu_map.fill_(-1)
         for key, slot_id in self.bank.ready_mapping().items():
             if key.layer_id == self.layer_id:
                 cpu_map[key.expert_id] = slot_id
@@ -441,6 +510,8 @@ class CudaLayerRuntime:
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream(self.log2phy.device))
             self._pending_map_copies.append(PendingMapCopy(cpu_map, event))
+        else:
+            self._free_map_buffers.append(cpu_map)
         self.mapping_version += 1
         return LayerMappingSnapshot(
             layer_id=self.layer_id,

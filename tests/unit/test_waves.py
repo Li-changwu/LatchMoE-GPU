@@ -11,6 +11,8 @@ from vllm_latchmoe_cuda.core.waves import (
     validate_pair_coverage,
 )
 from vllm_latchmoe_cuda.errors import PairIntegrityError
+from vllm_latchmoe_cuda.offloader import WAVE_SLOTS_ENV, _wave_slot_count
+from vllm_latchmoe_cuda.runner_adapter import _validate_piecewise_slot_capacity
 
 
 def _routing_with_union(union: int, top_k: int = 8):
@@ -103,3 +105,47 @@ def test_device_wave_plan_rejects_out_of_range_experts():
 
     with pytest.raises(ValueError, match="invalid expert ids"):
         plan_device_exact_waves(ids, weights, capacity=2, num_experts=16)
+
+
+def test_piecewise_finite_slots_cover_every_captured_routed_pair():
+    assert (
+        _validate_piecewise_slot_capacity(
+            num_slots=64,
+            num_experts=128,
+            top_k=8,
+            max_capture_size=8,
+        )
+        == 64
+    )
+    with pytest.raises(RuntimeError, match="required=64"):
+        _validate_piecewise_slot_capacity(
+            num_slots=32,
+            num_experts=128,
+            top_k=8,
+            max_capture_size=8,
+        )
+
+
+def test_piecewise_full_capacity_does_not_require_capture_metadata():
+    assert (
+        _validate_piecewise_slot_capacity(
+            num_slots=128,
+            num_experts=128,
+            top_k=0,
+            max_capture_size=None,
+        )
+        == 128
+    )
+
+
+def test_wave_capacity_is_decoupled_from_main_graph_slots(monkeypatch):
+    monkeypatch.delenv(WAVE_SLOTS_ENV, raising=False)
+    assert _wave_slot_count(64) == 32
+    assert _wave_slot_count(16) == 16
+
+    monkeypatch.setenv(WAVE_SLOTS_ENV, "8")
+    assert _wave_slot_count(64) == 8
+
+    monkeypatch.setenv(WAVE_SLOTS_ENV, "65")
+    with pytest.raises(ValueError, match=WAVE_SLOTS_ENV):
+        _wave_slot_count(64)

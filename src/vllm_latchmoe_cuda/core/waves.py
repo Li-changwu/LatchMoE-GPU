@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..errors import PairIntegrityError
+from ..routing import active_experts_from_topk
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ def plan_device_exact_waves(
     *,
     capacity: int,
     num_experts: int,
+    active_experts: Iterable[int] | None = None,
 ) -> DeviceExactWavePlan:
     """Build pair descriptors with device tensor operations.
 
@@ -153,10 +155,10 @@ def plan_device_exact_waves(
     if topk_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("topk_ids must use an integer dtype")
 
-    active = tuple(
-        int(value)
-        for value in torch.unique(topk_ids, sorted=True).detach().cpu().tolist()
-    )
+    if active_experts is None:
+        active = active_experts_from_topk(topk_ids)
+    else:
+        active = tuple(sorted({int(value) for value in active_experts}))
     invalid = tuple(expert for expert in active if expert < 0 or expert >= num_experts)
     if invalid:
         raise ValueError(f"invalid expert ids: {invalid}")

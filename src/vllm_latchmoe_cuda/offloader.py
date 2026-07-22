@@ -18,6 +18,17 @@ from .runtime import CudaLayerRuntime, CudaMainSlotPool, CudaStagePool
 
 _EXPERT_WEIGHT_NAMES = frozenset({"w13_weight", "w2_weight"})
 TOTAL_OFFLOAD_BUDGET_BYTES = 14 * 1024**3
+WAVE_SLOTS_ENV = "VLLM_LATCHMOE_WAVE_SLOTS"
+
+
+def _wave_slot_count(main_slots: int) -> int:
+    value = os.getenv(WAVE_SLOTS_ENV)
+    wave_slots = min(main_slots, 32) if value is None else int(value)
+    if wave_slots <= 0 or wave_slots > main_slots:
+        raise ValueError(
+            f"{WAVE_SLOTS_ENV} must be in [1, {main_slots}], got {wave_slots}"
+        )
+    return wave_slots
 
 
 def _post_load_named_parameters(
@@ -212,13 +223,24 @@ class CudaSEWOffloader(BaseOffloader):
                     dtype=host_w13.dtype,
                 )
                 if self.manifest.num_slots < self.manifest.model.num_experts:
+                    wave_slots = _wave_slot_count(self.manifest.num_slots)
                     self.stage_pool = CudaStagePool(
                         device=device,
-                        num_slots=self.manifest.num_slots,
+                        num_slots=wave_slots,
                         w13_shape=tuple(host_w13.shape[1:]),
                         w2_shape=tuple(host_w2.shape[1:]),
                         dtype=host_w13.dtype,
+                        primary_w13=self.main_slot_pool.w13,
+                        primary_w2=self.main_slot_pool.w2,
                     )
+                    if self.event_writer is not None:
+                        self.event_writer.write(
+                            "slot_pool_config",
+                            main_slots=self.manifest.num_slots,
+                            wave_slots=wave_slots,
+                            stage_bank_count=len(self.stage_pool.banks),
+                            reuses_main_bank=self.stage_pool.reuses_main_slots,
+                        )
             elif self.stage_pool is not None and tuple(
                 self.stage_pool.banks[0].w13.shape[1:]
             ) != tuple(host_w13.shape[1:]):

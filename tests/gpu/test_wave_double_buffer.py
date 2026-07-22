@@ -39,6 +39,8 @@ def test_wave_executor_alternates_two_stable_stage_banks(
         runtime.stage_pool.banks[0].w13.data_ptr()
         != runtime.stage_pool.banks[1].w13.data_ptr()
     )
+    assert runtime.stage_pool.reuses_main_slots is True
+    assert runtime.stage_pool.banks[0].w13.data_ptr() == runtime.slot_w13.data_ptr()
 
 
 def test_transfer_aware_prefetch_never_changes_compute_order(

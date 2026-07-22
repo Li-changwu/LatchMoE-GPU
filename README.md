@@ -91,8 +91,50 @@ pairs。LatchMoE 先对 active expert 去重，再用连续 H2D copy 把每个�
    ID 的动态变化。共享 slot pool 通过 CUDA event 保证上一层计算结束后才能覆盖。
 5. Latch adapter 显式推进 vLLM `forward_context.moe_layer_index`。缺少这一步会让第一个
    非 offload MoE 层错误解析为 layer 0，并使后续层全部错位。
-6. eager 路径仍保留 32-slot LRU、CUDA device exact-pair planner 和双 stage bank，作为
-   容量受限实现与独立 ablation；graph 路径不走 exact waves。
+6. eager 路径保留 LRU、CUDA device exact-pair planner 和双 stage bank；有限槽位 graph
+   对捕获 shape 走单工作集 replay，对非捕获 overflow shape 走 exact waves。
+
+## 2026-07-16 有限槽位 CUDA Graph 改进
+
+本轮审计确认，旧 graph 路径虽然能 replay，但强制 `num_slots == num_experts`。这使
+Qwen3 的 128 个 identity slot 占用约 1.125 GiB，也让真正的有限显存配置只能退回
+eager。现在 PIECEWISE 支持有限 main slots，并以捕获容量合同保证图内不会 overflow：
+
+```text
+required_main_slots = min(num_experts, max_cudagraph_capture_size * top_k)
+```
+
+当前 `max_cudagraph_capture_size=8`、`top_k=8`，因此使用 64 个 main slots。更大的
+非捕获 prefill/mixed shape 走 exact pair waves。wave capacity 与 main capacity 解耦，默认
+为 `min(main_slots, 32)`，可用 `VLLM_LATCHMOE_WAVE_SLOTS` 调整。双缓冲 bank 0 复用
+main pool，只有 bank 1 是额外分配；64 main + 32 wave 的总设备权重区为 96 个 expert
+slot，约 864 MiB。
+
+overflow 路径还改为让 vLLM modular Triton MoE kernel 直接读取 stage bank，删除旧实现
+每个 wave 的 `stage bank -> main slot` 整槽 D2D copy。共享 main/stage bank 的覆盖由
+CUDA event 连接到下一次 H2D，避免跨 stream 提前复用。
+
+针对单并发的 1×8 路由，还增加了 active-set 自适应路径：不再为 8 个 ID 启动 GPU
+`torch.unique`，而是直接 D2H 64 bytes 后在 CPU 去重；A6000 微基准由约 `58.8 us`
+降至 `12.4 us`。超过 512 个 routed IDs 时仍使用 GPU unique。512-byte `log2phy`
+发布也改为复用 event 守护的 pinned map buffers，避免每层重复创建 host tensor。
+
+完整 Qwen smoke 使用 64-slot manifest，实际完成 1/2/4/8-token PIECEWISE 图捕获与
+重放；同一运行的 192 routed-pair prefill 走了 3 个 32-slot exact waves。与官方 UVA
+eager reference 的 3 个 deterministic prompt、12 个生成 token 完全一致，实际卸载
+字节均为 `15,798,475,264`。
+
+按“先测单并发”的顺序，另做了 50 请求、每请求 32 token、`max_concurrency=1`、
+`max_num_seqs=1` 的单轮 exploratory graph-to-graph 检查。该配置使用 32 main slots 和
+32-slot wave bank，总设备权重区为 64 个 expert slot（约 576 MiB），只捕获 1-token 图。
+LatchMoE 为 `6.8072 token/s`，UVA 为 `4.6069 token/s`，前者高 `47.76%`；TPOT p50
+由 `144.79` 降至 `115.42 ms/token`，TTFT p50 由 `2189.12` 降至 `968.12 ms`。两侧
+workload hash、source state 和 offload bytes 相同。该结果只有一轮且输出长度不同于
+上面的正式 128-token 合同，不能替代三轮正式结果；它也早于最后两项 host-control
+微优化，因此是当前实现的保守 serving 基线。
+
+详细设计审计与剩余风险见
+[`docs/gpu_port/DESIGN_REVIEW_20260716.md`](docs/gpu_port/DESIGN_REVIEW_20260716.md)。
 
 ### Eager 历史结果
 
@@ -216,10 +258,79 @@ AOT artifact 绕过新的 layer adapter，并清除本地请求的 proxy 环境�
 - `artifacts/sharegpt-c8-latchmoe-piecewise-20260715-r1/`
 - `artifacts/sharegpt-c8-piecewise-comparison-20260715-r1.json`
 
-两个 graph 目录的 `run_manifest.json` 都是 `status=completed`、`exit_code=0`、
-`final_result=true`，拥有相同 source state；各自的 `SHA256SUMS` 已通过
-`sha256sum -c`。原始结果、client/server log、normalized measurement、合同和 graph
-profile 均保留在目录内。
+## 本地 Qwen3-30B INT8 图重放消融
+
+单张 RTX A6000 不能把原始 BF16 checkpoint（约 57 GB）完整放入显存。本仓库的
+`benchmark/scripts/run_int8_graph_ablation.py` 使用 vLLM `experts_int8` 在加载期间量化
+Qwen3-MoE 的专家矩阵；其余很小的 dense/router 权重仍以 BF16 计算，且没有设置
+`--cpu-offload-gb`。这使完整模型常驻 GPU，显存占用约 29.96 GiB。eager 与 PIECEWISE
+两组共享同一模型、请求、调度、KV 和 `VLLM_COMPILE` 配置，唯一运行时变量是
+`cudagraph_mode=NONE/PIECEWISE`。这里没有使用 `--enforce-eager`，因为它还会关闭
+`torch.compile`，会引入第二个控制变量。
+
+```bash
+RUN_ID=$(date -u +%Y%m%dT%H%M%S)
+$PY benchmark/scripts/run_int8_graph_ablation.py \
+  --artifact-dir "artifacts/${RUN_ID}-int8-eager-graph"
+$PY benchmark/scripts/plot_int8_graph_ablation.py \
+  "artifacts/${RUN_ID}-int8-eager-graph/results.json" \
+  "artifacts/${RUN_ID}-int8-eager-graph/int8_eager_vs_graph.png"
+```
+
+2026-07-22 本机运行使用 ShareGPT 50 条、每条生成 128 token、并发 8、3 轮测量。eager
+中位 TPOT 为 35.294 ms/token（171.450 token/s），PIECEWISE 为 27.800 ms/token
+（217.332 token/s），分别降低 21.23% 和提高 26.76%。两组均完成 50/50 请求、输出
+6,400 token；graph server 日志记录了 1/2/4/8/16-token PIECEWISE capture，capture
+额外占用约 0.07 GiB。结果目录和图由脚本保存在 `artifacts/<run-id>-int8-eager-graph/`。
+
+上一版绘图把完整 TPOT 近似为 Device Execution，并把 Host-induced Device Gaps 设为
+0；它只能用于端到端 graph 对比，不能用于解释 CUDA timeline。需要做时间分解时使用
+下面的 profiler 实验。
+
+### CUDA timeline 四数据集实验
+
+`prepare_profiler_datasets.py` 固定 seed 42，为 ShareGPT、LongBench `2wikimqa`、
+HumanEval 和 GSM8K 各准备 50 条 custom JSONL。`run_int8_profiler_ablation.py` 对每个
+数据集分别运行 `cudagraph_mode=NONE/PIECEWISE`，每个 case 启动独立 server，并在
+warmup 后通过 `/start_profile` 采集 PyTorch/CUPTI CUDA timeline。两侧都保留
+`VLLM_COMPILE`、INT8、调度、KV cache 和请求合同，唯一运行时变量为 graph replay。
+
+对每个 `execute_context_0(0)_generation_N(N)` 纯 decode iteration，Device Execution
+定义为设备实际执行 kernel 的忙碌时间：分析器只对区间内 `kernel` 时间取并集，包括
+Attention、GroupedMatmul/MoE、Norm 等设备计算，明确不包含 `gpu_memcpy` 和
+`gpu_memset`。跨 CUDA stream 的重叠 kernel 不会重复计时。
+
+Host-induced Device Gaps 定义为平均 TPOT 减去上述 kernel-only Device Execution，表示
+设备没有执行 kernel 的剩余关键路径时间；其中包括 host 调度、算子下发、运行时同步、
+graph replay 发起、`gpu_memcpy`/`gpu_memset` 以及这些行为造成的设备空闲。两部分只分解
+decode TPOT，均不包含 prefill 和 TTFT。
+
+```bash
+$PY benchmark/scripts/prepare_profiler_datasets.py \
+  --sharegpt /home/lcw/datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --model /home/lcw/model --output-dir artifacts/profiler-datasets \
+  --num-samples 50 --max-input-tokens 768 --seed 42
+
+RUN_ID=$(date -u +%Y%m%dT%H%M%S)
+$PY benchmark/scripts/run_int8_profiler_ablation.py \
+  --dataset-dir artifacts/profiler-datasets \
+  --artifact-dir "artifacts/${RUN_ID}-int8-cuda-timeline" \
+  --num-prompts 50 --output-len 128 --max-concurrency 8 \
+  --profile-delay-iterations 16 --profile-iterations 80
+$PY benchmark/scripts/plot_profiler_ablation.py \
+  "artifacts/${RUN_ID}-int8-cuda-timeline/results.json" \
+  "artifacts/${RUN_ID}-int8-cuda-timeline/int8_cuda_timeline_ablation.png"
+```
+
+2026-07-22 本机结果位于
+`artifacts/20260722T113657-int8-cuda-timeline/`。8 个 case 均完成 50/50 请求，每份
+trace 包含 80 个纯 decode iteration。eager 四组的平均 Host-induced Device Gaps 为
+28.64、35.09、36.88、40.49 ms；graph 分别为 0.46、0.90、0.42、0.51 ms。graph
+trace 每份包含 3,920 次 `cudaGraphLaunch`，eager trace 为 0 次。
+
+每个 case 目录都保留原始 `.pt.trace.json`、`timeline_summary.json`、client/server log
+和启动命令；顶层 `contract.json`、`results.json` 与数据集 manifest 绑定了模型、请求和
+profiler 合同。
 
 历史 eager artifact 仍保留在：
 

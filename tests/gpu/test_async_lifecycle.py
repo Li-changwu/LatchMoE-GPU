@@ -84,6 +84,21 @@ def test_async_map_publication_uses_pinned_lifetime_guard(
         runtime.validate_snapshot(first)
 
 
+def test_async_map_publication_reuses_pinned_buffers(
+    tiny_manifest, tiny_decoder_factory
+):
+    runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+
+    for step in range(20):
+        runtime.stage_async((step % 4, (step + 1) % 4))
+        torch.cuda.synchronize()
+
+    runtime.stage_async((0, 1))
+
+    assert runtime.map_buffer_count <= 2
+    assert all(copy.cpu_map.is_pinned() for copy in runtime._pending_map_copies)
+
+
 def test_shared_main_slots_wait_and_reload_across_layers(
     tiny_manifest, tiny_decoder_factory
 ):

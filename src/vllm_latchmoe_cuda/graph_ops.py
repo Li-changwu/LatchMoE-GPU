@@ -9,6 +9,8 @@ from torch import nn
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .runtime import CudaLayerRuntime
+from .runner_adapter import _apply_modular_moe_kernel, execute_exact_waves
+from .routing import active_experts_from_topk
 from .vllm_context import advance_moe_layer_index
 
 
@@ -60,8 +62,8 @@ def _stage_experts(
         or log2phy.data_ptr() != runtime.log2phy.data_ptr()
     ):
         raise RuntimeError("graph staging tensors do not match the registered runtime")
-    active = tuple(int(value) for value in torch.unique(topk_ids).cpu().tolist())
-    runtime.prepare_compute_async(active)
+    active = active_experts_from_topk(topk_ids)
+    runtime.prepare_graph_compute(active)
 
 
 def _stage_experts_fake(
@@ -92,27 +94,43 @@ def _fused_moe_compute(
     ):
         raise RuntimeError("graph compute tensors do not match the registered runtime")
     experts_module = context.experts_module
-    quant_method = experts_module.quant_method
-    moe_kernel = getattr(quant_method, "moe_kernel", None)
-    if moe_kernel is None:
-        moe_kernel = getattr(quant_method, "kernel", None)
-    if moe_kernel is None:
-        raise RuntimeError("LatchMoE graph mode requires the vLLM modular MoE kernel")
-    result = moe_kernel.apply(
+    overflow_active = runtime.graph_overflow_active
+    if overflow_active is not None:
+
+        def stage_kernel(w13, w2, pair_hidden, physical_ids, pair_weights):
+            return _apply_modular_moe_kernel(
+                experts_module,
+                hidden_states=pair_hidden,
+                topk_weights=pair_weights,
+                topk_ids=physical_ids,
+                w13=w13,
+                w2=w2,
+                global_num_experts=int(w13.shape[0]),
+                expert_map=None,
+            )
+
+        return execute_exact_waves(
+            runtime,
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            stage_kernel_callback=stage_kernel,
+            active_experts=overflow_active,
+        )
+
+    identity_slots = runtime.num_slots == runtime.num_experts
+    return _apply_modular_moe_kernel(
+        experts_module,
         hidden_states=hidden_states,
-        w1=slot_w13,
-        w2=slot_w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=experts_module.activation,
-        global_num_experts=runtime.num_slots,
-        expert_map=None,
-        apply_router_weight_on_input=experts_module.apply_router_weight_on_input,
-        shared_experts_input=hidden_states,
+        w13=slot_w13,
+        w2=slot_w2,
+        global_num_experts=(
+            runtime.num_slots if identity_slots else runtime.num_experts
+        ),
+        expert_map=None if identity_slots else log2phy,
     )
-    if isinstance(result, tuple):
-        raise TypeError("unexpected shared-expert result from Qwen3 routed experts")
-    return result
 
 
 def _fused_moe_compute_fake(
@@ -134,7 +152,7 @@ def _finish_experts(
 ) -> None:
     del output
     runtime = _get_context(runtime_id).runtime
-    runtime.finish_compute_async()
+    runtime.finish_graph_compute()
     graph_token.add_(1)
 
 

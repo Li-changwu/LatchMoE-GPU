@@ -14,6 +14,7 @@ class CorrectnessMismatchError(AssertionError):
 
 STOCK_UVA_CPU_OFFLOAD_GB = 14.0
 CORRECTNESS_MAX_NUM_SEQS = 32
+CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE = 8
 
 
 @dataclass(frozen=True)
@@ -183,7 +184,11 @@ def build_engine_kwargs(
 ) -> dict[str, object]:
     compilation_config = None
     if not mode.enforce_eager:
-        compilation_config = {"cudagraph_mode": "PIECEWISE"}
+        compilation_config = {
+            "cudagraph_mode": "PIECEWISE",
+            "custom_ops": ["+unquantized_fused_moe"],
+            "max_cudagraph_capture_size": CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE,
+        }
     kwargs: dict[str, object] = {
         "model": manifest.model.path,
         "revision": manifest.model.revision,

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from vllm_latchmoe_cuda.correctness import (
+    CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE,
     CORRECTNESS_MAX_NUM_SEQS,
     STOCK_UVA_CPU_OFFLOAD_GB,
     CorrectnessMismatchError,
@@ -84,7 +85,11 @@ def test_engine_kwargs_lock_target_and_piecewise_mode(tiny_manifest):
     assert kwargs["tensor_parallel_size"] == 1
     assert kwargs["max_num_seqs"] == CORRECTNESS_MAX_NUM_SEQS == 32
     assert kwargs["enforce_eager"] is False
-    assert kwargs["compilation_config"] == {"cudagraph_mode": "PIECEWISE"}
+    assert kwargs["compilation_config"] == {
+        "cudagraph_mode": "PIECEWISE",
+        "custom_ops": ["+unquantized_fused_moe"],
+        "max_cudagraph_capture_size": CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE,
+    }
 
 
 def test_engine_kwargs_enable_stock_uva_with_fixed_budget(tiny_manifest):
@@ -105,6 +110,7 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     monkeypatch.setenv("VLLM_LATCHMOE_MODE", "stale")
     monkeypatch.setenv("VLLM_LATCHMOE_MANIFEST", "stale")
     monkeypatch.setenv("VLLM_LATCHMOE_PROFILE_PATH", "stale")
+    monkeypatch.setenv("VLLM_LATCHMOE_WAVE_SLOTS", "stale")
     manifest_path = Path("tiny_manifest.json")
     profile_path = Path("profile.jsonl")
 
@@ -113,6 +119,9 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     )
     latchmoe = _worker_environment(
         resolve_correctness_mode("latchmoe-eager"), manifest_path, profile_path
+    )
+    piecewise = _worker_environment(
+        resolve_correctness_mode("latchmoe-piecewise"), manifest_path, profile_path
     )
 
     assert uva["VLLM_PLUGINS"] == "latchmoe_cuda"
@@ -124,6 +133,10 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     assert latchmoe["VLLM_LATCHMOE_MANIFEST"] == str(manifest_path)
     assert latchmoe["VLLM_LATCHMOE_PROFILE_PATH"] == str(profile_path)
     assert "VLLM_LATCHMOE_TELEMETRY_PATH" not in latchmoe
+    assert "VLLM_LATCHMOE_GRAPH_MODE" not in latchmoe
+    assert piecewise["VLLM_LATCHMOE_GRAPH_MODE"] == "piecewise"
+    assert piecewise["VLLM_DISABLE_COMPILE_CACHE"] == "1"
+    assert "VLLM_LATCHMOE_WAVE_SLOTS" not in piecewise
 
 
 def test_greedy_comparison_requires_exact_token_ids():

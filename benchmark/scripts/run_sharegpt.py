@@ -120,6 +120,7 @@ def _server_environment(
         "VLLM_LATCHMOE_PROFILE_PATH",
         "VLLM_LATCHMOE_TELEMETRY_PATH",
         "VLLM_LATCHMOE_GRAPH_MODE",
+        "VLLM_LATCHMOE_WAVE_SLOTS",
     ):
         environment.pop(name, None)
     environment.update(
@@ -225,7 +226,16 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "compile_cache": False,
     }
     workload_contract_sha256 = payload_sha256(workload_contract)
-    mode_contract = {**workload_contract, "mode": args.mode}
+    mode_contract = {
+        **workload_contract,
+        "mode": args.mode,
+        "latchmoe_wave_slots": (
+            min(manifest.num_slots, 32)
+            if args.mode.startswith("latchmoe")
+            and manifest.num_slots < manifest.model.num_experts
+            else None
+        ),
+    }
     mode_contract_sha256 = payload_sha256(mode_contract)
     run.write_json(
         "contract.json",

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from vllm_latchmoe_cuda.artifacts import ArtifactRun, RunKind
 from vllm_latchmoe_cuda.correctness import (
+    CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE,
     CORRECTNESS_MAX_NUM_SEQS,
     STOCK_UVA_CPU_OFFLOAD_GB,
     CorrectnessMismatchError,
@@ -169,6 +170,30 @@ def _offload_telemetry(
     event = matches[0]
     manifest_bytes = manifest.total_elements * 2
     residual_bytes = int(event["cpu_offload_bytes"])
+    graph_telemetry: dict[str, object] = {}
+    if mode.name == "latchmoe-piecewise":
+        captures = [
+            item
+            for item in events
+            if item.get("event") == "cudagraph_capture"
+            and item.get("runtime_mode") == "PIECEWISE"
+        ]
+        replays = [
+            item
+            for item in events
+            if item.get("event") == "cudagraph_replay"
+            and item.get("runtime_mode") == "PIECEWISE"
+        ]
+        if not captures or not replays:
+            raise RuntimeError(
+                "latchmoe-piecewise correctness produced no PIECEWISE "
+                "CUDA graph capture and replay evidence"
+            )
+        graph_telemetry = {
+            "cudagraph_captures": len(captures),
+            "cudagraph_replays": len(replays),
+            "cudagraph_runtime_mode": "PIECEWISE",
+        }
     return {
         "schema_version": 1,
         "mode": mode.name,
@@ -180,6 +205,7 @@ def _offload_telemetry(
         "configured_budget_bytes": (
             manifest_bytes + int(event["cpu_offload_max_bytes"])
         ),
+        **graph_telemetry,
     }
 
 
@@ -192,6 +218,8 @@ def _worker_environment(
         "VLLM_LATCHMOE_MANIFEST",
         "VLLM_LATCHMOE_PROFILE_PATH",
         "VLLM_LATCHMOE_TELEMETRY_PATH",
+        "VLLM_LATCHMOE_GRAPH_MODE",
+        "VLLM_LATCHMOE_WAVE_SLOTS",
     ):
         environment.pop(key, None)
     environment.update(
@@ -199,6 +227,8 @@ def _worker_environment(
             "VLLM_PLUGINS": "latchmoe_cuda",
             "HF_HUB_OFFLINE": "1",
             "TOKENIZERS_PARALLELISM": "false",
+            "VLLM_DISABLE_COMPILE_CACHE": "1",
+            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
         }
     )
     if mode.backend == "latchmoe":
@@ -209,6 +239,8 @@ def _worker_environment(
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
             }
         )
+        if mode.name == "latchmoe-piecewise":
+            environment["VLLM_LATCHMOE_GRAPH_MODE"] = "piecewise"
     else:
         environment["VLLM_LATCHMOE_TELEMETRY_PATH"] = str(profile_path)
     return environment
@@ -230,6 +262,17 @@ def _execute_driver(args, run: ArtifactRun) -> None:
             "dtype": manifest.dtype,
             "tensor_parallel_size": manifest.tensor_parallel_size,
             "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
+            "max_cudagraph_capture_size": (
+                CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE
+                if mode.name == "latchmoe-piecewise"
+                else None
+            ),
+            "latchmoe_wave_slots": (
+                min(manifest.num_slots, 32)
+                if mode.backend == "latchmoe"
+                and manifest.num_slots < manifest.model.num_experts
+                else None
+            ),
             "mode": mode.name,
             "backend": mode.backend,
             "enforce_eager": mode.enforce_eager,
