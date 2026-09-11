@@ -9,7 +9,7 @@ from torch import nn
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .runtime import CudaLayerRuntime
-from .runner_adapter import _apply_modular_moe_kernel, execute_exact_waves
+from .runner_adapter import _apply_modular_moe_kernel, execute_main_cache_waves
 from .routing import active_experts_from_topk
 from .vllm_context import advance_moe_layer_index
 
@@ -96,26 +96,17 @@ def _fused_moe_compute(
     experts_module = context.experts_module
     overflow_active = runtime.graph_overflow_active
     if overflow_active is not None:
+        if torch.cuda.is_current_stream_capturing():
+            from .errors import StagingDuringCaptureError
 
-        def stage_kernel(w13, w2, pair_hidden, physical_ids, pair_weights):
-            return _apply_modular_moe_kernel(
-                experts_module,
-                hidden_states=pair_hidden,
-                topk_weights=pair_weights,
-                topk_ids=physical_ids,
-                w13=w13,
-                w2=w2,
-                global_num_experts=int(w13.shape[0]),
-                expert_map=None,
+            raise StagingDuringCaptureError(
+                f"overflow main-cache waves cannot run during graph capture: layer={runtime.layer_id}"
             )
-
-        return execute_exact_waves(
+        return execute_main_cache_waves(
             runtime,
             hidden_states,
             topk_ids,
             topk_weights,
-            stage_kernel_callback=stage_kernel,
-            active_experts=overflow_active,
         )
 
     identity_slots = runtime.num_slots == runtime.num_experts

@@ -47,6 +47,7 @@ def execute_main_cache_waves(
     """Serial hit-first execution through one persistent layer cache."""
     if topk_ids.shape != topk_weights.shape or topk_ids.ndim != 2:
         raise ValueError("topk_ids and topk_weights must be matching rank-2 tensors")
+    runtime.release_pending_for_transfer()
     active = active_experts_from_topk(topk_ids)
     ready = frozenset(
         expert
@@ -63,9 +64,12 @@ def execute_main_cache_waves(
     flat_ids = topk_ids.reshape(-1).long()
     pair_offsets = torch.arange(flat_ids.numel(), device=topk_ids.device, dtype=torch.long)
     payloads: list[NativeWavePayload] = []
+    total_h2d_bytes = 0
     for spec in specs:
         prepared = runtime.prepare_main_cache_wave(spec)
         runtime.wait_and_publish(prepared)
+        total_h2d_bytes += prepared.h2d_bytes
+        runtime.begin_main_cache_compute(prepared)
         mask = torch.zeros_like(flat_ids, dtype=torch.bool)
         for expert in spec.experts:
             mask |= flat_ids == expert
@@ -87,8 +91,6 @@ def execute_main_cache_waves(
                 token_indices=token_indices,
             )
         )
-        handle = runtime.begin_main_cache_compute(prepared)
-        del handle
         runtime.mark_compute_complete(prepared)
     result = seam.combine(
         waves=payloads,
@@ -109,13 +111,10 @@ def execute_main_cache_waves(
             pair_count=int(pair_offsets.numel()),
             wave_count=len(specs),
             stage_mode=[spec.wave_type for spec in specs],
-            h2d_bytes=sum(
-                int(runtime.counters.snapshot().get("h2d_bytes", 0))
-                for _ in ()
-            ),
+            h2d_bytes=total_h2d_bytes,
             combine_count=1,
         )
-    return result
+    return result.to(dtype=hidden_states.dtype)
 
 
 def capturable_slot_moe(
