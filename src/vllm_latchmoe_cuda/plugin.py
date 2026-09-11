@@ -7,8 +7,13 @@ from importlib import metadata
 from pathlib import Path
 
 from .errors import UnsupportedVllmVersionError
-from .manifest import OffloadManifest
-from .offloader import TOTAL_OFFLOAD_BUDGET_BYTES, CudaSEWOffloader
+from .manifest import (
+    OffloadManifest,
+    deserialize_identity_lock,
+    validate_identity_lock,
+)
+from .offloader import CudaSEWOffloader
+from .residency_plan import deserialize_residency_plan
 from .profile import JsonlEventWriter
 from .uva import ManifestUVAOffloader
 
@@ -16,6 +21,8 @@ from .uva import ManifestUVAOffloader
 SUPPORTED_VLLM_VERSION = "0.19.1"
 MODE_ENV = "VLLM_LATCHMOE_MODE"
 MANIFEST_ENV = "VLLM_LATCHMOE_MANIFEST"
+RESIDENCY_PLAN_ENV = "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"
+IDENTITY_LOCK_ENV = "VLLM_LATCHMOE_IDENTITY_LOCK_JSON"
 TELEMETRY_ENV = "VLLM_LATCHMOE_TELEMETRY_PATH"
 PROFILE_ENV = "VLLM_LATCHMOE_PROFILE_PATH"
 
@@ -128,15 +135,29 @@ def register() -> None:
         mode = os.getenv(MODE_ENV, "").strip().lower()
         if not mode:
             return _instrument_stock_uva(current_factory(offload_config))
-        manifest = load_manifest_from_env()
         if mode == "latchmoe":
-            residual_uva_max_bytes = max(
-                0, TOTAL_OFFLOAD_BUDGET_BYTES - manifest.total_elements * 2
-            )
-            return CudaSEWOffloader(
-                manifest, residual_uva_max_bytes=residual_uva_max_bytes
-            )
+            graph_mode = os.getenv("VLLM_LATCHMOE_GRAPH_MODE", "piecewise").strip().lower()
+            if graph_mode in {"full", "full_decode_only", "full_and_piecewise"}:
+                raise RuntimeError(
+                    "LatchMoE residency requires PIECEWISE graph boundaries; "
+                    f"got {graph_mode!r}"
+                )
+            raw_plan = os.getenv(RESIDENCY_PLAN_ENV)
+            if not raw_plan:
+                raise RuntimeError(
+                    "LatchMoE worker is missing the parent residency plan"
+                )
+            raw_lock = os.getenv(IDENTITY_LOCK_ENV)
+            if not raw_lock:
+                raise RuntimeError(
+                    "LatchMoE worker is missing the parent identity lock"
+                )
+            plan = deserialize_residency_plan(raw_plan)
+            identity_lock = deserialize_identity_lock(raw_lock)
+            validate_identity_lock(identity_lock, plan)
+            return CudaSEWOffloader(plan=plan, identity_lock=identity_lock)
         if mode == "uva":
+            manifest = load_manifest_from_env()
             return ManifestUVAOffloader(manifest)
         raise ValueError(
             f"unsupported {MODE_ENV}={mode!r}; expected 'latchmoe' or 'uva'"
