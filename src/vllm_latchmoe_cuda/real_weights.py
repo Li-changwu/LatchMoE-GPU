@@ -14,7 +14,7 @@ from .offloader import CudaSEWOffloader
 from .runner_adapter import (
     _capturable_weights_moe,
     eager_slot_moe,
-    execute_exact_waves,
+    execute_main_cache_waves,
 )
 
 
@@ -157,16 +157,16 @@ def compare_qwen_layer(
         full_union_ids,
         full_union_weights,
     )
-    if runtime.stage_pool is None:
+    if runtime.num_slots == runtime.num_experts:
         full_union_actual = eager_slot_moe(
             runtime, full_union_hidden, full_union_ids, full_union_weights
         )
         full_union_mode = "identity_slots"
     else:
-        full_union_actual = execute_exact_waves(
+        full_union_actual = execute_main_cache_waves(
             runtime, full_union_hidden, full_union_ids, full_union_weights
         )
-        full_union_mode = "exact_waves"
+        full_union_mode = "main_cache_waves"
     torch.cuda.synchronize()
 
     eager = _comparison(eager_actual, eager_expected)

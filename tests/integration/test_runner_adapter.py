@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
+from vllm_latchmoe_cuda.moe_seam import SpyMoeSeam
 from vllm_latchmoe_cuda.runner_adapter import (
     capturable_slot_moe,
     install_vllm_forward_adapter,
@@ -38,7 +39,16 @@ class RecordingWriter:
         self.events = []
 
     def write(self, event, **fields):
-        self.events.append({"event": event, **fields})
+            self.events.append({"event": event, **fields})
+
+
+def _native_combine(*, waves, topk_weights, pair_offsets, restore_shape):
+    output = torch.zeros(restore_shape, device=pair_offsets.device, dtype=torch.float32)
+    weights = topk_weights.reshape(-1).float()
+    for wave in waves:
+        values = wave.outputs.float() * weights.index_select(0, wave.pair_offsets).unsqueeze(-1)
+        output.scatter_add_(0, wave.token_indices[:, None].expand_as(values), values)
+    return output.to(dtype=torch.bfloat16)
 
 
 def test_instance_adapter_stages_between_router_and_original_quant_kernel(
@@ -73,6 +83,7 @@ def test_instance_adapter_stages_between_router_and_original_quant_kernel(
     torch.testing.assert_close(output_again, output, rtol=2e-2, atol=2e-2)
     assert experts.quant_method.calls == 2
     assert runtime.counters.snapshot()["slot_hit"] >= 2
+    assert runtime.router_call_count == 2
 
 
 def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
@@ -92,6 +103,7 @@ def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
     experts.router = FakeRouter()
     experts.quant_method = FakeQuantMethod(runtime)
     experts._shared_experts = None
+    experts._latchmoe_seam = SpyMoeSeam(_native_combine)
     install_vllm_forward_adapter(experts, runtime)
     hidden = torch.randn((2, 2), dtype=torch.bfloat16, device="cuda")
     router_logits = torch.tensor(
@@ -102,21 +114,13 @@ def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
 
     assert shared is None
     assert output.shape == hidden.shape
-    assert experts.quant_method.calls == 2
+    assert experts.quant_method.calls == 0
+    assert experts._latchmoe_seam.run_calls == 2
+    assert experts._latchmoe_seam.combine_calls == 1
     assert runtime.last_wave_trace.pair_count == 4
     assert runtime.last_wave_trace.compute_order == (0, 1)
-    assert runtime.event_writer.events == [
-        {
-            "event": "exact_waves",
-            "layer_id": 0,
-            "pair_count": 4,
-            "wave_count": 2,
-            "compute_order": [0, 1],
-            "issue_order": [0, 1],
-            "pair_planner_mode": "cuda_device",
-            "scatter_mode": "layer_index_add",
-        }
-    ]
+    assert runtime.event_writer.events[0]["event"] == "main_cache_waves"
+    assert runtime.event_writer.events[0]["combine_count"] == 1
 
 
 def test_regular_request_reloads_after_overflow_overwrites_main_slots(
@@ -135,6 +139,7 @@ def test_regular_request_reloads_after_overflow_overwrites_main_slots(
     experts.router = FakeRouter()
     experts.quant_method = FakeQuantMethod(runtime)
     experts._shared_experts = None
+    experts._latchmoe_seam = SpyMoeSeam(_native_combine)
     install_vllm_forward_adapter(experts, runtime)
     hidden = torch.randn((2, 2), dtype=torch.bfloat16, device="cuda")
     regular_logits = torch.tensor(

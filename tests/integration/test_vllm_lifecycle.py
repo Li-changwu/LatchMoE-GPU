@@ -151,7 +151,7 @@ def test_real_triton_quant_method_uses_staged_slots_and_expert_map(tiny_manifest
     )
 
 
-def test_finite_slot_graph_replays_dynamic_map_and_overflow_uses_stage_banks(
+def test_finite_slot_graph_replays_dynamic_map_and_overflow_uses_main_cache(
     tiny_manifest,
 ):
     init_workspace_manager(torch.device("cuda"))
@@ -199,9 +199,8 @@ def test_finite_slot_graph_replays_dynamic_map_and_overflow_uses_stage_banks(
 
     torch.testing.assert_close(captured.float(), expected.float(), rtol=2e-2, atol=2e-2)
 
-    assert runtime.stage_pool.reuses_main_slots is True
-    assert runtime.stage_pool.banks[0].w13.data_ptr() == runtime.slot_w13.data_ptr()
-    assert runtime.stage_pool.banks[1].w13.data_ptr() != runtime.slot_w13.data_ptr()
+    assert not hasattr(runtime, "stage_pool")
+    assert runtime.main_cache.slot_w13.data_ptr() == runtime.slot_w13.data_ptr()
     runtime.prepare_compute_async((2, 3))
     pending_output = graph_fused_moe_compute(
         runtime, runtime_id, hidden, topk_weights, topk_ids
@@ -224,4 +223,6 @@ def test_finite_slot_graph_replays_dynamic_map_and_overflow_uses_stage_banks(
     torch.testing.assert_close(
         pending_output.float(), expected.float(), rtol=2e-2, atol=2e-2
     )
-    assert torch.count_nonzero(runtime.log2phy == -1).item() == runtime.num_experts
+    assert torch.count_nonzero(runtime.log2phy == -1).item() == (
+        runtime.num_experts - runtime.num_slots
+    )

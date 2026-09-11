@@ -74,5 +74,5 @@ def test_full_expert_capacity_uses_identity_slots_without_stage_banks(
 
     runtime.stage_sync((3, 1))
 
-    assert runtime.stage_pool is None
+    assert not hasattr(runtime, "stage_pool")
     assert runtime.log2phy.cpu().tolist() == [-1, 1, -1, 3]

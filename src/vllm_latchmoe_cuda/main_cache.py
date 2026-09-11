@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Literal, Mapping
 
 import torch
@@ -11,7 +12,7 @@ from .core.expert_key import ExpertKey
 from .core.policy import LruPolicy
 from .core.slots import ExpertSlotBank, SlotLease, SlotState
 from .core.waves import MainCacheWaveSpec
-from .errors import NoEvictableSlotError, StagingDuringCaptureError
+from .errors import StagingDuringCaptureError, StaleMappingError
 from .transfer import CudaTransferEngine, ExpertCopy, TransferTicket
 
 
@@ -112,6 +113,11 @@ class CudaLayerMainCache:
             if lease is not None:
                 selected[expert_id] = lease
                 reserved.add(lease.slot_id)
+        if spec.wave_type == "hit" and len(selected) != len(spec.experts):
+            missing = tuple(expert for expert in spec.experts if expert not in selected)
+            raise StaleMappingError(
+                f"hit wave lost READY experts before execution: layer={self.layer_id}, missing={missing}"
+            )
         for expert_id in spec.experts:
             if expert_id in selected:
                 continue
@@ -141,9 +147,9 @@ class CudaLayerMainCache:
             wave_type=spec.wave_type,
             experts=spec.experts,
             leases=tuple(selected[expert] for expert in spec.experts),
-            physical_slot_by_expert={
-                expert: selected[expert].slot_id for expert in spec.experts
-            },
+            physical_slot_by_expert=MappingProxyType(
+                {expert: selected[expert].slot_id for expert in spec.experts}
+            ),
             ready_ticket=ticket,
             evicted_experts=tuple(evicted),
             h2d_bytes=sum(

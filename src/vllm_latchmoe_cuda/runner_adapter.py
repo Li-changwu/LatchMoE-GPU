@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .core.waves import plan_device_exact_waves, plan_main_cache_waves
+from .core.waves import plan_main_cache_waves
 from .capabilities import describe_capabilities, validate_capabilities
 from .errors import NativeCombineError, StagingDuringCaptureError
 from .moe_seam import CudaMoeSeam, FunctionalMoeSeam, NativeWavePayload
@@ -218,156 +218,14 @@ def execute_exact_waves(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    *,
-    transfer_aware: bool = True,
-    kernel_callback=None,
-    stage_kernel_callback=None,
-    active_experts=None,
+    **_diagnostic_options,
 ) -> torch.Tensor:
-    # Compatibility name for legacy oracle callers. Production adapters call
-    # execute_main_cache_waves directly; no temporary stage banks are created.
+    """Deprecated diagnostic alias for the serial main-cache executor."""
     if torch.cuda.is_current_stream_capturing():
         raise StagingDuringCaptureError(
             f"wave staging attempted during CUDA Graph capture: layer={runtime.layer_id}"
         )
-    if runtime.stage_pool is None:
-        return execute_main_cache_waves(runtime, hidden_states, topk_ids, topk_weights)
-    if runtime.stage_pool is None:
-        raise RuntimeError("exact waves require a CUDA stage pool")
-    if kernel_callback is not None and stage_kernel_callback is not None:
-        raise ValueError("only one exact-wave kernel callback may be provided")
-    main_slots_overwritten = False
-    if runtime.stage_pool.reuses_main_slots:
-        runtime.main_slot_pool.acquire(
-            runtime, runtime.stage_pool.transfer_engine.stream
-        )
-        main_slots_overwritten = True
-    else:
-        runtime.release_pending_for_transfer()
-    plan = plan_device_exact_waves(
-        topk_ids,
-        topk_weights,
-        capacity=runtime.stage_pool.num_slots,
-        num_experts=runtime.num_experts,
-        active_experts=active_experts,
-    )
-    bytes_per_expert = (
-        runtime.host_w13[0].numel() * runtime.host_w13.element_size()
-        + runtime.host_w2[0].numel() * runtime.host_w2.element_size()
-    )
-    h2d_bytes = {
-        wave.wave_id: len(wave.experts) * bytes_per_expert for wave in plan.waves
-    }
-    preferred = (
-        tuple(
-            wave.wave_id
-            for wave in sorted(
-                plan.waves,
-                key=lambda wave: (-h2d_bytes[wave.wave_id], wave.wave_id),
-            )
-        )
-        if transfer_aware
-        else plan.compute_order
-    )
-    wave_by_id = {wave.wave_id: wave for wave in plan.waves}
-    issued: dict[int, object] = {}
-    completed: set[int] = set()
-    free_banks = [0, 1]
-    issue_log: list[int] = []
-    buffer_by_wave: dict[int, int] = {}
-    output = torch.zeros(
-        (hidden_states.shape[0], hidden_states.shape[1]),
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
-    pair_outputs: list[torch.Tensor] = []
-    scatter_indices: list[torch.Tensor] = []
-    if kernel_callback is not None:
-        runtime.acquire_main_slots_for_current_stream()
-
-    def issue(wave_id: int) -> None:
-        bank_id = free_banks.pop(0)
-        issued[wave_id] = runtime.stage_pool.issue(
-            runtime, wave_by_id[wave_id], bank_id
-        )
-        issue_log.append(wave_id)
-        buffer_by_wave[wave_id] = bank_id
-
-    try:
-        for wave_id in plan.compute_order:
-            if wave_id not in issued:
-                issue(wave_id)
-            for future in preferred:
-                if not free_banks:
-                    break
-                if (
-                    future != wave_id
-                    and future not in issued
-                    and future not in completed
-                ):
-                    issue(future)
-            staged = issued.pop(wave_id)
-            bank = runtime.stage_pool.wait_ready(staged)
-            wave = wave_by_id[wave_id]
-            pair_hidden = hidden_states.index_select(0, wave.token_indices)
-            if stage_kernel_callback is not None:
-                pair_output = stage_kernel_callback(
-                    bank.w13,
-                    bank.w2,
-                    pair_hidden,
-                    wave.physical_ids,
-                    wave.pair_weights,
-                )
-            elif kernel_callback is None:
-                pair_output = _capturable_weights_moe(
-                    bank.w13,
-                    bank.w2,
-                    pair_hidden,
-                    wave.physical_ids,
-                    wave.pair_weights,
-                )
-            else:
-                main_slots_overwritten = True
-                wave_slots = int(bank.w13.shape[0])
-                runtime.slot_w13.narrow(0, 0, wave_slots).copy_(bank.w13)
-                runtime.slot_w2.narrow(0, 0, wave_slots).copy_(bank.w2)
-                runtime.log2phy.copy_(wave.expert_map)
-                pair_output = kernel_callback(
-                    pair_hidden, wave.logical_ids, wave.pair_weights
-                )
-            pair_outputs.append(pair_output.float())
-            scatter_indices.append(wave.token_indices)
-            runtime.stage_pool.record_compute_done(bank.bank_id)
-            if runtime.stage_pool.reuses_main_slots and bank.bank_id == 0:
-                assert bank.compute_done is not None
-                runtime.main_slot_pool.record_external_compute_done(bank.compute_done)
-            completed.add(wave_id)
-            free_banks.append(bank.bank_id)
-            free_banks.sort()
-    finally:
-        if main_slots_overwritten:
-            runtime.invalidate_main_slots()
-
-    output.index_add_(0, torch.cat(scatter_indices), torch.cat(pair_outputs))
-
-    runtime.last_wave_trace = WaveExecutionTrace(
-        pair_count=plan.pair_count,
-        compute_order=plan.compute_order,
-        issue_order=tuple(issue_log),
-        buffer_by_wave=tuple(sorted(buffer_by_wave.items())),
-    )
-    if runtime.event_writer is not None:
-        runtime.event_writer.write(
-            "exact_waves",
-            layer_id=runtime.layer_id,
-            pair_count=runtime.last_wave_trace.pair_count,
-            wave_count=len(runtime.last_wave_trace.compute_order),
-            compute_order=list(runtime.last_wave_trace.compute_order),
-            issue_order=list(runtime.last_wave_trace.issue_order),
-            pair_planner_mode="cuda_device",
-            scatter_mode="layer_index_add",
-        )
-    return output.to(dtype=hidden_states.dtype)
+    return execute_main_cache_waves(runtime, hidden_states, topk_ids, topk_weights)
 
 
 def eager_slot_moe(
@@ -409,9 +267,22 @@ def install_vllm_forward_adapter(
         describe_capabilities(
             experts_module,
             graph_mode=("piecewise" if os.getenv("VLLM_LATCHMOE_GRAPH_MODE") == "piecewise" else "eager"),
+            source_module=__import__(
+                "vllm.model_executor.layers.fused_moe.fused_moe",
+                fromlist=["fused_moe"],
+            ),
         ),
         require_native_combine=False,
     )
+    if getattr(runtime, "production_plan", False):
+        seam = getattr(experts_module, "_latchmoe_seam", None)
+        if seam is None or not all(
+            callable(getattr(seam, name, None))
+            for name in ("run_expert_mlp", "combine")
+        ):
+            raise NativeCombineError(
+                "qualified production runtime is missing the locked vLLM native combine seam"
+            )
 
     original_forward = experts_module.forward
     graph_mode = os.getenv("VLLM_LATCHMOE_GRAPH_MODE") == "piecewise"
@@ -472,50 +343,13 @@ def install_vllm_forward_adapter(
             return None, result
         advance_moe_layer_index(experts_module)
         if eager_needs_exact_waves(runtime, topk_ids):
-            if _resolve_modular_moe_kernel(experts_module) is not None:
-
-                def stage_kernel(w13, w2, pair_hidden, physical_ids, pair_weights):
-                    return _apply_modular_moe_kernel(
-                        experts_module,
-                        hidden_states=pair_hidden,
-                        topk_weights=pair_weights,
-                        topk_ids=physical_ids,
-                        w13=w13,
-                        w2=w2,
-                        global_num_experts=int(w13.shape[0]),
-                        expert_map=None,
-                    )
-
-                result = execute_main_cache_waves(
-                    runtime,
-                    hidden_states,
-                    topk_ids,
-                    topk_weights,
-                    seam=getattr(experts_module, "_latchmoe_seam", None),
-                )
-            else:
-
-                def original_kernel(pair_hidden, logical_ids, pair_weights):
-                    pair_result = experts_module.quant_method.apply(
-                        layer=experts_module,
-                        x=pair_hidden,
-                        topk_weights=pair_weights,
-                        topk_ids=logical_ids,
-                        shared_experts_input=pair_hidden,
-                    )
-                    if isinstance(pair_result, tuple):
-                        raise TypeError(
-                            "unexpected shared-expert result from Qwen3 routed experts"
-                        )
-                    return pair_result
-
-                result = execute_main_cache_waves(
-                    runtime,
-                    hidden_states,
-                    topk_ids,
-                    topk_weights,
-                    seam=getattr(experts_module, "_latchmoe_seam", None),
-                )
+            result = execute_main_cache_waves(
+                runtime,
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                seam=getattr(experts_module, "_latchmoe_seam", None),
+            )
             return None, result
         eager_prepare_compute(runtime, topk_ids)
         try:

@@ -143,11 +143,6 @@ class CudaLayerRuntime:
         """Compatibility view; storage is owned by this layer's main cache."""
         return self.main_cache
 
-    @property
-    def stage_pool(self):
-        """Stage banks are intentionally absent from the production runtime."""
-        return None
-
     def _new_cpu_map(self) -> torch.Tensor:
         return torch.empty(
             (self.num_experts,), dtype=torch.int32, device="cpu", pin_memory=True
