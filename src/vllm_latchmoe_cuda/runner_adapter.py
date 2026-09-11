@@ -6,7 +6,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .core.waves import plan_device_exact_waves
+from .core.waves import plan_device_exact_waves, plan_main_cache_waves
+from .capabilities import describe_capabilities, validate_capabilities
+from .errors import NativeCombineError, StagingDuringCaptureError
+from .moe_seam import CudaMoeSeam, FunctionalMoeSeam, NativeWavePayload
 from .runtime import CudaLayerRuntime, WaveExecutionTrace
 from .routing import active_experts_from_topk
 from .split_ops import (
@@ -15,6 +18,104 @@ from .split_ops import (
     eager_prepare_compute,
 )
 from .vllm_context import advance_moe_layer_index
+
+
+def _diagnostic_scatter_combine(*, waves, topk_weights, pair_offsets, restore_shape):
+    """Oracle combine used only by legacy manifest tests.
+
+    Production plan execution supplies the locked vLLM native combine hook.
+    """
+    output = torch.zeros(restore_shape, dtype=torch.float32, device=pair_offsets.device)
+    for payload in waves:
+        flat_weights = topk_weights.reshape(-1).float().index_select(
+            0, payload.pair_offsets
+        )
+        weighted = payload.outputs.float() * flat_weights.unsqueeze(-1)
+        output.scatter_add_(0, payload.token_indices.reshape(-1, 1).expand_as(weighted), weighted)
+    return output.to(dtype=topk_weights.dtype)
+
+
+@torch.compiler.disable
+def execute_main_cache_waves(
+    runtime: CudaLayerRuntime,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    seam: CudaMoeSeam | None = None,
+) -> torch.Tensor:
+    """Serial hit-first execution through one persistent layer cache."""
+    if topk_ids.shape != topk_weights.shape or topk_ids.ndim != 2:
+        raise ValueError("topk_ids and topk_weights must be matching rank-2 tensors")
+    active = active_experts_from_topk(topk_ids)
+    ready = frozenset(
+        expert
+        for expert in active
+        if runtime.main_cache.lease_for(expert) is not None
+    )
+    specs = plan_main_cache_waves(active, runtime.num_slots, hit_experts=ready)
+    if seam is None:
+        if getattr(runtime, "production_plan", False):
+            raise NativeCombineError(
+                "production LatchMoE requires the locked vLLM native combine seam"
+            )
+        seam = FunctionalMoeSeam(combine_fn=_diagnostic_scatter_combine)
+    flat_ids = topk_ids.reshape(-1).long()
+    pair_offsets = torch.arange(flat_ids.numel(), device=topk_ids.device, dtype=torch.long)
+    payloads: list[NativeWavePayload] = []
+    for spec in specs:
+        prepared = runtime.prepare_main_cache_wave(spec)
+        runtime.wait_and_publish(prepared)
+        mask = torch.zeros_like(flat_ids, dtype=torch.bool)
+        for expert in spec.experts:
+            mask |= flat_ids == expert
+        selected_offsets = pair_offsets[mask]
+        token_indices = torch.div(
+            selected_offsets, topk_ids.shape[1], rounding_mode="floor"
+        )
+        physical = runtime.log2phy.index_select(0, flat_ids[mask]).long()
+        payload = seam.run_expert_mlp(
+            hidden_states=hidden_states.index_select(0, token_indices),
+            physical_ids=physical,
+            slot_w13=runtime.slot_w13,
+            slot_w2=runtime.slot_w2,
+        )
+        payloads.append(
+            NativeWavePayload(
+                outputs=payload.outputs,
+                pair_offsets=selected_offsets,
+                token_indices=token_indices,
+            )
+        )
+        handle = runtime.begin_main_cache_compute(prepared)
+        del handle
+        runtime.mark_compute_complete(prepared)
+    result = seam.combine(
+        waves=payloads,
+        topk_weights=topk_weights,
+        pair_offsets=pair_offsets,
+        restore_shape=(hidden_states.shape[0], hidden_states.shape[1]),
+    )
+    runtime.last_wave_trace = WaveExecutionTrace(
+        pair_count=int(pair_offsets.numel()),
+        compute_order=tuple(spec.wave_id for spec in specs),
+        issue_order=tuple(spec.wave_id for spec in specs),
+        buffer_by_wave=tuple((spec.wave_id, 0) for spec in specs),
+    )
+    if runtime.event_writer is not None:
+        runtime.event_writer.write(
+            "main_cache_waves",
+            layer_id=runtime.layer_id,
+            pair_count=int(pair_offsets.numel()),
+            wave_count=len(specs),
+            stage_mode=[spec.wave_type for spec in specs],
+            h2d_bytes=sum(
+                int(runtime.counters.snapshot().get("h2d_bytes", 0))
+                for _ in ()
+            ),
+            combine_count=1,
+        )
+    return result
 
 
 def capturable_slot_moe(
@@ -124,6 +225,14 @@ def execute_exact_waves(
     stage_kernel_callback=None,
     active_experts=None,
 ) -> torch.Tensor:
+    # Compatibility name for legacy oracle callers. Production adapters call
+    # execute_main_cache_waves directly; no temporary stage banks are created.
+    if torch.cuda.is_current_stream_capturing():
+        raise StagingDuringCaptureError(
+            f"wave staging attempted during CUDA Graph capture: layer={runtime.layer_id}"
+        )
+    if runtime.stage_pool is None:
+        return execute_main_cache_waves(runtime, hidden_states, topk_ids, topk_weights)
     if runtime.stage_pool is None:
         raise RuntimeError("exact waves require a CUDA stage pool")
     if kernel_callback is not None and stage_kernel_callback is not None:
@@ -297,6 +406,13 @@ def install_vllm_forward_adapter(
         raise TypeError("monolithic FusedMoE kernels are not supported")
     if getattr(experts_module, "_shared_experts", None) is not None:
         raise TypeError("shared experts are not supported by the Qwen3 target adapter")
+    validate_capabilities(
+        describe_capabilities(
+            experts_module,
+            graph_mode=("piecewise" if os.getenv("VLLM_LATCHMOE_GRAPH_MODE") == "piecewise" else "eager"),
+        ),
+        require_native_combine=False,
+    )
 
     original_forward = experts_module.forward
     graph_mode = os.getenv("VLLM_LATCHMOE_GRAPH_MODE") == "piecewise"
@@ -333,6 +449,7 @@ def install_vllm_forward_adapter(
         graph_finish = graph_finish_experts
 
     def latchmoe_forward(hidden_states: torch.Tensor, router_logits: torch.Tensor):
+        runtime.router_call_count += 1
         topk_weights, topk_ids = experts_module.router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -370,12 +487,12 @@ def install_vllm_forward_adapter(
                         expert_map=None,
                     )
 
-                result = execute_exact_waves(
+                result = execute_main_cache_waves(
                     runtime,
                     hidden_states,
                     topk_ids,
                     topk_weights,
-                    stage_kernel_callback=stage_kernel,
+                    seam=getattr(experts_module, "_latchmoe_seam", None),
                 )
             else:
 
@@ -393,12 +510,12 @@ def install_vllm_forward_adapter(
                         )
                     return pair_result
 
-                result = execute_exact_waves(
+                result = execute_main_cache_waves(
                     runtime,
                     hidden_states,
                     topk_ids,
                     topk_weights,
-                    kernel_callback=original_kernel,
+                    seam=getattr(experts_module, "_latchmoe_seam", None),
                 )
             return None, result
         eager_prepare_compute(runtime, topk_ids)

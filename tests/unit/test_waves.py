@@ -8,6 +8,7 @@ from vllm_latchmoe_cuda.core.waves import (
     plan_device_exact_waves,
     plan_exact_waves,
     plan_transfer_issue_order,
+    plan_main_cache_waves,
     validate_pair_coverage,
 )
 from vllm_latchmoe_cuda.errors import PairIntegrityError
@@ -149,3 +150,31 @@ def test_wave_capacity_is_decoupled_from_main_graph_slots(monkeypatch):
     monkeypatch.setenv(WAVE_SLOTS_ENV, "65")
     with pytest.raises(ValueError, match=WAVE_SLOTS_ENV):
         _wave_slot_count(64)
+
+
+def test_main_cache_waves_are_hit_first_and_capacity_bounded():
+    specs = plan_main_cache_waves(
+        active_experts=(0, 1, 2, 3, 4, 5, 6), capacity=4, hit_experts=(0, 1)
+    )
+    assert [(spec.wave_type, spec.experts) for spec in specs] == [
+        ("hit", (0, 1)),
+        ("miss", (2, 3, 4, 5)),
+        ("miss", (6,)),
+    ]
+
+
+def test_main_cache_wave_planner_does_not_duplicate_experts():
+    specs = plan_main_cache_waves(
+        active_experts=(0, 0, 1, 2, 3, 4), capacity=4, hit_experts=(0,)
+    )
+    assert tuple(expert for spec in specs for expert in spec.experts) == (
+        0, 1, 2, 3, 4
+    )
+
+
+def test_full_hit_capacity_has_no_overlap_candidate():
+    specs = plan_main_cache_waves(
+        active_experts=(0, 1, 2, 3, 4), capacity=4, hit_experts=(0, 1, 2, 3)
+    )
+    assert specs[0].overlap_candidate is False
+    assert specs[1].overlap_candidate is False

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from ..errors import PairIntegrityError
 from ..routing import active_experts_from_topk
@@ -71,6 +71,62 @@ class DeviceExactWavePlan:
     @property
     def pair_count(self) -> int:
         return sum(int(wave.pair_offsets.numel()) for wave in self.waves)
+
+
+@dataclass(frozen=True)
+class MainCacheWaveSpec:
+    """A deterministic serial wave for the persistent per-layer cache."""
+
+    wave_id: int
+    wave_type: Literal["hit", "miss"]
+    experts: tuple[int, ...]
+    overlap_candidate: bool = False
+
+    @property
+    def is_hit(self) -> bool:
+        return self.wave_type == "hit"
+
+
+def plan_main_cache_waves(
+    active_experts: Iterable[int],
+    capacity: int,
+    *,
+    hit_experts: Iterable[int] = (),
+) -> tuple[MainCacheWaveSpec, ...]:
+    """Plan hit-first waves without changing router-produced expert pairs.
+
+    The hit set is emitted as one wave. Misses are then split into complete
+    capacity-bounded waves in first-seen order. This makes the planner useful
+    for both CPU tests and CUDA execution, while keeping duplicate routed pairs
+    outside this expert-set planner.
+    """
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    active = tuple(dict.fromkeys(int(value) for value in active_experts))
+    hits = set(int(value) for value in hit_experts)
+    if any(value < 0 for value in active):
+        raise ValueError("expert ids must be non-negative")
+    if not hits.issubset(active):
+        raise ValueError("hit_experts must be a subset of active_experts")
+    specs: list[MainCacheWaveSpec] = []
+    wave_id = 0
+    hit_wave = tuple(value for value in active if value in hits)
+    if hit_wave:
+        specs.append(MainCacheWaveSpec(wave_id, "hit", hit_wave))
+        wave_id += 1
+    misses = tuple(value for value in active if value not in hits)
+    for start in range(0, len(misses), capacity):
+        specs.append(
+            MainCacheWaveSpec(
+                wave_id,
+                "miss",
+                misses[start : start + capacity],
+            )
+        )
+        wave_id += 1
+    if not specs and active:
+        raise PairIntegrityError("active experts produced no cache waves")
+    return tuple(specs)
 
 
 def _as_nested_list(value) -> list[list[float | int]]:
