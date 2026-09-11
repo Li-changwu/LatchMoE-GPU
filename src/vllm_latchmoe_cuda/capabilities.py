@@ -9,7 +9,11 @@ from typing import Any, Mapping
 
 from .errors import CapabilityError
 
-SUPPORTED_VLLM_SOURCE_HASHES: frozenset[str] = frozenset()
+# vLLM 0.19.1 fused_moe.py hash observed by the ABI probe on the locked wheel.
+# Editable checkouts must replace/extend this set with their seam-file hash.
+SUPPORTED_VLLM_SOURCE_HASHES: frozenset[str] = frozenset(
+    {"607c0a459306a71ff7d01445772494367f3924098739bbd3b4f43020738297d4"}
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +111,10 @@ def validate_capabilities(
         failures.append("graph mode must be piecewise or eager")
     if require_native_combine and descriptor.combine_owner != "vllm.native":
         failures.append("native combine owner is unavailable")
+    if (
+        descriptor.vllm_source_sha256 != "unknown"
+        and descriptor.vllm_source_sha256 not in SUPPORTED_VLLM_SOURCE_HASHES
+    ):
+        failures.append("vLLM seam source hash is not in the locked support matrix")
     if failures:
         raise CapabilityError("unsupported LatchMoE capability tuple: " + "; ".join(failures))
-
