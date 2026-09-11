@@ -11,17 +11,21 @@ from vllm.model_executor.offloader.base import BaseOffloader
 from vllm.model_executor.offloader.uva import UVAOffloader
 
 from .host_store import PinnedHostStore
-from .manifest import OffloadManifest
+from .manifest import ModelIdentityLock, OffloadManifest
 from .profile import JsonlEventWriter
-from .runtime import CudaLayerRuntime, CudaMainSlotPool, CudaStagePool
+from .residency_plan import CudaResidencyPlan
+from .runtime import CudaLayerRuntime
 
 
 _EXPERT_WEIGHT_NAMES = frozenset({"w13_weight", "w2_weight"})
+# Deprecated diagnostic constant retained for old benchmark readers.  It is not
+# consulted by the production plan path.
 TOTAL_OFFLOAD_BUDGET_BYTES = 14 * 1024**3
 WAVE_SLOTS_ENV = "VLLM_LATCHMOE_WAVE_SLOTS"
 
 
 def _wave_slot_count(main_slots: int) -> int:
+    """Diagnostic/oracle slot override; production plans do not call this."""
     value = os.getenv(WAVE_SLOTS_ENV)
     wave_slots = min(main_slots, 32) if value is None else int(value)
     if wave_slots <= 0 or wave_slots > main_slots:
@@ -29,8 +33,6 @@ def _wave_slot_count(main_slots: int) -> int:
             f"{WAVE_SLOTS_ENV} must be in [1, {main_slots}], got {wave_slots}"
         )
     return wave_slots
-
-
 def _post_load_named_parameters(
     module: nn.Module,
     prefix: str = "",
@@ -88,21 +90,31 @@ def _move_unbound_state_to_device(
 
 
 class CudaSEWOffloader(BaseOffloader):
-    """Manifest-selected CUDA expert offloader attached by make_layers()."""
+    """Plan-selected CPU-first offloader with one main cache per layer."""
 
     def __init__(
         self,
-        manifest: OffloadManifest,
+        manifest: OffloadManifest | None = None,
         *,
+        plan: CudaResidencyPlan | None = None,
+        identity_lock: ModelIdentityLock | None = None,
         pin_memory: bool = True,
         first_layer_id: int = 0,
         residual_uva_max_bytes: int = 0,
     ):
+        if (manifest is None) == (plan is None):
+            raise TypeError("provide exactly one of manifest or plan")
         self.manifest = manifest
-        self.host_store = PinnedHostStore(manifest, pin_memory=pin_memory)
+        self.plan = plan
+        self.identity_lock = identity_lock
+        self.host_store = PinnedHostStore(
+            plan if plan is not None else manifest, pin_memory=pin_memory
+        )
         self.first_layer_id = first_layer_id
         if residual_uva_max_bytes < 0:
             raise ValueError("residual_uva_max_bytes must be non-negative")
+        if plan is not None and residual_uva_max_bytes:
+            raise ValueError("production plan cannot enable residual UVA")
         self.residual_uva = (
             UVAOffloader(cpu_offload_max_bytes=residual_uva_max_bytes)
             if residual_uva_max_bytes
@@ -113,10 +125,41 @@ class CudaSEWOffloader(BaseOffloader):
         self.runtimes: dict[int, CudaLayerRuntime] = {}
         self._wrapped = False
         self._post_initialized = False
-        self.main_slot_pool: CudaMainSlotPool | None = None
-        self.stage_pool: CudaStagePool | None = None
         profile_path = os.getenv("VLLM_LATCHMOE_PROFILE_PATH")
         self.event_writer = JsonlEventWriter(profile_path) if profile_path else None
+
+    @property
+    def selected_layer_ids(self) -> tuple[int, ...]:
+        if self.plan is not None:
+            return self.plan.offloaded_layer_ids
+        assert self.manifest is not None
+        return self.manifest.layer_ids
+
+    @property
+    def num_experts(self) -> int:
+        if self.plan is not None:
+            return self.plan.num_experts
+        assert self.manifest is not None
+        return self.manifest.model.num_experts
+
+    @property
+    def num_slots(self) -> int:
+        if self.plan is not None:
+            return self.plan.effective_num_slots
+        assert self.manifest is not None
+        return self.manifest.num_slots
+
+    def _parameter_layouts(self, layer_id: int) -> tuple[tuple[str, str], ...]:
+        if self.plan is not None:
+            return (
+                ("w13_weight", "mlp.experts.w13_weight"),
+                ("w2_weight", "mlp.experts.w2_weight"),
+            )
+        assert self.manifest is not None
+        return tuple(
+            (tensor.name, tensor.parameter_name)
+            for tensor in self.manifest.layer(layer_id).tensors
+        )
 
     def wrap_modules(
         self, modules_generator: Generator[nn.Module, None, None]
@@ -125,7 +168,7 @@ class CudaSEWOffloader(BaseOffloader):
             raise RuntimeError("wrap_modules may only be called once")
         self._wrapped = True
         modules: list[nn.Module] = []
-        selected = set(self.manifest.layer_ids)
+        selected = set(self.selected_layer_ids)
         modules_iterator = iter(modules_generator)
         relative_index = 0
         while True:
@@ -144,19 +187,18 @@ class CudaSEWOffloader(BaseOffloader):
             if layer_id not in selected:
                 relative_index += 1
                 continue
-            layout = self.manifest.layer(layer_id)
             bound_parameter_ids: set[int] = set()
-            for tensor in layout.tensors:
-                parameter = _resolve_parameter(module, tensor.parameter_name)
+            for tensor_name, parameter_name in self._parameter_layouts(layer_id):
+                parameter = _resolve_parameter(module, parameter_name)
                 self.host_store.bind_parameter(
                     layer_id,
-                    tensor.name,
+                    tensor_name,
                     parameter,
                     original_device=target_device if construct_on_cpu else None,
                 )
                 bound_parameter_ids.add(id(parameter))
                 self.bound_parameter_names.add(
-                    f"model.layers.{layer_id}.{tensor.parameter_name}"
+                    f"model.layers.{layer_id}.{parameter_name}"
                 )
             if construct_on_cpu:
                 _move_unbound_state_to_device(
@@ -187,7 +229,7 @@ class CudaSEWOffloader(BaseOffloader):
     def post_init(self) -> None:
         if self._post_initialized:
             raise RuntimeError("post_init may only be called once")
-        missing = sorted(set(self.manifest.layer_ids) - set(self.bound_layers))
+        missing = sorted(set(self.selected_layer_ids) - set(self.bound_layers))
         if missing:
             raise RuntimeError(f"missing manifest layers during binding: {missing}")
         self._post_initialized = True
@@ -214,52 +256,16 @@ class CudaSEWOffloader(BaseOffloader):
                     up_last=float(host_w13[-1, -1, -1]),
                     down_last=float(host_w2[-1, -1, -1]),
                 )
-            if self.main_slot_pool is None:
-                self.main_slot_pool = CudaMainSlotPool(
-                    device=device,
-                    num_slots=self.manifest.num_slots,
-                    w13_shape=tuple(host_w13.shape[1:]),
-                    w2_shape=tuple(host_w2.shape[1:]),
-                    dtype=host_w13.dtype,
-                )
-                if self.manifest.num_slots < self.manifest.model.num_experts:
-                    wave_slots = _wave_slot_count(self.manifest.num_slots)
-                    self.stage_pool = CudaStagePool(
-                        device=device,
-                        num_slots=wave_slots,
-                        w13_shape=tuple(host_w13.shape[1:]),
-                        w2_shape=tuple(host_w2.shape[1:]),
-                        dtype=host_w13.dtype,
-                        primary_w13=self.main_slot_pool.w13,
-                        primary_w2=self.main_slot_pool.w2,
-                    )
-                    if self.event_writer is not None:
-                        self.event_writer.write(
-                            "slot_pool_config",
-                            main_slots=self.manifest.num_slots,
-                            wave_slots=wave_slots,
-                            stage_bank_count=len(self.stage_pool.banks),
-                            reuses_main_bank=self.stage_pool.reuses_main_slots,
-                        )
-            elif self.stage_pool is not None and tuple(
-                self.stage_pool.banks[0].w13.shape[1:]
-            ) != tuple(host_w13.shape[1:]):
-                raise RuntimeError("offloaded layers do not share one expert layout")
-            elif self.stage_pool is not None and tuple(
-                self.stage_pool.banks[0].w2.shape[1:]
-            ) != tuple(host_w2.shape[1:]):
-                raise RuntimeError("offloaded layers do not share one expert layout")
             self.runtimes[layer_id] = CudaLayerRuntime(
-                layer=self.manifest.layer(layer_id),
-                num_experts=self.manifest.model.num_experts,
-                num_slots=self.manifest.num_slots,
+                layer_id=layer_id,
+                num_experts=self.num_experts,
+                num_slots=self.num_slots,
                 host_store=self.host_store,
                 experts_module=experts_module,
                 device=device,
-                main_slot_pool=self.main_slot_pool,
-                stage_pool=self.stage_pool,
                 event_writer=self.event_writer,
             )
+            self.runtimes[layer_id].production_plan = self.plan is not None
             if hasattr(experts_module, "router") and hasattr(
                 experts_module, "quant_method"
             ):

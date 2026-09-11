@@ -99,7 +99,7 @@ def test_async_map_publication_reuses_pinned_buffers(
     assert all(copy.cpu_map.is_pinned() for copy in runtime._pending_map_copies)
 
 
-def test_shared_main_slots_wait_and_reload_across_layers(
+def test_per_layer_main_slots_preserve_mapping_across_layers(
     tiny_manifest, tiny_decoder_factory
 ):
     first_layout = tiny_manifest.layers[0]
@@ -126,10 +126,13 @@ def test_shared_main_slots_wait_and_reload_across_layers(
     second_snapshot = second.stage_async((0, 1))
     torch.cuda.synchronize()
 
-    assert not first._pending_computes
+    assert first.slot_w13.data_ptr() != second.slot_w13.data_ptr()
+    first_mapping = first.log2phy.cpu().clone()
     assert torch.count_nonzero(second.slot_w13[second_snapshot.slot_ids]).item() > 0
 
+    first.wait_compute_done(first._pending_computes.pop())
     first_snapshot = first.stage_async((0, 1))
     torch.cuda.synchronize()
 
+    assert torch.equal(first.log2phy.cpu(), first_mapping)
     assert torch.count_nonzero(first.slot_w13[first_snapshot.slot_ids]).item() == 0

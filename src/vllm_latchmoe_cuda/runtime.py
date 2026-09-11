@@ -8,8 +8,8 @@ from torch import nn
 
 from .core.expert_key import ExpertKey
 from .core.policy import LruPolicy
-from .core.slots import ComputeHandle, ExpertSlotBank, SlotLease, SlotState
-from .core.waves import WaveDescriptor
+from .core.slots import ComputeHandle, SlotLease, SlotState
+from .core.waves import MainCacheWaveSpec
 from .errors import (
     ActiveExpertCapacityError,
     NoEvictableSlotError,
@@ -18,14 +18,10 @@ from .errors import (
     StaleMappingError,
 )
 from .host_store import PinnedHostStore
+from .main_cache import CudaLayerMainCache, PreparedMainCacheWave
 from .manifest import LayerLayout
 from .profile import JsonlEventWriter, RuntimeCounters
-from .transfer import (
-    CudaTransferEngine,
-    ExpertCopy,
-    TransferTicket,
-    copy_expert_sync,
-)
+from .transfer import ExpertCopy, copy_expert_sync
 
 
 @dataclass(frozen=True)
@@ -52,184 +48,56 @@ class PendingMapCopy:
     event: torch.cuda.Event
 
 
-@dataclass
-class StageBank:
-    bank_id: int
-    w13: torch.Tensor
-    w2: torch.Tensor
-    compute_done: torch.cuda.Event | None = None
-
-
-@dataclass(frozen=True)
-class StagedWave:
-    wave_id: int
-    bank_id: int
-    experts: tuple[int, ...]
-    ticket: TransferTicket
-
-
 @dataclass(frozen=True)
 class WaveExecutionTrace:
     pair_count: int
     compute_order: tuple[int, ...]
     issue_order: tuple[int, ...]
     buffer_by_wave: tuple[tuple[int, int], ...]
-
-
-class CudaStagePool:
-    def __init__(
-        self,
-        *,
-        device: torch.device,
-        num_slots: int,
-        w13_shape: tuple[int, ...],
-        w2_shape: tuple[int, ...],
-        dtype: torch.dtype,
-        buffer_count: int = 2,
-        primary_w13: torch.Tensor | None = None,
-        primary_w2: torch.Tensor | None = None,
-    ):
-        if buffer_count != 2:
-            raise ValueError("LatchMoE B2 requires exactly two stage banks")
-        self.device = device
-        self.num_slots = num_slots
-        self.transfer_engine = CudaTransferEngine(device)
-        if (primary_w13 is None) != (primary_w2 is None):
-            raise ValueError("both primary stage tensors must be provided together")
-        self.reuses_main_slots = primary_w13 is not None
-        if primary_w13 is not None and primary_w2 is not None:
-            if (
-                tuple(primary_w13.shape[1:]) != w13_shape
-                or tuple(primary_w2.shape[1:]) != w2_shape
-            ):
-                raise ValueError("primary stage tensors have an incompatible layout")
-            if primary_w13.shape[0] < num_slots or primary_w2.shape[0] < num_slots:
-                raise ValueError("primary stage tensors are smaller than wave capacity")
-            first = StageBank(
-                bank_id=0,
-                w13=primary_w13.narrow(0, 0, num_slots),
-                w2=primary_w2.narrow(0, 0, num_slots),
-            )
-        else:
-            first = StageBank(
-                bank_id=0,
-                w13=torch.empty((num_slots, *w13_shape), dtype=dtype, device=device),
-                w2=torch.empty((num_slots, *w2_shape), dtype=dtype, device=device),
-            )
-        second = StageBank(
-            bank_id=1,
-            w13=torch.empty((num_slots, *w13_shape), dtype=dtype, device=device),
-            w2=torch.empty((num_slots, *w2_shape), dtype=dtype, device=device),
-        )
-        self.banks = (first, second)
-
-    def data_ptrs(self) -> tuple[tuple[int, int], ...]:
-        return tuple((bank.w13.data_ptr(), bank.w2.data_ptr()) for bank in self.banks)
-
-    def issue(
-        self, runtime: CudaLayerRuntime, wave: WaveDescriptor, bank_id: int
-    ) -> StagedWave:
-        if torch.cuda.is_current_stream_capturing():
-            raise StagingDuringCaptureError(
-                f"wave staging attempted during CUDA Graph capture: "
-                f"layer={runtime.layer_id}, wave={wave.wave_id}"
-            )
-        bank = self.banks[bank_id]
-        if bank.compute_done is not None:
-            self.transfer_engine.stream.wait_event(bank.compute_done)
-        copies = tuple(
-            ExpertCopy(expert_id=expert, slot_id=position, generation=0)
-            for position, expert in enumerate(wave.experts)
-        )
-        ticket = self.transfer_engine.load_many_async(
-            host_w13=runtime.host_w13,
-            host_w2=runtime.host_w2,
-            slot_w13=bank.w13,
-            slot_w2=bank.w2,
-            copies=copies,
-        )
-        return StagedWave(wave.wave_id, bank_id, wave.experts, ticket)
-
-    def wait_ready(self, staged: StagedWave) -> StageBank:
-        self.transfer_engine.wait_ready(staged.ticket)
-        return self.banks[staged.bank_id]
-
-    def record_compute_done(self, bank_id: int) -> None:
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(self.device))
-        self.banks[bank_id].compute_done = event
-
-
-class CudaMainSlotPool:
-    def __init__(
-        self,
-        *,
-        device: torch.device,
-        num_slots: int,
-        w13_shape: tuple[int, ...],
-        w2_shape: tuple[int, ...],
-        dtype: torch.dtype,
-    ):
-        self.device = device
-        self.w13 = torch.empty((num_slots, *w13_shape), dtype=dtype, device=device)
-        self.w2 = torch.empty((num_slots, *w2_shape), dtype=dtype, device=device)
-        self.transfer_engine = CudaTransferEngine(device)
-        self.owner: CudaLayerRuntime | None = None
-        self.external_compute_done: torch.cuda.Event | None = None
-
-    def acquire(self, runtime: CudaLayerRuntime, stream: torch.cuda.Stream) -> None:
-        if self.external_compute_done is not None:
-            stream.wait_event(self.external_compute_done)
-            self.external_compute_done = None
-        if self.owner is runtime:
-            runtime._release_pending_to_stream(stream)
-            return
-        if self.owner is not None:
-            self.owner._release_pending_to_stream(stream)
-        runtime.invalidate_main_slots()
-        self.owner = runtime
-
-    def record_external_compute_done(self, event: torch.cuda.Event) -> None:
-        self.external_compute_done = event
-
-
 class CudaLayerRuntime:
     def __init__(
         self,
         *,
-        layer: LayerLayout,
+        layer: LayerLayout | None = None,
+        layer_id: int | None = None,
         num_experts: int,
         num_slots: int,
         host_store: PinnedHostStore,
         experts_module: nn.Module,
         device: torch.device,
-        main_slot_pool: CudaMainSlotPool | None = None,
-        stage_pool: CudaStagePool | None = None,
         event_writer: JsonlEventWriter | None = None,
     ):
         if device.type != "cuda":
             raise ValueError(f"CUDA runtime requires a CUDA device, got {device}")
-        self.layer_id = layer.layer_id
+        if layer_id is None:
+            if layer is None:
+                raise TypeError("layer_id is required")
+            layer_id = layer.layer_id
+        self.layer_id = int(layer_id)
+        self.production_plan = False
+        self.router_call_count = 0
         self.num_experts = num_experts
         self.num_slots = num_slots
-        self.host_w13 = host_store.tensor_view(layer.layer_id, "w13_weight")
-        self.host_w2 = host_store.tensor_view(layer.layer_id, "w2_weight")
+        self.host_w13 = host_store.tensor_view(self.layer_id, "w13_weight")
+        self.host_w2 = host_store.tensor_view(self.layer_id, "w2_weight")
         w13_parameter = getattr(experts_module, "w13_weight")
         w2_parameter = getattr(experts_module, "w2_weight")
-        self.main_slot_pool = main_slot_pool or CudaMainSlotPool(
+        self.main_cache = CudaLayerMainCache(
+            layer_id=self.layer_id,
             device=device,
             num_slots=num_slots,
+            num_experts=num_experts,
             w13_shape=tuple(self.host_w13.shape[1:]),
             w2_shape=tuple(self.host_w2.shape[1:]),
             dtype=self.host_w13.dtype,
         )
-        w13_parameter.data = self.main_slot_pool.w13
-        w2_parameter.data = self.main_slot_pool.w2
+        w13_parameter.data = self.main_cache.slot_w13
+        w2_parameter.data = self.main_cache.slot_w2
         self.slot_w13_parameter = w13_parameter
         self.slot_w2_parameter = w2_parameter
         self.slot_w13 = w13_parameter
         self.slot_w2 = w2_parameter
-        self.log2phy = torch.full((num_experts,), -1, dtype=torch.int32, device=device)
+        self.log2phy = self.main_cache.log2phy
         self.expert_map = self.log2phy
         if "_expert_map" in experts_module._buffers:
             experts_module._buffers["_expert_map"] = self.expert_map
@@ -245,26 +113,16 @@ class CudaLayerRuntime:
             experts_module.local_num_experts = num_slots
         if hasattr(experts_module, "n_local_physical_experts"):
             experts_module.n_local_physical_experts = num_slots
-        self.bank = ExpertSlotBank(num_slots)
+        self.bank = self.main_cache.bank
         self.policy = LruPolicy()
         self.counters = RuntimeCounters()
-        self.transfer_engine = self.main_slot_pool.transfer_engine
-        self.stage_pool = stage_pool
-        if self.stage_pool is None and num_slots < num_experts:
-            self.stage_pool = CudaStagePool(
-                device=device,
-                num_slots=num_slots,
-                w13_shape=tuple(self.host_w13.shape[1:]),
-                w2_shape=tuple(self.host_w2.shape[1:]),
-                dtype=self.host_w13.dtype,
-                primary_w13=self.main_slot_pool.w13,
-                primary_w2=self.main_slot_pool.w2,
-            )
+        self.transfer_engine = self.main_cache.transfer_engine
         self.last_wave_trace: WaveExecutionTrace | None = None
         self.event_writer = event_writer
         self.direct_slots_profiled = False
         self.mapping_version = 0
         self._active_compute: ComputeHandle | None = None
+        self._main_cache_compute_handles: dict[int, ComputeHandle] = {}
         self._pending_computes: list[PendingCompute] = []
         self._pending_map_copies: list[PendingMapCopy] = []
         self._free_map_buffers = [self._new_cpu_map(), self._new_cpu_map()]
@@ -279,6 +137,16 @@ class CudaLayerRuntime:
     @property
     def map_buffer_count(self) -> int:
         return len(self._free_map_buffers) + len(self._pending_map_copies)
+
+    @property
+    def main_slot_pool(self):
+        """Compatibility view; storage is owned by this layer's main cache."""
+        return self.main_cache
+
+    @property
+    def stage_pool(self):
+        """Stage banks are intentionally absent from the production runtime."""
+        return None
 
     def _new_cpu_map(self) -> torch.Tensor:
         return torch.empty(
@@ -301,23 +169,6 @@ class CudaLayerRuntime:
                 f"layer {self.layer_id} tensor address changed: "
                 f"expected={self._stable_ptrs}, actual={actual}"
             )
-
-    def invalidate_main_slots(self) -> None:
-        if self._active_compute is not None or self._pending_computes:
-            raise RuntimeError(
-                f"layer {self.layer_id} cannot invalidate slots with pending compute"
-            )
-        for slot in self.bank.slots:
-            if slot.state is SlotState.READY:
-                self.bank.evict(slot.slot_id)
-            elif slot.state is not SlotState.EMPTY:
-                raise RuntimeError(
-                    f"layer {self.layer_id} cannot invalidate slot {slot.slot_id} "
-                    f"while {slot.state.value}"
-                )
-        self.log2phy.fill_(-1)
-        self.mapping_version += 1
-        self.assert_stable_addresses()
 
     def _normalize_active(
         self, active_experts: Iterable[int], *, enforce_capacity: bool = True
@@ -363,9 +214,7 @@ class CudaLayerRuntime:
         return self.policy.choose(self.bank, excluded=reserved)
 
     def stage_sync(self, active_experts: Iterable[int]) -> LayerMappingSnapshot:
-        self.main_slot_pool.acquire(
-            self, torch.cuda.current_stream(self.slot_w13.device)
-        )
+        self.release_pending_for_transfer()
         self.assert_stable_addresses()
         active = self._normalize_active(active_experts)
         selected: dict[int, SlotLease] = {}
@@ -423,7 +272,7 @@ class CudaLayerRuntime:
                 f"dynamic staging attempted during CUDA Graph capture: "
                 f"layer={self.layer_id}"
             )
-        self.main_slot_pool.acquire(self, self.transfer_engine.stream)
+        self.release_pending_for_transfer()
         self.assert_stable_addresses()
         active = self._normalize_active(active_experts)
         selected: dict[int, SlotLease] = {}
@@ -580,6 +429,40 @@ class CudaLayerRuntime:
         self._pending_computes.clear()
 
     def acquire_main_slots_for_current_stream(self) -> None:
-        self.main_slot_pool.acquire(
-            self, torch.cuda.current_stream(self.slot_w13.device)
+        self._release_pending_to_stream(
+            torch.cuda.current_stream(self.slot_w13.device)
         )
+
+    def prepare_main_cache_wave(
+        self,
+        spec: MainCacheWaveSpec,
+        *,
+        protected_slots: frozenset[int] = frozenset(),
+    ) -> PreparedMainCacheWave:
+        prepared = self.main_cache.prepare_wave(
+            spec,
+            host_w13=self.host_w13,
+            host_w2=self.host_w2,
+            protected_slots=protected_slots,
+        )
+        self.counters.increment("slot_hit", sum(
+            1 for expert in spec.experts if self.main_cache.lease_for(expert) is not None
+        ) if spec.wave_type == "hit" else 0)
+        self.counters.increment("slot_miss", len(prepared.leases) if spec.wave_type == "miss" else 0)
+        self.counters.increment("h2d_bytes", prepared.h2d_bytes)
+        return prepared
+
+    def wait_and_publish(self, prepared: PreparedMainCacheWave) -> None:
+        self.main_cache.wait_and_publish(prepared)
+        self.mapping_version += 1
+        self.assert_stable_addresses()
+
+    def begin_main_cache_compute(self, prepared: PreparedMainCacheWave) -> ComputeHandle:
+        handle = self.bank.begin_compute(tuple(lease.slot_id for lease in prepared.leases))
+        self._main_cache_compute_handles[prepared.wave_id] = handle
+        return handle
+
+    def mark_compute_complete(self, prepared: PreparedMainCacheWave) -> None:
+        handle = self._main_cache_compute_handles.pop(prepared.wave_id, None)
+        if handle is not None:
+            self.bank.end_compute(handle)
