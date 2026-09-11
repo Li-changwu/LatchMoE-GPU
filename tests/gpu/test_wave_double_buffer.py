@@ -13,7 +13,7 @@ pytestmark = [
 ]
 
 
-def test_wave_executor_alternates_two_stable_stage_banks(
+def test_wave_executor_reuses_one_stable_main_cache(
     tiny_manifest, tiny_decoder_factory
 ):
     module = tiny_decoder_factory("cuda")
@@ -24,7 +24,7 @@ def test_wave_executor_alternates_two_stable_stage_banks(
         host.copy_(torch.randn_like(host))
     offloader.post_init()
     runtime = offloader.runtimes[0]
-    pointers = runtime.stage_pool.data_ptrs()
+    pointers = runtime.main_cache.data_ptrs()
     hidden = torch.randn((4, 2), dtype=torch.bfloat16, device="cuda")
     ids = torch.tensor([[0, 1], [2, 3], [0, 2], [1, 3]], device="cuda")
     weights = torch.full((4, 2), 0.5, device="cuda")
@@ -33,14 +33,11 @@ def test_wave_executor_alternates_two_stable_stage_banks(
     first_trace = runtime.last_wave_trace
     execute_exact_waves(runtime, hidden, ids, weights)
 
-    assert first_trace.buffer_by_wave == ((0, 0), (1, 1))
-    assert runtime.stage_pool.data_ptrs() == pointers
-    assert (
-        runtime.stage_pool.banks[0].w13.data_ptr()
-        != runtime.stage_pool.banks[1].w13.data_ptr()
-    )
-    assert runtime.stage_pool.reuses_main_slots is True
-    assert runtime.stage_pool.banks[0].w13.data_ptr() == runtime.slot_w13.data_ptr()
+    assert first_trace.buffer_by_wave == ((0, 0), (1, 0))
+    assert not hasattr(runtime, "stage_pool")
+    assert runtime.main_cache.data_ptrs() == pointers
+    assert runtime.main_cache.slot_w13.data_ptr() == runtime.slot_w13.data_ptr()
+    assert runtime.main_cache.slot_w2.data_ptr() == runtime.slot_w2.data_ptr()
 
 
 def test_transfer_aware_prefetch_never_changes_compute_order(
@@ -64,7 +61,7 @@ def test_transfer_aware_prefetch_never_changes_compute_order(
     assert sorted(runtime.last_wave_trace.issue_order) == [0, 1]
 
 
-def test_two_layers_share_the_same_double_stage_pool(
+def test_two_layers_have_independent_persistent_main_caches(
     tiny_manifest, tiny_decoder_factory
 ):
     first = tiny_manifest.layers[0]
@@ -86,15 +83,22 @@ def test_two_layers_share_the_same_double_stage_pool(
 
     offloader.post_init()
 
-    assert offloader.runtimes[0].stage_pool is offloader.runtimes[1].stage_pool
-    assert offloader.runtimes[0].stage_pool is offloader.stage_pool
-    assert len(offloader.stage_pool.banks) == 2
+    first_runtime = offloader.runtimes[0]
+    second_runtime = offloader.runtimes[1]
+    assert not hasattr(first_runtime, "stage_pool")
+    assert not hasattr(second_runtime, "stage_pool")
+    assert first_runtime.main_slot_pool is first_runtime.main_cache
+    assert second_runtime.main_slot_pool is second_runtime.main_cache
+    assert first_runtime.main_cache is not second_runtime.main_cache
     assert (
-        offloader.runtimes[0].main_slot_pool
-        is offloader.runtimes[1].main_slot_pool
-        is offloader.main_slot_pool
+        first_runtime.slot_w13.data_ptr()
+        != second_runtime.slot_w13.data_ptr()
     )
     assert (
-        offloader.runtimes[0].slot_w13.data_ptr()
-        == offloader.runtimes[1].slot_w13.data_ptr()
+        first_runtime.slot_w2.data_ptr()
+        != second_runtime.slot_w2.data_ptr()
+    )
+    assert (
+        first_runtime.log2phy.data_ptr()
+        != second_runtime.log2phy.data_ptr()
     )
