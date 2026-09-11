@@ -931,16 +931,24 @@ Expected: 输出 `PASS`，并显式列出 exact parameter set、HBM ledger、pai
 - `76a8727` `feat: stream overflow through the main cache`：hit-first planner、串行 replacement、pair coverage 和一次 combine 执行路径。
 - `24ca378` `feat: defer routed pairs to one native combine`：窄 `CudaMoeSeam`、`NativeWavePayload`、capability descriptor 和组合调用计数测试。
 - `8c74764` `fix: keep dynamic CUDA staging outside graph replay`：PIECEWISE graph boundary、capture 时拒绝动态 staging/overflow，并记录 H2D 事件字段。
+- `c05d163` `refactor: finalize serial main-cache execution`：删除生产 exact-wave/double-bank 路径，统一到串行 Main Cache executor，并更新 lifecycle/runner 断言。
+- `785117c` `fix: lock qualified vLLM capability source hash`：固化 vLLM 0.19.1 fused-MoE seam 源码 SHA-256，未知源码 fail closed。
+- `ac828ee` `test: align wave lifecycle checks with main cache`：将遗留双-bank测试迁移为单层持久 cache 复用和层间独立性验收。
 
 已执行验收：
 
 ```text
-tests/unit                                           126 passed
-Task 1-3 + Task 4-6 targeted suite                 173 passed
-graph boundary / runner / streaming / combine        31 passed
+/root/latchmoe-venv/bin/python -m pytest -q tests/unit
+137 passed
+
+/root/latchmoe-venv/bin/python -m pytest -q tests/unit tests/integration tests/gpu
+196 passed, 20 warnings
+
+Task 1-6 targeted suite (plan/CLI/cache/waves/seam/graph/lifecycle/CUDA)
+88 passed, 20 warnings
 ```
 
-测试使用 `/root/latchmoe-venv` 的 PyTorch 2.10 CUDA 环境；A6000 上的小张量 slot、streaming、graph replay 和 seam 计数测试均通过。旧的 `execute_exact_waves`、双 temporary-bank 断言仅保留为 diagnostic oracle，生产 adapter 已切换到 `execute_main_cache_waves`。当前 vLLM 0.19.1 wheel 未提供独立 layer-level combine hook，因此生产 plan 在未注入锁定 native seam 时明确抛 `NativeCombineError`，不会以 `index_add_` 冒充 native combine；真实模型 full-token gate 仍需在带该 hook 的锁定 vLLM fork 上运行。
+测试使用 `/root/latchmoe-venv` 的 PyTorch 2.10 CUDA 环境；A6000 上的小张量 slot、streaming、graph replay、single-layer cache isolation 和 seam 计数测试均通过。旧的 `execute_exact_waves` 仅保留为 diagnostic alias，双 temporary-bank 断言已迁移到逐层持久 Main Cache 断言，生产 adapter 已切换到 `execute_main_cache_waves`。当前 vLLM 0.19.1 wheel 未提供独立 layer-level combine hook，因此生产 plan 在未注入锁定 native seam 时明确抛 `NativeCombineError`，不会以 `index_add_` 冒充 native combine；真实模型 full-token gate 仍需在带该 hook 的锁定 vLLM fork 上运行。
 
 未完成部分从 Task 7 开始：定向空闲-slot overlap、poison/drain shutdown、shared expert capability 扩展、benchmark 合同和正式全模型验收尚未宣称完成。
 
@@ -958,7 +966,7 @@ graph boundary / runner / streaming / combine        31 passed
 - [x] `--cuda-moe-offload-gb` 是唯一生产 residency knob。
 - [x] 无 profile 的均匀层默认使用 `midpoint_stratified_v1`；Qwen3 `E=48,K=12` 精确选择 `2,6,...,46`。
 - [x] dense/non-MoE 层先从 ordered eligible IDs 排除；非均匀层按实测整层 bytes 累计，不使用平均层大小。
-- [ ] `(3,7,...,47)` 和 first-12 仅作为 legacy evidence，生产 manifest 不再拥有默认层选择权。
+- [x] `(3,7,...,47)` 和 first-12 仅作为 legacy evidence，生产 manifest 不再拥有默认层选择权。
 - [x] parent 和所有 workers 使用相同且校验过的 `plan_id`、`selection_strategy`、eligible IDs 和 selected IDs。
 - [x] 只有 selected layers 进入 Host Store、Main Cache 和 H2D。
 - [x] 每个 selected layer 有独立持久 cache；层切换不清空映射。
@@ -968,6 +976,6 @@ graph boundary / runner / streaming / combine        31 passed
 - [x] 每层 forward 只有一次 native combine seam 调用；缺少锁定 hook 时 fail closed，不存在生产 `index_add_` combine。
 - [x] `h=0`、`h=C<P` 不产生 overlap claim；candidate/actual 字段已预留给 Task 7。
 - [ ] 异常使 runtime poisoned，并在 shutdown 时 drain 所有在途 CUDA 工作。
-- [ ] vLLM commit/source、model config/index/shards 均可追溯。
+- [x] vLLM commit/source、model config/index/shards 均可追溯。
 - [ ] full-resident、exact UVA、serial LatchMoE、async LatchMoE 通过 exact-token parity。
 - [ ] 新性能结果使用可比参数集合和 HBM ledger，并保留所有失败/不可比 case。
