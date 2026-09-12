@@ -139,6 +139,7 @@ class CudaLayerRuntime:
         self._pending_main_computes: dict[int, PendingCompute] = {}
         self._pending_transfer_tickets: dict[int, object] = {}
         self.overlap_records: list[dict[str, object]] = []
+        self.eviction_sequence: list[int] = []
         self._pending_computes: list[PendingCompute] = []
         self._pending_map_copies: list[PendingMapCopy] = []
         self._free_map_buffers = [self._new_cpu_map(), self._new_cpu_map()]
@@ -483,6 +484,7 @@ class CudaLayerRuntime:
         ) if spec.wave_type == "hit" else 0)
         self.counters.increment("slot_miss", len(prepared.leases) if spec.wave_type == "miss" else 0)
         self.counters.increment("h2d_bytes", prepared.h2d_bytes)
+        self.eviction_sequence.extend(prepared.evicted_experts)
         if prepared.ready_ticket is not None:
             self._pending_transfer_tickets[prepared.wave_id] = prepared.ready_ticket
         return prepared
@@ -490,7 +492,11 @@ class CudaLayerRuntime:
     def wait_and_publish(self, prepared: PreparedMainCacheWave) -> None:
         self.ensure_healthy()
         self.main_cache.wait_and_publish(prepared)
-        self._pending_transfer_tickets.pop(prepared.wave_id, None)
+        ticket = self._pending_transfer_tickets.pop(prepared.wave_id, None)
+        if ticket is not None:
+            for key, value in tuple(self._pending_transfer_tickets.items()):
+                if value is ticket:
+                    del self._pending_transfer_tickets[key]
         self.mapping_version += 1
         self.assert_stable_addresses()
 
@@ -598,7 +604,8 @@ class CudaLayerRuntime:
                     )
         for ticket in transfer_tickets:
             if getattr(ticket, "event", None) is not None:
-                self._pending_transfer_tickets[id(ticket)] = ticket
+                if not any(value is ticket for value in self._pending_transfer_tickets.values()):
+                    self._pending_transfer_tickets[id(ticket)] = ticket
         self._failure_record = failure = {
             "event": "failure",
             "plan_id": getattr(self, "plan_id", None),
