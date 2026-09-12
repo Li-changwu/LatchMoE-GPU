@@ -57,6 +57,47 @@ def source_sha256(module: Any) -> str:
         return "unknown"
 
 
+def shared_expert_weight_bytes(shared: Any) -> int:
+    if shared is None or not hasattr(shared, "parameters"):
+        return 0
+    seen: set[int] = set()
+    total = 0
+    for parameter in shared.parameters(recurse=True):
+        identity = id(parameter)
+        if identity not in seen:
+            seen.add(identity)
+            total += int(parameter.numel() * parameter.element_size())
+    for buffer in shared.buffers(recurse=True):
+        identity = id(buffer)
+        if identity not in seen:
+            seen.add(identity)
+            total += int(buffer.numel() * buffer.element_size())
+    return total
+
+
+def _shared_representation(experts_module: Any, shared: Any, quant: Any) -> str:
+    if shared is None:
+        return "none"
+    kernel = getattr(quant, "moe_kernel", None)
+    if getattr(kernel, "shared_experts", None) is not None:
+        return "fused"
+    if bool(getattr(experts_module, "use_overlapped", False)):
+        return "mix_placement"
+    parameters = (
+        tuple(shared.parameters(recurse=True))
+        if hasattr(shared, "parameters")
+        else ()
+    )
+    buffers = (
+        tuple(shared.buffers(recurse=True)) if hasattr(shared, "buffers") else ()
+    )
+    if any(
+        tensor.device.type != "cuda" for tensor in (*parameters, *buffers)
+    ):
+        return "external_host"
+    return "external_resident"
+
+
 def describe_capabilities(
     experts_module: Any,
     *,
@@ -74,7 +115,7 @@ def describe_capabilities(
     return CapabilityDescriptor(
         model_family=model_family,
         router_owner=f"{type(router).__module__}.{type(router).__name__}",
-        shared_expert_representation="none" if shared is None else type(shared).__name__,
+        shared_expert_representation=_shared_representation(experts_module, shared, quant),
         dtype=dtype.removeprefix("torch."),
         tensor_parallel_size=int(tensor_parallel_size),
         expert_parallel=bool(expert_parallel),
@@ -103,8 +144,8 @@ def validate_capabilities(
         failures.append("tensor parallel size must be 1")
     if descriptor.expert_parallel:
         failures.append("expert parallel is unsupported")
-    if descriptor.shared_expert_representation != "none":
-        failures.append("shared/mixed experts are unsupported")
+    if descriptor.shared_expert_representation not in {"none", "external_resident"}:
+        failures.append("shared expert must be an external resident module")
     if descriptor.kernel_mode != "modular":
         failures.append("monolithic kernels are unsupported")
     if descriptor.graph_mode not in {"piecewise", "eager"}:

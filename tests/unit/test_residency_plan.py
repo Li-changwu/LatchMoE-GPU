@@ -143,6 +143,9 @@ def test_shared_bytes_do_not_enter_dynamic_slot_budget():
         ),
     )
     assert plan.main_slot_cache_bytes == 24
+    assert plan.ledger["resident_shared_weight_bytes"] == 1000
+    assert plan.ledger["host_routed_expert_bytes"] == 96
+    assert plan.ledger["dynamic_slot_bytes"] == 24
 
 
 def test_unknown_architecture_without_measured_metadata_fails_closed():
@@ -167,4 +170,3 @@ def test_slot_floor_must_produce_positive_hbm_savings():
             device_total_bytes=2 << 40,
             kv_reserve_bytes=0,
         )
-

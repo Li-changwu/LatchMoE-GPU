@@ -324,8 +324,6 @@ def install_vllm_forward_adapter(
         raise TypeError("FusedMoE quant_method.apply is required")
     if bool(getattr(quant_method, "is_monolithic", False)):
         raise TypeError("monolithic FusedMoE kernels are not supported")
-    if getattr(experts_module, "_shared_experts", None) is not None:
-        raise TypeError("shared experts are not supported by the Qwen3 target adapter")
     validate_capabilities(
         describe_capabilities(
             experts_module,
@@ -383,6 +381,10 @@ def install_vllm_forward_adapter(
 
     def latchmoe_forward(hidden_states: torch.Tensor, router_logits: torch.Tensor):
         runtime.router_call_count += 1
+        shared_experts = getattr(experts_module, "_shared_experts", None)
+        shared_output = (
+            shared_experts(hidden_states) if shared_experts is not None else None
+        )
         topk_weights, topk_ids = experts_module.router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
@@ -403,7 +405,7 @@ def install_vllm_forward_adapter(
                 topk_ids,
             )
             graph_finish(runtime, graph_runtime_id, result)
-            return None, result
+            return shared_output, result
         advance_moe_layer_index(experts_module)
         if eager_needs_exact_waves(runtime, topk_ids):
             result = execute_main_cache_waves(
@@ -413,7 +415,7 @@ def install_vllm_forward_adapter(
                 topk_weights,
                 seam=getattr(experts_module, "_latchmoe_seam", None),
             )
-            return None, result
+            return shared_output, result
         eager_prepare_compute(runtime, topk_ids)
         try:
             result = experts_module.quant_method.apply(
@@ -427,7 +429,7 @@ def install_vllm_forward_adapter(
             eager_finish_compute(runtime)
         if isinstance(result, tuple):
             raise TypeError("unexpected shared-expert result from Qwen3 routed experts")
-        return None, result
+        return shared_output, result
 
     experts_module._latchmoe_original_forward = original_forward
     experts_module.forward = latchmoe_forward

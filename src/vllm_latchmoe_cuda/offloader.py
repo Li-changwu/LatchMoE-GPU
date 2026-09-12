@@ -11,6 +11,7 @@ from vllm.model_executor.offloader.base import BaseOffloader
 from vllm.model_executor.offloader.uva import UVAOffloader
 
 from .host_store import PinnedHostStore
+from .capabilities import shared_expert_weight_bytes
 from .manifest import ModelIdentityLock, OffloadManifest
 from .profile import JsonlEventWriter
 from .residency_plan import CudaResidencyPlan
@@ -270,6 +271,27 @@ class CudaSEWOffloader(BaseOffloader):
                 None if self.plan is None else self.plan.plan_id
             )
             self.runtimes[layer_id].production_plan = self.plan is not None
+            resident_shared_bytes = shared_expert_weight_bytes(
+                getattr(experts_module, "_shared_experts", None)
+            )
+            host_routed_bytes = sum(binding.nbytes for binding in bindings.values())
+            dynamic_slot_bytes = int(
+                self.runtimes[layer_id].slot_w13.numel()
+                * self.runtimes[layer_id].slot_w13.element_size()
+                + self.runtimes[layer_id].slot_w2.numel()
+                * self.runtimes[layer_id].slot_w2.element_size()
+            )
+            self.runtimes[layer_id].resident_shared_weight_bytes = resident_shared_bytes
+            self.runtimes[layer_id].host_routed_expert_bytes = host_routed_bytes
+            self.runtimes[layer_id].dynamic_slot_bytes = dynamic_slot_bytes
+            if self.event_writer is not None:
+                self.event_writer.write(
+                    "residency_ledger",
+                    layer_id=layer_id,
+                    resident_shared_weight_bytes=resident_shared_bytes,
+                    dynamic_slot_bytes=dynamic_slot_bytes,
+                    host_routed_expert_bytes=host_routed_bytes,
+                )
             if hasattr(experts_module, "router") and hasattr(
                 experts_module, "quant_method"
             ):

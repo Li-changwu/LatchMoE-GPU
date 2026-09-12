@@ -496,6 +496,9 @@ def build_residency_plan(
         "uniform_layer_bytes": uniform,
         "minimum_slots": slots,
         "kv_reserve_bytes": int(kv_reserve_bytes),
+        "resident_shared_weight_bytes": sum(
+            item.shared_expert_bytes for item in table
+        ),
     }
     if profile_path is not None:
         profile_hash, scores = _profile_bytes_and_scores(profile_path)
@@ -528,6 +531,8 @@ def build_residency_plan(
         for layer in selected
     )
     net_saved = selected_bytes - cache_bytes
+    ledger["host_routed_expert_bytes"] = int(selected_bytes)
+    ledger["dynamic_slot_bytes"] = int(cache_bytes)
     estimated_hbm = total - selected_bytes + cache_bytes + int(kv_reserve_bytes)
     if selected and net_saved <= 0:
         raise ResidencyBudgetError(

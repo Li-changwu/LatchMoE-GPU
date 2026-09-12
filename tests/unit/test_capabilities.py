@@ -32,6 +32,12 @@ def test_qualified_routed_only_tuple_is_accepted():
     validate_capabilities(_descriptor())
 
 
+def test_external_resident_shared_tuple_is_accepted():
+    validate_capabilities(
+        _descriptor(shared_expert_representation="external_resident")
+    )
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -60,4 +66,3 @@ def test_describe_capabilities_records_router_kernel_and_shared_representation()
     assert descriptor.kernel_mode == "modular"
     assert descriptor.shared_expert_representation == "none"
     assert descriptor.to_jsonable()["combine_owner"] == "vllm.native"
-
