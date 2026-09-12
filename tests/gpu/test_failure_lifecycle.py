@@ -56,10 +56,12 @@ def test_kernel_failure_poison_rejects_next_forward_and_drains(
     seam = FailingAfterEnqueueSeam()
 
     execute_main_cache_waves(runtime, hidden, first_ids, weights, seam=seam)
+    h2d_before = runtime.counters.snapshot().get("h2d_bytes", 0)
     with pytest.raises(RuntimeError, match="synthetic kernel callback failure"):
         execute_main_cache_waves(runtime, hidden, second_ids, weights, seam=seam)
 
     assert runtime.state is RuntimeState.POISONED
+    assert runtime.counters.snapshot().get("h2d_bytes", 0) > h2d_before
     mapping = runtime.log2phy.detach().cpu().clone()
     with pytest.raises(RuntimePoisonedError):
         execute_main_cache_waves(runtime, hidden, first_ids, weights, seam=seam)
