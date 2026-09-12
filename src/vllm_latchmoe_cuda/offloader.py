@@ -125,6 +125,7 @@ class CudaSEWOffloader(BaseOffloader):
         self.runtimes: dict[int, CudaLayerRuntime] = {}
         self._wrapped = False
         self._post_initialized = False
+        self._closed = False
         profile_path = os.getenv("VLLM_LATCHMOE_PROFILE_PATH")
         self.event_writer = JsonlEventWriter(profile_path) if profile_path else None
 
@@ -265,6 +266,9 @@ class CudaSEWOffloader(BaseOffloader):
                 device=device,
                 event_writer=self.event_writer,
             )
+            self.runtimes[layer_id].plan_id = (
+                None if self.plan is None else self.plan.plan_id
+            )
             self.runtimes[layer_id].production_plan = self.plan is not None
             if hasattr(experts_module, "router") and hasattr(
                 experts_module, "quant_method"
@@ -272,3 +276,29 @@ class CudaSEWOffloader(BaseOffloader):
                 from .runner_adapter import install_vllm_forward_adapter
 
                 install_vllm_forward_adapter(experts_module, self.runtimes[layer_id])
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        close_error: BaseException | None = None
+        try:
+            for runtime in self.runtimes.values():
+                try:
+                    runtime.close()
+                except BaseException as exc:
+                    if close_error is None:
+                        close_error = exc
+            try:
+                from .graph_ops import unregister_graph_runtime
+
+                for runtime in self.runtimes.values():
+                    unregister_graph_runtime(runtime)
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
+            if self.event_writer is not None:
+                self.event_writer.close()
+        finally:
+            self._closed = True
+        if close_error is not None:
+            raise close_error

@@ -35,6 +35,8 @@ class PreparedMainCacheWave:
     ready_ticket: TransferTicket | None
     evicted_experts: tuple[int, ...]
     h2d_bytes: int
+    protected_slots: tuple[int, ...] = ()
+    overlap_candidate: bool = False
 
 
 class CudaLayerMainCache:
@@ -98,6 +100,8 @@ class CudaLayerMainCache:
         host_w13: torch.Tensor,
         host_w2: torch.Tensor,
         protected_slots: frozenset[int] = frozenset(),
+        origin_event: torch.cuda.Event | None = None,
+        overlap_candidate: bool | None = None,
     ) -> PreparedMainCacheWave:
         """Resolve hits and replace only evictable slots in this layer cache."""
         if torch.cuda.is_current_stream_capturing():
@@ -140,6 +144,7 @@ class CudaLayerMainCache:
                 slot_w13=self.slot_w13,
                 slot_w2=self.slot_w2,
                 copies=copies,
+                origin_event=origin_event,
             )
         return PreparedMainCacheWave(
             layer_id=self.layer_id,
@@ -157,6 +162,12 @@ class CudaLayerMainCache:
                 + host_w2[copy.expert_id].numel() * host_w2.element_size()
                 for copy in copies
             ),
+            protected_slots=tuple(sorted(protected_slots)),
+            overlap_candidate=(
+                spec.overlap_candidate
+                if overlap_candidate is None
+                else bool(overlap_candidate)
+            ),
         )
 
     def wait_and_publish(self, prepared: PreparedMainCacheWave) -> None:
@@ -170,3 +181,6 @@ class CudaLayerMainCache:
         for key, slot_id in self.bank.ready_mapping().items():
             if key.layer_id == self.layer_id:
                 self.log2phy[key.expert_id] = slot_id
+
+    def close(self) -> None:
+        self.transfer_engine.close()

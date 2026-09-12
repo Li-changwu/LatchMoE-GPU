@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import atexit
 import os
 from types import MethodType
 from importlib import metadata
@@ -155,7 +156,9 @@ def register() -> None:
             plan = deserialize_residency_plan(raw_plan)
             identity_lock = deserialize_identity_lock(raw_lock)
             validate_identity_lock(identity_lock, plan)
-            return CudaSEWOffloader(plan=plan, identity_lock=identity_lock)
+            offloader = CudaSEWOffloader(plan=plan, identity_lock=identity_lock)
+            atexit.register(offloader.close)
+            return offloader
         if mode == "uva":
             manifest = load_manifest_from_env()
             return ManifestUVAOffloader(manifest)

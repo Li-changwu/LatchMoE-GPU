@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable
 
 import torch
@@ -16,6 +17,7 @@ from .errors import (
     StableAddressError,
     StagingDuringCaptureError,
     StaleMappingError,
+    RuntimePoisonedError,
 )
 from .host_store import PinnedHostStore
 from .main_cache import CudaLayerMainCache, PreparedMainCacheWave
@@ -48,6 +50,12 @@ class PendingMapCopy:
     event: torch.cuda.Event
 
 
+class RuntimeState(str, Enum):
+    ACTIVE = "ACTIVE"
+    POISONED = "POISONED"
+    CLOSED = "CLOSED"
+
+
 @dataclass(frozen=True)
 class WaveExecutionTrace:
     pair_count: int
@@ -74,6 +82,10 @@ class CudaLayerRuntime:
                 raise TypeError("layer_id is required")
             layer_id = layer.layer_id
         self.layer_id = int(layer_id)
+        self.device = device
+        self.state = RuntimeState.ACTIVE
+        self.poison_cause: BaseException | None = None
+        self._closed = False
         self.production_plan = False
         self.router_call_count = 0
         self.num_experts = num_experts
@@ -123,6 +135,10 @@ class CudaLayerRuntime:
         self.mapping_version = 0
         self._active_compute: ComputeHandle | None = None
         self._main_cache_compute_handles: dict[int, ComputeHandle] = {}
+        self._main_cache_windows: dict[int, dict[str, torch.cuda.Event | None]] = {}
+        self._pending_main_computes: dict[int, PendingCompute] = {}
+        self._pending_transfer_tickets: dict[int, object] = {}
+        self.overlap_records: list[dict[str, object]] = []
         self._pending_computes: list[PendingCompute] = []
         self._pending_map_copies: list[PendingMapCopy] = []
         self._free_map_buffers = [self._new_cpu_map(), self._new_cpu_map()]
@@ -137,6 +153,18 @@ class CudaLayerRuntime:
     @property
     def map_buffer_count(self) -> int:
         return len(self._free_map_buffers) + len(self._pending_map_copies)
+
+    @property
+    def is_poisoned(self) -> bool:
+        return self.state is RuntimeState.POISONED
+
+    def ensure_healthy(self) -> None:
+        if self.state is RuntimeState.POISONED:
+            raise RuntimePoisonedError(
+                f"layer {self.layer_id} runtime is poisoned"
+            ) from self.poison_cause
+        if self.state is RuntimeState.CLOSED:
+            raise RuntimePoisonedError(f"layer {self.layer_id} runtime is closed")
 
     @property
     def main_slot_pool(self):
@@ -187,6 +215,7 @@ class CudaLayerRuntime:
 
     def prepare_graph_compute(self, active_experts: Iterable[int]) -> bool:
         """Stage a graph-safe working set or defer an overflow to exact waves."""
+        self.ensure_healthy()
         active = self._normalize_active(active_experts, enforce_capacity=False)
         if len(active) > self.num_slots:
             if self._active_compute is not None:
@@ -209,6 +238,7 @@ class CudaLayerRuntime:
         return self.policy.choose(self.bank, excluded=reserved)
 
     def stage_sync(self, active_experts: Iterable[int]) -> LayerMappingSnapshot:
+        self.ensure_healthy()
         self.release_pending_for_transfer()
         self.assert_stable_addresses()
         active = self._normalize_active(active_experts)
@@ -262,6 +292,7 @@ class CudaLayerRuntime:
         return snapshot
 
     def stage_async(self, active_experts: Iterable[int]) -> LayerMappingSnapshot:
+        self.ensure_healthy()
         if torch.cuda.is_current_stream_capturing():
             raise StagingDuringCaptureError(
                 f"dynamic staging attempted during CUDA Graph capture: "
@@ -384,6 +415,7 @@ class CudaLayerRuntime:
                 )
 
     def begin_compute(self, snapshot: LayerMappingSnapshot) -> ComputeHandle:
+        self.ensure_healthy()
         self.validate_snapshot(snapshot)
         return self.bank.begin_compute(snapshot.slot_ids)
 
@@ -400,6 +432,7 @@ class CudaLayerRuntime:
         self.bank.end_compute(pending.handle)
 
     def prepare_compute_async(self, active_experts: Iterable[int]) -> None:
+        self.ensure_healthy()
         if self._active_compute is not None:
             raise RuntimeError(f"layer {self.layer_id} already has active compute")
         self.release_pending_for_transfer()
@@ -433,31 +466,196 @@ class CudaLayerRuntime:
         spec: MainCacheWaveSpec,
         *,
         protected_slots: frozenset[int] = frozenset(),
+        origin_event: torch.cuda.Event | None = None,
+        overlap_candidate: bool | None = None,
     ) -> PreparedMainCacheWave:
+        self.ensure_healthy()
         prepared = self.main_cache.prepare_wave(
             spec,
             host_w13=self.host_w13,
             host_w2=self.host_w2,
             protected_slots=protected_slots,
+            origin_event=origin_event,
+            overlap_candidate=overlap_candidate,
         )
         self.counters.increment("slot_hit", sum(
             1 for expert in spec.experts if self.main_cache.lease_for(expert) is not None
         ) if spec.wave_type == "hit" else 0)
         self.counters.increment("slot_miss", len(prepared.leases) if spec.wave_type == "miss" else 0)
         self.counters.increment("h2d_bytes", prepared.h2d_bytes)
+        if prepared.ready_ticket is not None:
+            self._pending_transfer_tickets[prepared.wave_id] = prepared.ready_ticket
         return prepared
 
     def wait_and_publish(self, prepared: PreparedMainCacheWave) -> None:
+        self.ensure_healthy()
         self.main_cache.wait_and_publish(prepared)
+        self._pending_transfer_tickets.pop(prepared.wave_id, None)
         self.mapping_version += 1
         self.assert_stable_addresses()
 
     def begin_main_cache_compute(self, prepared: PreparedMainCacheWave) -> ComputeHandle:
+        self.ensure_healthy()
         handle = self.bank.begin_compute(tuple(lease.slot_id for lease in prepared.leases))
         self._main_cache_compute_handles[prepared.wave_id] = handle
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(torch.cuda.current_stream(self.device))
+        self._main_cache_windows[prepared.wave_id] = {
+            "start": start_event,
+            "end": None,
+        }
         return handle
 
-    def mark_compute_complete(self, prepared: PreparedMainCacheWave) -> None:
+    def mark_compute_complete(
+        self, prepared: PreparedMainCacheWave, *, defer: bool = False
+    ) -> None:
         handle = self._main_cache_compute_handles.pop(prepared.wave_id, None)
         if handle is not None:
-            self.bank.end_compute(handle)
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream(self.device))
+            window = self._main_cache_windows.setdefault(prepared.wave_id, {})
+            window["end"] = end_event
+            if defer:
+                self._pending_main_computes[prepared.wave_id] = PendingCompute(
+                    handle=handle, event=end_event
+                )
+            else:
+                self.bank.end_compute(handle)
+
+    def complete_pending_main_cache_computes(self) -> None:
+        for wave_id, pending in tuple(self._pending_main_computes.items()):
+            pending.event.synchronize()
+            self.bank.end_compute(pending.handle)
+            del self._pending_main_computes[wave_id]
+
+    def compute_start_event(self, wave_id: int) -> torch.cuda.Event | None:
+        window = self._main_cache_windows.get(wave_id)
+        return None if window is None else window.get("start")
+
+    def record_overlap(self, prepared: PreparedMainCacheWave) -> dict[str, object] | None:
+        ticket = prepared.ready_ticket
+        window = self._main_cache_windows.get(prepared.wave_id - 1)
+        if ticket is None or window is None or not prepared.overlap_candidate:
+            return None
+        self.complete_pending_main_cache_computes()
+        start = window.get("start")
+        end = window.get("end")
+        transfer_start = ticket.start_event
+        transfer_end = ticket.end_event or ticket.event
+        if start is None or end is None or transfer_start is None or transfer_end is None:
+            return None
+        transfer_end.synchronize()
+        origin_ms = 0.0
+        h2d_start_ms = origin_ms + float(start.elapsed_time(transfer_start))
+        h2d_end_ms = origin_ms + float(start.elapsed_time(transfer_end))
+        compute_start_ms = 0.0
+        compute_end_ms = float(start.elapsed_time(end))
+        actual = max(h2d_start_ms, compute_start_ms) < min(
+            h2d_end_ms, compute_end_ms
+        )
+        record: dict[str, object] = {
+            "event": "main_cache_overlap",
+            "layer_id": self.layer_id,
+            "wave_id": prepared.wave_id,
+            "overlap_candidate": True,
+            "actual_overlap": bool(actual),
+            "h2d_start_ms": h2d_start_ms,
+            "h2d_end_ms": h2d_end_ms,
+            "compute_start_ms": compute_start_ms,
+            "compute_end_ms": compute_end_ms,
+            "h2d_bytes": prepared.h2d_bytes,
+            "protected_slot_ids": list(prepared.protected_slots),
+        }
+        self.overlap_records.append(record)
+        if self.event_writer is not None:
+            fields = dict(record)
+            fields.pop("event", None)
+            self.event_writer.write("main_cache_overlap", **fields)
+        return record
+
+    def poison(
+        self,
+        cause: BaseException,
+        *,
+        wave_id: int | None = None,
+        compute_done: torch.cuda.Event | None = None,
+        transfer_tickets: tuple[object, ...] = (),
+        active_experts: tuple[int, ...] = (),
+    ) -> None:
+        if self.state is RuntimeState.CLOSED:
+            return
+        if self.state is RuntimeState.POISONED:
+            return
+        self.state = RuntimeState.POISONED
+        self.poison_cause = cause
+        if compute_done is not None:
+            self._main_cache_windows.setdefault(wave_id or -1, {})["end"] = compute_done
+            if wave_id is not None:
+                handle = self._main_cache_compute_handles.pop(wave_id, None)
+                if handle is not None:
+                    self._pending_main_computes[wave_id] = PendingCompute(
+                        handle=handle, event=compute_done
+                    )
+        for ticket in transfer_tickets:
+            if getattr(ticket, "event", None) is not None:
+                self._pending_transfer_tickets[id(ticket)] = ticket
+        self._failure_record = failure = {
+            "event": "failure",
+            "plan_id": getattr(self, "plan_id", None),
+            "layer_id": self.layer_id,
+            "wave_id": wave_id,
+            "exception_type": type(cause).__name__,
+            "exception": str(cause),
+            "active_experts": list(active_experts),
+            "leases": [
+                {
+                    "slot_id": slot.slot_id,
+                    "expert_id": None if slot.key is None else slot.key.expert_id,
+                    "generation": slot.generation,
+                    "state": slot.state.value,
+                }
+                for slot in self.bank.slots
+            ],
+            "pending_compute_events": len(self._pending_main_computes),
+            "pending_transfer_events": len(self._pending_transfer_tickets),
+            "drained": False,
+        }
+        if self.event_writer is not None:
+            try:
+                fields = dict(failure)
+                fields.pop("event", None)
+                self.event_writer.write("failure", **fields)
+            except BaseException:
+                pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        close_error: BaseException | None = None
+        try:
+            for pending in tuple(self._pending_main_computes.values()):
+                pending.event.synchronize()
+            self.complete_pending_main_cache_computes()
+            for ticket in tuple(self._pending_transfer_tickets.values()):
+                self.transfer_engine.drain(ticket)
+            for pending in tuple(self._pending_map_copies):
+                pending.event.synchronize()
+            self.main_cache.close()
+            if self.event_writer is not None and hasattr(self, "_failure_record"):
+                drained = dict(self._failure_record)
+                drained["drained"] = True
+                drained["pending_compute_events"] = 0
+                drained["pending_transfer_events"] = 0
+                fields = dict(drained)
+                fields.pop("event", None)
+                try:
+                    self.event_writer.write("failure", **fields)
+                except BaseException:
+                    pass
+        except BaseException as exc:
+            close_error = exc
+        finally:
+            self._closed = True
+            self.state = RuntimeState.CLOSED
+        if close_error is not None:
+            raise close_error

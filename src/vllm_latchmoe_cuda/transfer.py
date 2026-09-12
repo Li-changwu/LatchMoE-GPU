@@ -17,6 +17,9 @@ class ExpertCopy:
 class TransferTicket:
     event: torch.cuda.Event
     copies: tuple[ExpertCopy, ...]
+    start_event: torch.cuda.Event | None = None
+    end_event: torch.cuda.Event | None = None
+    h2d_bytes: int = 0
 
 
 def contiguous_copy_runs(
@@ -51,9 +54,14 @@ class CudaTransferEngine:
         slot_w13: torch.Tensor,
         slot_w2: torch.Tensor,
         copies: Iterable[ExpertCopy],
+        origin_event: torch.cuda.Event | None = None,
     ) -> TransferTicket:
         copies = tuple(copies)
         with torch.cuda.stream(self.stream):
+            if origin_event is not None:
+                self.stream.wait_event(origin_event)
+            start_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(self.stream)
             for run in contiguous_copy_runs(copies):
                 source_start = run[0].expert_id
                 slot_start = run[0].slot_id
@@ -64,12 +72,28 @@ class CudaTransferEngine:
                 slot_w2.narrow(0, slot_start, length).copy_(
                     host_w2.narrow(0, source_start, length), non_blocking=True
                 )
-            event = torch.cuda.Event()
+            event = torch.cuda.Event(enable_timing=True)
             event.record(self.stream)
-        return TransferTicket(event=event, copies=copies)
+        return TransferTicket(
+            event=event,
+            copies=copies,
+            start_event=start_event,
+            end_event=event,
+            h2d_bytes=sum(
+                int(host_w13[copy.expert_id].numel() * host_w13.element_size())
+                + int(host_w2[copy.expert_id].numel() * host_w2.element_size())
+                for copy in copies
+            ),
+        )
 
     def wait_ready(self, ticket: TransferTicket) -> None:
         torch.cuda.current_stream(self.device).wait_event(ticket.event)
+
+    def drain(self, ticket: TransferTicket) -> None:
+        ticket.event.synchronize()
+
+    def close(self) -> None:
+        self.stream.synchronize()
 
 
 def copy_expert_sync(

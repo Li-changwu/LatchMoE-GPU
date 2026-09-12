@@ -77,3 +77,7 @@ class NativeCombineError(LatchMoEError):
 
 class CapabilityError(LatchMoEError):
     """The requested model/runtime tuple is outside the qualified matrix."""
+
+
+class RuntimePoisonedError(LatchMoEError):
+    """A layer runtime failed and can no longer accept another forward."""

@@ -126,7 +126,16 @@ def plan_main_cache_waves(
         wave_id += 1
     if not specs and active:
         raise PairIntegrityError("active experts produced no cache waves")
-    return tuple(specs)
+    planned: list[MainCacheWaveSpec] = []
+    for index, spec in enumerate(specs):
+        next_spec = specs[index + 1] if index + 1 < len(specs) else None
+        candidate = bool(
+            next_spec is not None
+            and 0 < len(spec.experts) < capacity
+            and len(next_spec.experts) <= capacity - len(spec.experts)
+        )
+        planned.append(replace(spec, overlap_candidate=candidate))
+    return tuple(planned)
 
 
 def _as_nested_list(value) -> list[list[float | int]]:

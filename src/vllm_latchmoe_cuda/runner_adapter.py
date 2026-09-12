@@ -43,10 +43,12 @@ def execute_main_cache_waves(
     topk_weights: torch.Tensor,
     *,
     seam: CudaMoeSeam | None = None,
+    overlap: bool = True,
 ) -> torch.Tensor:
     """Serial hit-first execution through one persistent layer cache."""
     if topk_ids.shape != topk_weights.shape or topk_ids.ndim != 2:
         raise ValueError("topk_ids and topk_weights must be matching rank-2 tensors")
+    runtime.ensure_healthy()
     runtime.release_pending_for_transfer()
     active = active_experts_from_topk(topk_ids)
     ready = frozenset(
@@ -65,25 +67,57 @@ def execute_main_cache_waves(
     pair_offsets = torch.arange(flat_ids.numel(), device=topk_ids.device, dtype=torch.long)
     payloads: list[NativeWavePayload] = []
     total_h2d_bytes = 0
-    for spec in specs:
-        prepared = runtime.prepare_main_cache_wave(spec)
-        runtime.wait_and_publish(prepared)
-        total_h2d_bytes += prepared.h2d_bytes
-        runtime.begin_main_cache_compute(prepared)
-        mask = torch.zeros_like(flat_ids, dtype=torch.bool)
-        for expert in spec.experts:
-            mask |= flat_ids == expert
-        selected_offsets = pair_offsets[mask]
-        token_indices = torch.div(
-            selected_offsets, topk_ids.shape[1], rounding_mode="floor"
-        )
-        physical = runtime.log2phy.index_select(0, flat_ids[mask]).long()
-        payload = seam.run_expert_mlp(
-            hidden_states=hidden_states.index_select(0, token_indices),
-            physical_ids=physical,
-            slot_w13=runtime.slot_w13,
-            slot_w2=runtime.slot_w2,
-        )
+    prefetched: PreparedMainCacheWave | None = None
+    for index, spec in enumerate(specs):
+        try:
+            if prefetched is not None:
+                runtime.complete_pending_main_cache_computes()
+                runtime.record_overlap(prefetched)
+                prepared = prefetched
+                prefetched = None
+                runtime.wait_and_publish(prepared)
+            else:
+                prepared = runtime.prepare_main_cache_wave(spec)
+                runtime.wait_and_publish(prepared)
+            total_h2d_bytes += prepared.h2d_bytes
+            runtime.begin_main_cache_compute(prepared)
+        except BaseException as exc:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream(runtime.device))
+            runtime.poison(
+                exc,
+                wave_id=spec.wave_id,
+                compute_done=end_event,
+                transfer_tickets=tuple(runtime._pending_transfer_tickets.values()),
+                active_experts=spec.experts,
+            )
+            raise
+        try:
+            mask = torch.zeros_like(flat_ids, dtype=torch.bool)
+            for expert in spec.experts:
+                mask |= flat_ids == expert
+            selected_offsets = pair_offsets[mask]
+            token_indices = torch.div(
+                selected_offsets, topk_ids.shape[1], rounding_mode="floor"
+            )
+            physical = runtime.log2phy.index_select(0, flat_ids[mask]).long()
+            payload = seam.run_expert_mlp(
+                hidden_states=hidden_states.index_select(0, token_indices),
+                physical_ids=physical,
+                slot_w13=runtime.slot_w13,
+                slot_w2=runtime.slot_w2,
+            )
+        except BaseException as exc:
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record(torch.cuda.current_stream(runtime.device))
+            runtime.poison(
+                exc,
+                wave_id=spec.wave_id,
+                compute_done=end_event,
+                transfer_tickets=tuple(runtime._pending_transfer_tickets.values()),
+                active_experts=spec.experts,
+            )
+            raise
         payloads.append(
             NativeWavePayload(
                 outputs=payload.outputs,
@@ -91,13 +125,42 @@ def execute_main_cache_waves(
                 token_indices=token_indices,
             )
         )
-        runtime.mark_compute_complete(prepared)
-    result = seam.combine(
-        waves=payloads,
-        topk_weights=topk_weights,
-        pair_offsets=pair_offsets,
-        restore_shape=(hidden_states.shape[0], hidden_states.shape[1]),
-    )
+        next_spec = specs[index + 1] if index + 1 < len(specs) else None
+        if overlap and spec.overlap_candidate and next_spec is not None:
+            try:
+                prefetched = runtime.prepare_main_cache_wave(
+                    next_spec,
+                    protected_slots=frozenset(
+                        lease.slot_id for lease in prepared.leases
+                    ),
+                    origin_event=runtime.compute_start_event(spec.wave_id),
+                    overlap_candidate=spec.overlap_candidate,
+                )
+                runtime.mark_compute_complete(prepared, defer=True)
+            except BaseException as exc:
+                end_event = torch.cuda.Event(enable_timing=True)
+                end_event.record(torch.cuda.current_stream(runtime.device))
+                runtime.poison(
+                    exc,
+                    wave_id=spec.wave_id,
+                    compute_done=end_event,
+                    transfer_tickets=tuple(runtime._pending_transfer_tickets.values()),
+                    active_experts=spec.experts,
+                )
+                raise
+        else:
+            runtime.mark_compute_complete(prepared)
+    runtime.complete_pending_main_cache_computes()
+    try:
+        result = seam.combine(
+            waves=payloads,
+            topk_weights=topk_weights,
+            pair_offsets=pair_offsets,
+            restore_shape=(hidden_states.shape[0], hidden_states.shape[1]),
+        )
+    except BaseException as exc:
+        runtime.poison(exc, active_experts=active)
+        raise
     runtime.last_wave_trace = WaveExecutionTrace(
         pair_count=int(pair_offsets.numel()),
         compute_order=tuple(spec.wave_id for spec in specs),

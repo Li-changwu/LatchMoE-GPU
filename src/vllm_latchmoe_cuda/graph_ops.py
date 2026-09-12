@@ -39,6 +39,13 @@ def register_graph_runtime(runtime: CudaLayerRuntime, experts_module: nn.Module)
     return context_id
 
 
+def unregister_graph_runtime(runtime: CudaLayerRuntime) -> None:
+    context_id = runtime.layer_id
+    context = _contexts.get(context_id)
+    if context is not None and context.runtime is runtime:
+        del _contexts[context_id]
+
+
 def _get_context(runtime_id: int) -> _GraphContext:
     try:
         return _contexts[runtime_id]

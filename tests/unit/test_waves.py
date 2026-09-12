@@ -178,3 +178,28 @@ def test_full_hit_capacity_has_no_overlap_candidate():
     )
     assert specs[0].overlap_candidate is False
     assert specs[1].overlap_candidate is False
+
+
+def test_partial_hit_marks_only_capacity_safe_next_wave_as_overlap_candidate():
+    specs = plan_main_cache_waves(
+        active_experts=(0, 1, 2, 3),
+        capacity=4,
+        hit_experts=(0, 1),
+    )
+
+    assert [(spec.wave_type, spec.experts) for spec in specs] == [
+        ("hit", (0, 1)),
+        ("miss", (2, 3)),
+    ]
+    assert specs[0].overlap_candidate is True
+    assert specs[1].overlap_candidate is False
+
+
+def test_partial_hit_rejects_next_wave_that_does_not_fit_idle_slots():
+    specs = plan_main_cache_waves(
+        active_experts=(0, 1, 2, 3, 4, 5),
+        capacity=4,
+        hit_experts=(0, 1),
+    )
+
+    assert specs[0].overlap_candidate is False
