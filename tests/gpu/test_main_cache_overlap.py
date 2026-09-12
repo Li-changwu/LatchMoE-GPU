@@ -73,6 +73,10 @@ def test_serial_and_overlap_have_same_result_for_partial_hit(
     )
 
     torch.testing.assert_close(overlap, serial, rtol=2e-2, atol=2e-2)
+    assert overlap_runtime.counters.snapshot().get(
+        "h2d_bytes", 0
+    ) == serial_runtime.counters.snapshot().get("h2d_bytes", 0)
+    assert overlap_runtime.eviction_sequence == serial_runtime.eviction_sequence
     assert overlap_runtime.last_wave_trace.pair_count == int(second_ids.numel())
     assert overlap_runtime.last_wave_trace.compute_order == (0, 1)
     ownership = {

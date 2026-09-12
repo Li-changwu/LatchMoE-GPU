@@ -82,3 +82,40 @@ def test_kernel_failure_poison_rejects_next_forward_and_drains(
     assert failures[-1]["active_experts"] == [2]
     assert failures[-1]["leases"]
     assert failures[-1]["drained"] is True
+
+
+def test_prefetch_failure_drains_in_flight_transfer_ticket(
+    tiny_manifest, tiny_decoder_factory, tmp_path, monkeypatch
+):
+    offloader, runtime = _offloader(
+        tiny_manifest, tiny_decoder_factory, tmp_path / "prefetch-failure.jsonl"
+    )
+    hidden = torch.randn((1, 2), dtype=torch.bfloat16, device="cuda")
+    weights = torch.tensor([[0.5, 0.5]], device="cuda")
+    first_ids = torch.tensor([[0, 1]], dtype=torch.int64, device="cuda")
+    second_ids = torch.tensor([[0, 2]], dtype=torch.int64, device="cuda")
+    execute_main_cache_waves(runtime, hidden, first_ids, weights)
+
+    original_mark = runtime.mark_compute_complete
+
+    def fail_after_prefetch(prepared, *, defer=False):
+        if defer:
+            raise RuntimeError("synthetic prefetch bookkeeping failure")
+        return original_mark(prepared, defer=defer)
+
+    monkeypatch.setattr(runtime, "mark_compute_complete", fail_after_prefetch)
+    with pytest.raises(RuntimeError, match="synthetic prefetch bookkeeping failure"):
+        execute_main_cache_waves(runtime, hidden, second_ids, weights)
+
+    assert runtime.state is RuntimeState.POISONED
+    assert runtime._pending_transfer_tickets
+    offloader.close()
+    offloader.close()
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "prefetch-failure.jsonl").read_text().splitlines()
+    ]
+    failures = [event for event in events if event["event"] == "failure"]
+    assert failures[0]["pending_transfer_events"] >= 1
+    assert failures[-1]["drained"] is True
