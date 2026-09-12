@@ -788,19 +788,19 @@ git commit -m "fix: fail closed and drain CUDA wave lifecycles"
 - Modify: `src/vllm_latchmoe_cuda/offloader.py`
 - Create: `tests/integration/test_shared_expert.py`
 
-- [ ] **Step 1: 写 shared expert 预算与调用测试**
+- [x] **Step 1: 写 shared expert 预算与调用测试**
 
 external shared module 的权重必须一直常驻 GPU，不进入 Host Store、dynamic slots 或 victim candidates。它对原始 token batch 计算一次，不能对每个 routed wave 重算。
 
-- [ ] **Step 2: 实现受限 capability**
+- [x] **Step 2: 实现受限 capability**
 
 仅接受锁定 ABI 的 external resident shared expert。先得到 routed result，再按宿主 ABI 合并 shared result并保持原返回 tuple/shape。fused/mix-placement shared expert、shared/H2D overlap 和未知 gate 语义继续在 capability guard 中拒绝。
 
-- [ ] **Step 3: 更新 ledger**
+- [x] **Step 3: 更新 ledger**
 
 分别记录 `resident_shared_weight_bytes`、`dynamic_slot_bytes` 和 `host_routed_expert_bytes`。shared bytes 不影响 `effective_num_slots`。
 
-- [ ] **Step 4: 运行测试并提交**
+- [x] **Step 4: 运行测试并提交**
 
 ```bash
 python -m pytest -q tests/integration/test_shared_expert.py tests/unit/test_capabilities.py
@@ -923,7 +923,7 @@ Expected: 输出 `PASS`，并显式列出 exact parameter set、HBM ledger、pai
 
 ## 本次实施进展与验收记录
 
-截至 2026-09-11，Task 1-6 已按功能边界完成并拆分提交：
+截至 2026-09-12，Task 1-9 已按功能边界完成并拆分提交：
 
 - `612d6d8` `feat: add model-adaptive CUDA residency plan`：不可变 GiB plan、整层预算、midpoint/ordered-prefix 选择、slot 可行性、schema v2 identity lock。
 - `345f48f` `feat: propagate one CUDA offload plan to workers`：生产 CLI、环境传播、worker plan/identity 校验和 fail-closed plugin。
@@ -970,7 +970,21 @@ Task 7-8 验收：
 
 partial-hit 测试确认 protected slots 不被覆盖，serial/overlap 输出、pair count、compute order、victim sequence、H2D traffic 和最终 ownership 一致；failure 测试确认 wave kernel 或预取 bookkeeping 异常后 runtime 进入 `POISONED`、后续 forward 抛 `RuntimePoisonedError`，close 可重复调用并 drain 在途 compute/transfer，再追加 `drained=true` failure 记录。小张量运行的 `actual_overlap` 作为设备实测布尔值记录，只有为真时才可计入性能统计。
 
-未完成部分从 Task 9 开始：shared expert capability 扩展、benchmark 合同和正式全模型验收尚未宣称完成。
+Task 9 已在 2026-09-12 完成并提交：
+
+- `3c3c1b9` `feat: support external resident shared experts`：只接受独立 external-resident shared module；shared 权重不进入 Host Store、dynamic slots 或 victim candidates，由 adapter 对原始 token batch 调用一次并保留 `(shared_output, routed_output)` ABI；fused/mix-placement/CPU shared 权重继续 fail closed；plan/profile ledger 分别记录 shared、dynamic slot 和 host routed bytes。
+
+Task 9 验收：
+
+```text
+/root/latchmoe-venv/bin/python -m pytest -q tests/integration/test_shared_expert.py tests/unit/test_capabilities.py tests/unit/test_residency_plan.py
+20 passed, 14 warnings
+
+/root/latchmoe-venv/bin/python -m pytest -q tests/unit tests/integration tests/gpu
+204 passed, 20 warnings
+```
+
+shared expert 集成测试确认 GPU 常驻、每次 forward 只调用一次、仅 routed tensors 进入 Host Store，且 `resident_shared_weight_bytes`、`dynamic_slot_bytes`、`host_routed_expert_bytes` 分项写入 profile。未完成部分从 Task 10 开始：benchmark 合同和正式全模型验收尚未宣称完成。
 
 ## 推荐实施顺序与停止点
 
@@ -978,7 +992,7 @@ partial-hit 测试确认 protected slots 不被覆盖，serial/overlap 输出、
 2. Task 4-6 完成严格串行 Main Cache、一次 native combine 和图边界。这是第一个可用于正确性验收的版本。
 3. 若 serial exact-token 不通过，停止，不进入 overlap。优先对比 router 输出、pair offsets、每 wave 未加权 MLP 输出和 native combine metadata。
 4. Task 7-8 只改变调度和失败生命周期，不允许改变 victim 顺序或数学结果；当前已完成并通过小张量 serial/overlap 与 failure lifecycle 验收。
-5. Task 9 是明确的 capability 扩展，可在 routed-only 正确性收口后独立合入。
+5. Task 9 是明确的 capability 扩展，当前已完成并限制在 external-resident shared ABI。
 6. Task 10-11 通过前，所有新性能数字只能标记为 smoke/exploratory。
 
 ## 最终验收清单
@@ -989,6 +1003,7 @@ partial-hit 测试确认 protected slots 不被覆盖，serial/overlap 输出、
 - [x] `(3,7,...,47)` 和 first-12 仅作为 legacy evidence，生产 manifest 不再拥有默认层选择权。
 - [x] parent 和所有 workers 使用相同且校验过的 `plan_id`、`selection_strategy`、eligible IDs 和 selected IDs。
 - [x] 只有 selected layers 进入 Host Store、Main Cache 和 H2D。
+- [x] external-resident shared expert 保持 GPU 常驻，只计算一次且不进入动态 slot/victim 集合；fused/mix-placement/CPU shared ABI fail closed。
 - [x] 每个 selected layer 有独立持久 cache；层切换不清空映射。
 - [x] 生产 profile 中 `temporary_bank_bytes == 0`。
 - [x] hit-first、真实 victim replacement、owner/generation/state lease 均有测试证据。
