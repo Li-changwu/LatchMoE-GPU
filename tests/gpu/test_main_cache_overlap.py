@@ -52,18 +52,31 @@ def test_partial_hit_prefetch_uses_only_idle_slot_and_records_window(
 def test_serial_and_overlap_have_same_result_for_partial_hit(
     tiny_manifest, tiny_decoder_factory
 ):
-    runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+    serial_runtime = _runtime(tiny_manifest, tiny_decoder_factory)
+    overlap_runtime = _runtime(tiny_manifest, tiny_decoder_factory)
     hidden = torch.randn((1, 2), dtype=torch.bfloat16, device="cuda")
     weights = torch.tensor([[0.5, 0.5]], device="cuda")
     first_ids = torch.tensor([[0, 1]], dtype=torch.int64, device="cuda")
     second_ids = torch.tensor([[0, 2]], dtype=torch.int64, device="cuda")
 
-    execute_main_cache_waves(runtime, hidden, first_ids, weights, overlap=False)
+    execute_main_cache_waves(
+        serial_runtime, hidden, first_ids, weights, overlap=False
+    )
     serial = execute_main_cache_waves(
-        runtime, hidden, second_ids, weights, overlap=False
+        serial_runtime, hidden, second_ids, weights, overlap=False
+    )
+    execute_main_cache_waves(
+        overlap_runtime, hidden, first_ids, weights, overlap=False
     )
     overlap = execute_main_cache_waves(
-        runtime, hidden, second_ids, weights, overlap=True
+        overlap_runtime, hidden, second_ids, weights, overlap=True
     )
 
     torch.testing.assert_close(overlap, serial, rtol=2e-2, atol=2e-2)
+    assert overlap_runtime.last_wave_trace.pair_count == int(second_ids.numel())
+    assert overlap_runtime.last_wave_trace.compute_order == (0, 1)
+    ownership = {
+        expert: overlap_runtime.main_cache.lease_for(expert).slot_id
+        for expert in (0, 2)
+    }
+    assert ownership[0] != ownership[2]

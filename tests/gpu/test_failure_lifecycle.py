@@ -38,7 +38,9 @@ def _offloader(tiny_manifest, tiny_decoder_factory, profile_path):
     for name in ("w13_weight", "w2_weight"):
         offloader.host_store.tensor_view(0, name).normal_()
     offloader.post_init()
-    return offloader, offloader.runtimes[0]
+    runtime = offloader.runtimes[0]
+    runtime.plan_id = "test-plan"
+    return offloader, runtime
 
 
 def test_kernel_failure_poison_rejects_next_forward_and_drains(
@@ -73,4 +75,8 @@ def test_kernel_failure_poison_rejects_next_forward_and_drains(
     failures = [event for event in events if event["event"] == "failure"]
     assert failures
     assert failures[-1]["exception_type"] == "RuntimeError"
+    assert failures[-1]["plan_id"] == "test-plan"
+    assert failures[-1]["layer_id"] == 0
+    assert failures[-1]["active_experts"] == [2]
+    assert failures[-1]["leases"]
     assert failures[-1]["drained"] is True
