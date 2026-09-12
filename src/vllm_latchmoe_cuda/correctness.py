@@ -12,6 +12,78 @@ class CorrectnessMismatchError(AssertionError):
     pass
 
 
+def compare_exact_token_results(
+    native: Mapping[str, Any],
+    uva: Mapping[str, Any],
+    latchmoe: Mapping[str, Any],
+) -> dict[str, object]:
+    """Compare three deterministic runs by prompt and generated token IDs.
+
+    This is intentionally stricter than a BF16 numerical tolerance or a fixed
+    output length: every request must have the same prompt tokenization and
+    greedy token sequence across the native oracle, exact-selection UVA and
+    LatchMoE implementations.
+    """
+    errors: list[str] = []
+    documents = (("native", native), ("uva", uva), ("latchmoe", latchmoe))
+    reference_prompts = native.get("prompts")
+    reference_sampling = native.get("sampling")
+    records: list[tuple[str, list[Mapping[str, Any]]]] = []
+    for name, document in documents:
+        outputs = document.get("outputs")
+        if not isinstance(outputs, list) or not outputs:
+            errors.append(f"{name} has no outputs")
+            continue
+        records.append((name, outputs))
+    if not records:
+        return {"schema_version": 1, "match": False, "errors": errors}
+    reference_name, reference = records[0]
+    mismatches: dict[str, list[int]] = {}
+    for name, candidate in records[1:]:
+        source = dict(documents)[name]
+        if source.get("prompts") != reference_prompts:
+            errors.append(f"{name} prompt contract differs")
+        if source.get("sampling") != reference_sampling:
+            errors.append(f"{name} sampling contract differs")
+        if len(candidate) != len(reference):
+            errors.append(f"{name} request count differs")
+            continue
+        bad: list[int] = []
+        for index, (expected, actual) in enumerate(zip(reference, candidate)):
+            if (
+                expected.get("prompt") != actual.get("prompt")
+                or expected.get("prompt_token_ids") != actual.get("prompt_token_ids")
+                or expected.get("token_ids") != actual.get("token_ids")
+            ):
+                bad.append(index)
+        if bad:
+            mismatches[name] = bad
+    return {
+        "schema_version": 1,
+        "reference": reference_name,
+        "request_count": len(reference),
+        "match": not errors and not mismatches,
+        "errors": errors,
+        "mismatched_requests": mismatches,
+    }
+
+
+def require_exact_token_gate(
+    native: Mapping[str, Any],
+    uva: Mapping[str, Any],
+    latchmoe: Mapping[str, Any],
+) -> dict[str, object]:
+    comparison = compare_exact_token_results(native, uva, latchmoe)
+    if comparison["match"]:
+        return comparison
+    details = list(comparison.get("errors", []))
+    details.extend(
+        f"{name} token IDs differ at requests {indices}"
+        for name, indices in comparison.get("mismatched_requests", {}).items()
+    )
+    raise CorrectnessMismatchError("; ".join(details))
+
+
 STOCK_UVA_CPU_OFFLOAD_GB = 14.0
 CORRECTNESS_MAX_NUM_SEQS = 32
 CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE = 8
@@ -26,6 +98,7 @@ class CorrectnessMode:
 
 
 _MODES = {
+    "native": CorrectnessMode("native", "native", True, False),
     "uva": CorrectnessMode("uva", "uva", True, False),
     "latchmoe-eager": CorrectnessMode("latchmoe-eager", "latchmoe", True, False),
     "latchmoe-piecewise": CorrectnessMode(

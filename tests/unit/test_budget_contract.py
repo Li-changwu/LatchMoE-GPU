@@ -1,0 +1,75 @@
+import pytest
+
+from vllm_latchmoe_cuda.benchmark import (
+    compare_mode_summaries,
+    validate_comparable_contracts,
+)
+from vllm_latchmoe_cuda.correctness import (
+    CorrectnessMismatchError,
+    compare_exact_token_results,
+    require_exact_token_gate,
+)
+
+
+def _contract(**overrides):
+    value = {
+        "selection_strategy": "midpoint_stratified_v1",
+        "eligible_layer_ids": list(range(48)),
+        "selected_layer_ids": [2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46],
+        "plan_id": "a" * 64,
+        "parameter_names": ["model.layers.2.mlp.experts.w13_weight"],
+        "host_bytes": 123,
+        "resident_weight_bytes": 456,
+        "kv_reserve_bytes": 512,
+        "graph_policy": "piecewise",
+        "workload_contract_sha256": "b" * 64,
+        "source_identity": "c" * 64,
+    }
+    value.update(overrides)
+    return value
+
+
+def _result(ids):
+    return {
+        "outputs": [
+            {"prompt": "p", "prompt_token_ids": [1], "token_ids": ids}
+        ]
+    }
+
+
+def test_comparable_contract_checks_all_identity_fields():
+    left = _contract()
+    right = _contract()
+    assert validate_comparable_contracts(left, right)["reservation_equal"]
+    right["plan_id"] = "d" * 64
+    with pytest.raises(ValueError, match="plan_id"):
+        validate_comparable_contracts(left, right)
+
+
+def test_exact_token_gate_requires_all_three_runs():
+    native = _result([1, 2])
+    uva = _result([1, 2])
+    latchmoe = _result([1, 3])
+    report = compare_exact_token_results(native, uva, latchmoe)
+    assert report["match"] is False
+    with pytest.raises(CorrectnessMismatchError, match="latchmoe"):
+        require_exact_token_gate(native, uva, latchmoe)
+
+
+def test_exact_token_gate_accepts_identical_outputs():
+    result = _result([1, 2])
+    assert require_exact_token_gate(result, result, result)["match"] is True
+
+
+def test_comparison_rejects_legacy_evidence():
+    common = {
+        "workload_contract_sha256": "b" * 64,
+        "offload_telemetry": {"actual_offload_bytes": 123},
+        "comparison_contract": {**_contract(), "legacy_evidence": True},
+        "metrics": {},
+    }
+    with pytest.raises(ValueError, match="legacy temporary-bank"):
+        compare_mode_summaries(
+            {**common, "mode": "uva"},
+            {**common, "mode": "latchmoe-eager"},
+        )

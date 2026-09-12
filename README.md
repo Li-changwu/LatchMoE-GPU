@@ -6,7 +6,14 @@ pair waves 移植到 GPU，并与 vLLM 官方 CUDA UVA offloader 做同机、同
 
 设计与实现历史见 [`docs/gpu_port/PROGRESS.md`](docs/gpu_port/PROGRESS.md)。
 
-## 图重放对图重放结论
+## 历史结果（legacy temporary-bank/shared-pool evidence）
+
+以下 2026-07 结果冻结保留，证据来自旧 temporary-bank/shared-pool 实现，不能作为
+当前 Main Slots Cache 的性能结论或默认 placement。旧 generator 使用的层选择
+`(3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47)`，同期正式 first-12 manifest
+使用的是 `(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)`；两者均仅用于历史复现。
+
+## 图重放对图重放结论（历史）
 
 2026-07-15 在单卡 NVIDIA RTX A6000 48 GB 上完成了正式 PIECEWISE CUDA Graph
 对比。模型为 `/home/lcw/model` 的 Qwen3-30B-A3B，ShareGPT 固定取 50 条，每条强制
@@ -21,6 +28,9 @@ pair waves 移植到 GPU，并与 vLLM 官方 CUDA UVA offloader 做同机、同
 | TPOT p50 | 578.740 ms/token | 377.351 ms/token | 降低 34.80% |
 | TPOT p99 | 969.359 ms/token | 633.805 ms/token | 降低 34.62% |
 | 输出吞吐 | 10.1169 token/s | 16.1718 token/s | 提高 59.85% |
+
+表中 59.85% 是上述旧实现的冻结结果，不代表 Main Slots Cache。旧的 32/64-slot
+单轮数据同样属于 exploratory evidence。
 
 指标由 vLLM 0.19.1 官方 `vllm bench serve` 计算。比较器对延迟使用
 `(UVA - LatchMoE) / UVA`，对吞吐使用 `(LatchMoE - UVA) / UVA`。两侧每轮均完成
@@ -188,6 +198,27 @@ artifact 绑定到相同 `source_state_sha256`：
   等价。性能和质量结论必须分开。
 - 当前 A6000 合同显存余量较小，driver、allocator、模型或 capture size 变化都可能
   OOM；128-slot graph 方案也不是最小显存方案。
+
+## 当前生产入口与证据门槛
+
+生产 CUDA residency 通过 immutable plan 生成，入口只接受 GiB 预算；不会从旧 manifest
+generator 独立选择层：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 VLLM_WORKER_MULTIPROC_METHOD=spawn \
+python -m vllm_latchmoe_cuda serve /home/lcw/model \
+  --cuda-moe-offload-gb 13.5 --max-model-len 4096 \
+  --max-num-seqs 1 --max-num-batched-tokens 4096 \
+  --kv-cache-memory-bytes 536870912 --gpu-memory-utilization 0.90 \
+  --no-enable-prefix-caching
+```
+
+正式性能前必须用 `benchmark/scripts/verify_budget_contract.py` 校验相同的
+`selection_strategy`、ordered eligible/selected IDs、`plan_id`、参数集合、host/resident
+字节、KV reserve、graph policy、workload hash 和 source identity；profile 中不得出现
+temporary bank、resident/hit-wave H2D 或无 event window 的 overlap。native full-resident、
+exact-selection UVA 和 LatchMoE 还必须对 deterministic prompts 逐 token ID 全等，不能以
+BF16 `allclose` 或固定输出长度替代。
 
 ## 复现实验
 

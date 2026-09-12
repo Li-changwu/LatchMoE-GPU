@@ -30,6 +30,81 @@ SUMMARY_METRICS = (
     "request_throughput",
 )
 
+# Fields that define whether two measurements exercised the same memory and
+# execution contract.  Keeping this list in the library lets both the runner
+# and the standalone evidence verifier use exactly the same rules.
+COMPARISON_CONTRACT_FIELDS = (
+    "selection_strategy",
+    "eligible_layer_ids",
+    "selected_layer_ids",
+    "plan_id",
+    "parameter_names",
+    "host_bytes",
+    "resident_weight_bytes",
+    "kv_reserve_bytes",
+    "graph_policy",
+    "workload_contract_sha256",
+    "source_identity",
+)
+
+
+def _contract_value(payload: dict[str, Any], field: str) -> Any:
+    """Read a contract field from either a flat or nested artifact document."""
+    comparison = payload.get("comparison_contract")
+    if isinstance(comparison, dict) and field in comparison:
+        return comparison[field]
+    contract = payload.get("contract")
+    if isinstance(contract, dict) and field in contract:
+        return contract[field]
+    if field in payload:
+        return payload[field]
+    aliases = {
+        "selected_layer_ids": ("offloaded_layer_ids",),
+        "source_identity": ("source_state_sha256", "source_identity_sha256"),
+    }
+    for alias in aliases.get(field, ()):
+        if alias in payload:
+            return payload[alias]
+    return None
+
+
+def validate_comparable_contracts(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate the immutable plan and resource contract for a comparison.
+
+    A ``ValueError`` is raised on the first mismatch so callers cannot
+    accidentally publish a result with only a matching workload hash.
+    """
+    mismatches: list[str] = []
+    for field in COMPARISON_CONTRACT_FIELDS:
+        left = _contract_value(baseline, field)
+        right = _contract_value(candidate, field)
+        if left != right:
+            mismatches.append(field)
+    baseline_reservation = _contract_value(baseline, "uva_reservation_bytes")
+    candidate_reservation = _contract_value(candidate, "uva_reservation_bytes")
+    if baseline_reservation is None:
+        baseline_reservation = 0
+    if candidate_reservation is None:
+        candidate_reservation = 0
+    try:
+        baseline_reservation = int(baseline_reservation)
+        candidate_reservation = int(candidate_reservation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("uva reservation bytes must be an integer") from exc
+    if baseline_reservation < 0 or candidate_reservation < 0:
+        raise ValueError("uva reservation bytes must be non-negative")
+    if mismatches:
+        raise ValueError("comparison contract differs: " + ", ".join(mismatches))
+    return {
+        "schema_version": 1,
+        "fields": list(COMPARISON_CONTRACT_FIELDS),
+        "uva_reservation_bytes": baseline_reservation,
+        "candidate_reservation_bytes": candidate_reservation,
+        "reservation_equal": baseline_reservation == candidate_reservation,
+    }
+
 
 def local_benchmark_environment(
     environment: dict[str, str] | None = None,
@@ -59,6 +134,70 @@ def file_sha256(path: str | Path) -> str:
 
 def payload_sha256(payload: object) -> str:
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def manifest_comparison_contract(
+    manifest: OffloadManifest,
+    *,
+    workload_contract_sha256: str,
+    source_identity: str,
+    graph_policy: str,
+    kv_reserve_bytes: int,
+    plan: Any | None = None,
+    uva_reservation_bytes: int = 0,
+) -> dict[str, Any]:
+    """Render a flat comparison contract from an immutable plan or manifest.
+
+    Schema-v1 manifests are deliberately labelled diagnostic legacy evidence;
+    production runs should pass the v2 ``CudaResidencyPlan`` as ``plan``.
+    """
+    if plan is not None:
+        selected = list(plan.offloaded_layer_ids)
+        eligible = list(plan.eligible_layer_ids)
+        strategy = str(plan.selection_strategy)
+        plan_id = str(plan.plan_id)
+        parameter_names = sorted(
+            f"model.layers.{layer_id}.mlp.experts.{name}"
+            for layer_id in selected
+            for name in ("w13_weight", "w2_weight")
+        )
+        host_bytes = int(
+            sum(
+                item.routed_expert_bytes
+                for item in plan.layer_expert_bytes
+                if item.layer_id in selected
+            )
+        )
+        resident_bytes = int(
+            sum(
+                item.routed_expert_bytes
+                for item in plan.layer_expert_bytes
+                if item.layer_id not in selected
+            )
+        )
+    else:
+        selected = list(manifest.layer_ids)
+        eligible = list(manifest.layer_ids)
+        strategy = "legacy_diagnostic_manifest"
+        plan_id = None
+        parameter_names = sorted(manifest.parameter_names)
+        host_bytes = int(manifest.total_elements * 2)
+        resident_bytes = 0
+    return {
+        "selection_strategy": strategy,
+        "eligible_layer_ids": eligible,
+        "selected_layer_ids": selected,
+        "plan_id": plan_id,
+        "parameter_names": parameter_names,
+        "host_bytes": host_bytes,
+        "resident_weight_bytes": resident_bytes,
+        "kv_reserve_bytes": int(kv_reserve_bytes),
+        "graph_policy": graph_policy,
+        "workload_contract_sha256": str(workload_contract_sha256),
+        "source_identity": str(source_identity),
+        "uva_reservation_bytes": int(uva_reservation_bytes),
+        "legacy_evidence": plan is None,
+    }
 
 
 def build_server_command(
@@ -391,6 +530,20 @@ def compare_mode_summaries(
             f"actual offload bytes differ: UVA={uva_bytes}, LatchMoE={latchmoe_bytes}"
         )
 
+    # New artifacts carry the full plan/resource contract.  Keep the legacy
+    # summary shape readable for historical reports, but enforce every field
+    # whenever either side advertises the contract.
+    if any(
+        _contract_value(uva, field) is not None
+        or _contract_value(latchmoe, field) is not None
+        for field in COMPARISON_CONTRACT_FIELDS
+    ):
+        if _contract_value(uva, "legacy_evidence") is True or _contract_value(
+            latchmoe, "legacy_evidence"
+        ) is True:
+            raise ValueError("legacy temporary-bank/shared-pool evidence is not comparable")
+        validate_comparable_contracts(uva, latchmoe)
+
     comparison: dict[str, Any] = {}
     for metric in SUMMARY_METRICS:
         reference = float(uva["metrics"][metric]["median"])
@@ -413,6 +566,11 @@ def compare_mode_summaries(
         "candidate_mode": candidate_mode,
         "workload_contract_sha256": uva["workload_contract_sha256"],
         "actual_offload_bytes": uva_bytes,
+        "comparison_contract": {
+            field: _contract_value(uva, field)
+            for field in COMPARISON_CONTRACT_FIELDS
+            if _contract_value(uva, field) is not None
+        },
         "metrics": comparison,
     }
 

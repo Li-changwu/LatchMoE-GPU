@@ -986,6 +986,25 @@ Task 9 验收：
 
 shared expert 集成测试确认 GPU 常驻、每次 forward 只调用一次、仅 routed tensors 进入 Host Store，且 `resident_shared_weight_bytes`、`dynamic_slot_bytes`、`host_routed_expert_bytes` 分项写入 profile。未完成部分从 Task 10 开始：benchmark 合同和正式全模型验收尚未宣称完成。
 
+Task 10 已在 2026-09-12 完成代码实现并提交（`test: enforce comparable CUDA LatchMoE evidence`）：
+
+- `benchmark/scripts/verify_budget_contract.py`：严格校验 plan identity、参数集合、HBM/KV/graph/workload/source 合同；拒绝 legacy temporary-bank、resident/hit-wave H2D、不完整 pair、错误 combine 和无 event window overlap；提供三方 exact-token gate CLI。
+- `src/vllm_latchmoe_cuda/benchmark.py`、`benchmark/scripts/run_sharegpt.py`：新 measurement contract 写入 `selection_strategy`、ordered eligible/selected IDs、`plan_id`、参数名、host/resident bytes、KV reserve、graph policy、workload hash 和 source identity；schema-v1 manifest 明确标记为 diagnostic legacy evidence。
+- `src/vllm_latchmoe_cuda/correctness.py`：增加 native/UVA/LatchMoE 三方逐请求 token-ID 全等比较接口；固定长度或 BF16 allclose 不再作为替代。
+- `README.md`：冻结 2026-07 结果并标注 legacy temporary-bank/shared-pool，记录旧 `(3,7,...,47)` 与 first-12 `(0..11)` placement 及新的生产命令。
+
+Task 10 验收：
+
+```text
+/root/latchmoe-venv/bin/python -m pytest -q tests/unit/test_budget_contract.py tests/unit/test_benchmark.py tests/unit/test_correctness.py
+38 passed
+
+/root/latchmoe-venv/bin/python -m pytest -q tests/unit tests/integration
+175 passed, 20 warnings
+```
+
+ruff 未安装于 `/root/latchmoe-venv`，因此本轮未执行 ruff；未运行真实 full-model benchmark 或三方 token gate，Task 11 仍保持未完成。
+
 ## 推荐实施顺序与停止点
 
 1. Task 1-3 先解决“选哪些层、如何进入 worker、存储属于谁”。完成后应能启动逐层 cache，但还不宣称 overflow 完成。
@@ -1012,5 +1031,7 @@ shared expert 集成测试确认 GPU 常驻、每次 forward 只调用一次、�
 - [x] `h=0`、`h=C<P` 不产生 overlap claim；partial-hit 只在下一 wave 能装入 idle slots 时产生 candidate，并记录 H2D/compute event 窗口和 `actual_overlap`。
 - [x] 异常使 runtime poisoned，并在 shutdown 时 drain 所有在途 CUDA 工作；重复 close 幂等。
 - [x] vLLM commit/source、model config/index/shards 均可追溯。
+- [x] benchmark comparator 校验完整 plan/resource/workload/source 合同，并拒绝旧 temporary-bank/shared-pool 证据冒充新结果。
+- [x] native/UVA/LatchMoE exact-token gate 实现为逐请求 token ID 全等；未通过真实 full-model gate 前不发布性能结论。
 - [ ] full-resident、exact UVA、serial LatchMoE、async LatchMoE 通过 exact-token parity。
 - [ ] 新性能结果使用可比参数集合和 HBM ledger，并保留所有失败/不可比 case。

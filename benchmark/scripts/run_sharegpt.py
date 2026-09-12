@@ -21,12 +21,14 @@ from vllm_latchmoe_cuda.benchmark import (
     build_server_command,
     file_sha256,
     local_benchmark_environment,
+    manifest_comparison_contract,
     normalize_benchmark_result,
     payload_sha256,
     read_offload_telemetry,
     summarize_repetitions,
 )
 from vllm_latchmoe_cuda.manifest import OffloadManifest
+from vllm_latchmoe_cuda.residency_plan import deserialize_residency_plan
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", required=True, choices=BENCHMARK_MODES)
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--plan",
+        type=Path,
+        help="immutable residency plan JSON; required for qualified production evidence",
+    )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument(
@@ -194,7 +201,15 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
     dataset_path = args.dataset.resolve()
     manifest = OffloadManifest.load(manifest_path)
     manifest.validate_model_files()
+    plan = None
+    if args.plan is not None:
+        plan = deserialize_residency_plan(args.plan.read_text(encoding="utf-8"))
+        if tuple(manifest.layer_ids) != tuple(plan.offloaded_layer_ids):
+            raise ValueError("manifest layers must exactly match plan offloaded layers")
     dataset_sha256 = file_sha256(dataset_path)
+    run_manifest = json.loads((run.path / "run_manifest.json").read_text())
+    source_state_sha256 = run_manifest["source_state_sha256"]
+    git_commit = run_manifest["git_commit"]
     workload_contract = {
         "schema_version": 1,
         "model_path": manifest.model.path,
@@ -236,6 +251,16 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
             else None
         ),
     }
+    mode_contract.update(
+        manifest_comparison_contract(
+            manifest,
+            workload_contract_sha256=workload_contract_sha256,
+            source_identity=source_state_sha256,
+            graph_policy=("piecewise" if args.mode.endswith("piecewise") else "eager"),
+            kv_reserve_bytes=args.kv_cache_memory_bytes,
+            plan=plan,
+        )
+    )
     mode_contract_sha256 = payload_sha256(mode_contract)
     run.write_json(
         "contract.json",
@@ -261,9 +286,6 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
     )
     run.write_json("server_command.json", server_command)
-    run_manifest = json.loads((run.path / "run_manifest.json").read_text())
-    source_state_sha256 = run_manifest["source_state_sha256"]
-    git_commit = run_manifest["git_commit"]
     environment = _server_environment(args.mode, manifest_path, profile_path)
 
     server_log = (run.path / "server.log").open("w", encoding="utf-8")
@@ -365,6 +387,24 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "exploratory": args.exploratory,
         "final_result": not args.exploratory,
         "offload_telemetry": telemetry,
+        "comparison_contract": {
+            key: mode_contract[key]
+            for key in (
+                "selection_strategy",
+                "eligible_layer_ids",
+                "selected_layer_ids",
+                "plan_id",
+                "parameter_names",
+                "host_bytes",
+                "resident_weight_bytes",
+                "kv_reserve_bytes",
+                "graph_policy",
+                "workload_contract_sha256",
+                "source_identity",
+                "uva_reservation_bytes",
+                "legacy_evidence",
+            )
+        },
         "metrics": summarize_repetitions(
             repetitions, minimum_repetitions=1 if args.exploratory else 3
         ),
