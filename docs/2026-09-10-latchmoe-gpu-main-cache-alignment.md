@@ -960,13 +960,13 @@ Task 7-8 验收：
 
 ```text
 /root/latchmoe-venv/bin/python -m pytest -q tests/gpu/test_main_cache_overlap.py tests/gpu/test_failure_lifecycle.py
-3 passed
+4 passed
 
 /root/latchmoe-venv/bin/python -m pytest -q tests/unit tests/integration tests/gpu
-201 passed, 20 warnings
+202 passed, 20 warnings
 ```
 
-partial-hit 测试确认 protected slots 不被覆盖，serial/overlap 输出、pair count、compute order 和最终 ownership 一致；failure 测试确认 wave kernel 异常后 runtime 进入 `POISONED`、后续 forward 抛 `RuntimePoisonedError`，close 可重复调用并追加 `drained=true` failure 记录。小张量运行的 `actual_overlap` 作为设备实测布尔值记录，只有为真时才可计入性能统计。
+partial-hit 测试确认 protected slots 不被覆盖，serial/overlap 输出、pair count、compute order、victim sequence、H2D traffic 和最终 ownership 一致；failure 测试确认 wave kernel 或预取 bookkeeping 异常后 runtime 进入 `POISONED`、后续 forward 抛 `RuntimePoisonedError`，close 可重复调用并 drain 在途 compute/transfer，再追加 `drained=true` failure 记录。小张量运行的 `actual_overlap` 作为设备实测布尔值记录，只有为真时才可计入性能统计。
 
 未完成部分从 Task 9 开始：shared expert capability 扩展、benchmark 合同和正式全模型验收尚未宣称完成。
 
