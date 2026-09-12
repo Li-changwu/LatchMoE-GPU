@@ -955,6 +955,8 @@ Task 7-8 已在 2026-09-12 完成并提交：
 - `578c671` `feat: add constrained overlap and poisoned lifecycle`：为 partial-hit wave 增加只写 idle slot 的 H2D prefetch、CUDA event 时间窗和 candidate/actual overlap profile；新增 `RuntimeState`、`RuntimePoisonedError`、failure JSONL、close/drain 和 graph registry 注销，并注册 plugin 的 `atexit` 后备关闭。
 - `7c203c6` `test: strengthen Task 7-8 lifecycle acceptance`：补充 serial/overlap 的 pair/order/ownership parity，以及 failure 记录的 plan/layer/lease 字段断言。
 - `8ad2e2c` `test: verify prefetched H2D before runtime poison`：确认异常前下一 wave 的 H2D 已发出，再验证 runtime poison 和 drain。
+- `9be80cf` `test: cover pending transfer drain and victim parity`：覆盖未完成 transfer ticket 的 drain，以及 victim sequence/H2D traffic parity。
+- `93b9a18` `fix: preserve victim and transfer lifecycle evidence`：运行时保存 eviction sequence，并去重 failure 中的 transfer ticket 计数。
 
 Task 7-8 验收：
 
