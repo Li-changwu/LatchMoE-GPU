@@ -679,11 +679,11 @@ git commit -m "fix: keep dynamic CUDA staging outside graph replay"
 - Modify: `src/vllm_latchmoe_cuda/profile.py`
 - Create: `tests/gpu/test_main_cache_overlap.py`
 
-- [ ] **Step 1: 写三类强制调度测试**
+- [x] **Step 1: 写三类强制调度测试**
 
 分别构造 `h=0`、`h=C<P` 和 `0<h<C`。前两种断言没有 next-wave H2D 在 current compute 前发出；第三种只有当 `len(next_wave) <= C-h` 时才允许 candidate，且 next wave 只能写不受保护的 EMPTY/READY slots，不能覆盖 current leases。
 
-- [ ] **Step 2: 实现空闲-slot prefetch**
+- [x] **Step 2: 实现空闲-slot prefetch**
 
 当前 wave 准备完后，计算：
 
@@ -697,7 +697,7 @@ can_prefetch = (
 
 `can_prefetch` 为真时，用 transfer stream 把下一完整 wave装入不受当前 wave leases 保护的可复用 slots。候选可以是 EMPTY，也可以是 READY 且不属于当前 wave 的 victim；后者必须先等待自己的历史 compute event。不得选择 LOADING、COMPUTING 或当前 wave 的 slot。只发 H2D，不提前覆盖当前 `log2phy`；mapping publication 在下一 wave compute 入队前完成。
 
-- [ ] **Step 3: 用 CUDA events 证明实际 overlap**
+- [x] **Step 3: 用 CUDA events 证明实际 overlap**
 
 为 H2D 和 compute 分别记录 start/end events，并从同一个 origin event 计算设备时间窗：
 
@@ -709,11 +709,11 @@ actual_overlap = max(h2d_start_ms, compute_start_ms) < min(
 
 profile 同时写 `overlap_candidate`、`actual_overlap`、四个 event 时间、H2D bytes 和 protected slot IDs。只有 actual 为真才能汇入 overlap 性能统计。
 
-- [ ] **Step 4: 对比 serial/async 数值和 traffic**
+- [x] **Step 4: 对比 serial/async 数值和 traffic**
 
 固定 routes，串行和 async 必须得到相同 token IDs、pair count、victim sequence 和最终 cache ownership；async 只允许改变 event 排序和延迟，不能改变算法结果。
 
-- [ ] **Step 5: 运行测试并提交**
+- [x] **Step 5: 运行测试并提交**
 
 ```bash
 python -m pytest -q tests/gpu/test_main_cache_overlap.py tests/gpu/test_main_cache_streaming.py
@@ -734,7 +734,7 @@ git commit -m "feat: overlap H2D only through idle main slots"
 - Create: `tests/gpu/test_failure_lifecycle.py`
 - Modify: `tests/unit/test_profile.py`
 
-- [ ] **Step 1: 写 kernel 中途异常测试**
+- [x] **Step 1: 写 kernel 中途异常测试**
 
 让第一个 wave kernel 向 compute stream 入队后抛异常，并让下一 wave H2D 已发出。断言 runtime 记录所有在途 compute/transfer events、进入 `POISONED`、下一次 forward 抛 `RuntimePoisonedError`，且没有 bank/slot 被重新写入。
 
@@ -743,7 +743,7 @@ class RuntimePoisonedError(LatchMoEError):
     pass
 ```
 
-- [ ] **Step 2: 在异常路径记录完成边界**
+- [x] **Step 2: 在异常路径记录完成边界**
 
 围绕每个 wave 使用：
 
@@ -761,15 +761,15 @@ else:
 
 即使 Python callback 抛错，已经入队的 CUDA 工作也有 event 保护。fail closed 后禁止尝试透明恢复。
 
-- [ ] **Step 3: 实现幂等 close/drain**
+- [x] **Step 3: 实现幂等 close/drain**
 
 `CudaLayerRuntime.close()` 等待所有 compute events 和 transfer tickets；`CudaSEWOffloader.close()` 关闭所有 runtimes、注销 graph registry、最后关闭唯一 `JsonlEventWriter`。重复 close 不报错。plugin 注册 `atexit` 作为 vLLM 没有调用 shutdown hook 时的后备。
 
-- [ ] **Step 4: 记录结构化 failure**
+- [x] **Step 4: 记录结构化 failure**
 
 failure JSONL 必须包含 plan_id、layer、wave、exception type、active experts、leases、slot states、pending event 数和是否完成 drain。日志写失败不能掩盖原异常。
 
-- [ ] **Step 5: 运行测试并提交**
+- [x] **Step 5: 运行测试并提交**
 
 ```bash
 python -m pytest -q tests/gpu/test_failure_lifecycle.py tests/unit/test_profile.py
@@ -950,14 +950,30 @@ Task 1-6 targeted suite (plan/CLI/cache/waves/seam/graph/lifecycle/CUDA)
 
 测试使用 `/root/latchmoe-venv` 的 PyTorch 2.10 CUDA 环境；A6000 上的小张量 slot、streaming、graph replay、single-layer cache isolation 和 seam 计数测试均通过。旧的 `execute_exact_waves` 仅保留为 diagnostic alias，双 temporary-bank 断言已迁移到逐层持久 Main Cache 断言，生产 adapter 已切换到 `execute_main_cache_waves`。当前 vLLM 0.19.1 wheel 未提供独立 layer-level combine hook，因此生产 plan 在未注入锁定 native seam 时明确抛 `NativeCombineError`，不会以 `index_add_` 冒充 native combine；真实模型 full-token gate 仍需在带该 hook 的锁定 vLLM fork 上运行。
 
-未完成部分从 Task 7 开始：定向空闲-slot overlap、poison/drain shutdown、shared expert capability 扩展、benchmark 合同和正式全模型验收尚未宣称完成。
+Task 7-8 已在 2026-09-12 完成并提交：
+
+- `578c671` `feat: add constrained overlap and poisoned lifecycle`：为 partial-hit wave 增加只写 idle slot 的 H2D prefetch、CUDA event 时间窗和 candidate/actual overlap profile；新增 `RuntimeState`、`RuntimePoisonedError`、failure JSONL、close/drain 和 graph registry 注销，并注册 plugin 的 `atexit` 后备关闭。
+
+Task 7-8 验收：
+
+```text
+/root/latchmoe-venv/bin/python -m pytest -q tests/gpu/test_main_cache_overlap.py tests/gpu/test_failure_lifecycle.py
+3 passed
+
+/root/latchmoe-venv/bin/python -m pytest -q tests/unit tests/integration tests/gpu
+201 passed, 20 warnings
+```
+
+partial-hit 测试确认 protected slots 不被覆盖，serial/overlap 输出、pair count、compute order 和最终 ownership 一致；failure 测试确认 wave kernel 异常后 runtime 进入 `POISONED`、后续 forward 抛 `RuntimePoisonedError`，close 可重复调用并追加 `drained=true` failure 记录。小张量运行的 `actual_overlap` 作为设备实测布尔值记录，只有为真时才可计入性能统计。
+
+未完成部分从 Task 9 开始：shared expert capability 扩展、benchmark 合同和正式全模型验收尚未宣称完成。
 
 ## 推荐实施顺序与停止点
 
 1. Task 1-3 先解决“选哪些层、如何进入 worker、存储属于谁”。完成后应能启动逐层 cache，但还不宣称 overflow 完成。
 2. Task 4-6 完成严格串行 Main Cache、一次 native combine 和图边界。这是第一个可用于正确性验收的版本。
 3. 若 serial exact-token 不通过，停止，不进入 overlap。优先对比 router 输出、pair offsets、每 wave 未加权 MLP 输出和 native combine metadata。
-4. Task 7-8 只改变调度和失败生命周期，不允许改变 victim 顺序或数学结果。
+4. Task 7-8 只改变调度和失败生命周期，不允许改变 victim 顺序或数学结果；当前已完成并通过小张量 serial/overlap 与 failure lifecycle 验收。
 5. Task 9 是明确的 capability 扩展，可在 routed-only 正确性收口后独立合入。
 6. Task 10-11 通过前，所有新性能数字只能标记为 smoke/exploratory。
 
@@ -974,8 +990,8 @@ Task 1-6 targeted suite (plan/CLI/cache/waves/seam/graph/lifecycle/CUDA)
 - [x] hit-first、真实 victim replacement、owner/generation/state lease 均有测试证据。
 - [x] router 每层每次 forward 一次，pair coverage 严格完整。
 - [x] 每层 forward 只有一次 native combine seam 调用；缺少锁定 hook 时 fail closed，不存在生产 `index_add_` combine。
-- [x] `h=0`、`h=C<P` 不产生 overlap claim；candidate/actual 字段已预留给 Task 7。
-- [ ] 异常使 runtime poisoned，并在 shutdown 时 drain 所有在途 CUDA 工作。
+- [x] `h=0`、`h=C<P` 不产生 overlap claim；partial-hit 只在下一 wave 能装入 idle slots 时产生 candidate，并记录 H2D/compute event 窗口和 `actual_overlap`。
+- [x] 异常使 runtime poisoned，并在 shutdown 时 drain 所有在途 CUDA 工作；重复 close 幂等。
 - [x] vLLM commit/source、model config/index/shards 均可追溯。
 - [ ] full-resident、exact UVA、serial LatchMoE、async LatchMoE 通过 exact-token parity。
 - [ ] 新性能结果使用可比参数集合和 HBM ledger，并保留所有失败/不可比 case。
