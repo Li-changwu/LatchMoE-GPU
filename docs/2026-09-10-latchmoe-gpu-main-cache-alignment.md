@@ -1015,7 +1015,7 @@ Task 11 分层验收进展（2026-09-14）：
 真实模型验收更新（2026-09-14）：
 
 - 使用 `/root/models/Qwen3-30B-A3B-Instruct-2507` 生成并提交 midpoint manifest `benchmark/manifests/offload_manifest.qwen3-root.midpoint12.graph64.20260914.json`，selected layers 为 `(2,6,10,14,18,22,26,30,34,38,42,46)`，64 slots 与 13.5 GiB plan 的 capture 约束一致。
-- Step 3 真实权重部分：`LATCHMOE_REAL=1` 的 `tests/real/test_qwen_layers.py` 通过 `13 passed`，覆盖 12 个 selected layers 的 checkpoint tensor、eager staged path 和 union-128 path；runtime ledger/profile 中观察到 `temporary_bank_bytes=0`、`dynamic_slot_bytes=603979776`、`host_routed_expert_bytes=1207959552`。
+- Step 3 真实权重部分：使用最终 graph64 midpoint manifest，`LATCHMOE_REAL=1` 的 `tests/real/test_qwen_layers.py` 通过 `13 passed`，覆盖 12 个 selected layers 的 checkpoint tensor、eager staged path 和 union-128 path；对应 runtime ledger/profile 预算为 `temporary_bank_bytes=0`、`dynamic_slot_bytes=603979776`、`host_routed_expert_bytes=1207959552`。
 - Step 4 UVA 侧：`artifacts/20260914T091724-uva` 成功完成 3 个 deterministic prompts、16 token 输出，生成 `correctness.json` 和 `offload_telemetry.json`。
 - Step 4 native 侧：`artifacts/20260914T091724-native` 保留启动失败；A6000 在分配第 48 层专家权重时 OOM（总显存 44.42 GiB、仅余 430.62 MiB），因此没有 native token oracle。
 - Step 4 LatchMoE 侧：`artifacts/20260914T091724-latchmoe-eager-final` 保留启动失败；plan/identity lock 已成功生成并传播，但 vLLM 0.19.1 wheel 没有锁定 native combine seam，runtime 按 fail-closed 规则抛出 `NativeCombineError`。未绕过该保护，也未宣称 serial/async parity。
