@@ -1,0 +1,840 @@
+{
+  "dtype": "bfloat16",
+  "layers": [
+    {
+      "layer_id": 1,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 0,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 402653184,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 3,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 603979776,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 1006632960,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 6,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 1207959552,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 1610612736,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 8,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 1811939328,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 2214592512,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 10,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 2415919104,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 2818572288,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 13,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 3019898880,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 3422552064,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 15,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 3623878656,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 4026531840,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 18,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 4227858432,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 4630511616,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 20,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 4831838208,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 5234491392,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 22,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 5435817984,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 5838471168,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 25,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 6039797760,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 6442450944,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 27,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 6643777536,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 7046430720,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 30,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 7247757312,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 7650410496,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 32,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 7851737088,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 8254390272,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 34,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 8455716864,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 8858370048,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 37,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 9059696640,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 9462349824,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 39,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 9663676416,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 10066329600,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 42,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 10267656192,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 10670309376,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 44,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 10871635968,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 11274289152,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "layer_id": 46,
+      "tensors": [
+        {
+          "dtype": "bfloat16",
+          "name": "w13_weight",
+          "nbytes": 805306368,
+          "numel": 402653184,
+          "offset_elements": 11475615744,
+          "parameter_name": "mlp.experts.w13_weight",
+          "shape": [
+            128,
+            1536,
+            2048
+          ],
+          "stride": [
+            3145728,
+            2048,
+            1
+          ]
+        },
+        {
+          "dtype": "bfloat16",
+          "name": "w2_weight",
+          "nbytes": 402653184,
+          "numel": 201326592,
+          "offset_elements": 11878268928,
+          "parameter_name": "mlp.experts.w2_weight",
+          "shape": [
+            128,
+            2048,
+            768
+          ],
+          "stride": [
+            1572864,
+            768,
+            1
+          ]
+        }
+      ]
+    }
+  ],
+  "manifest_sha256": "d99f2d76c2099b744100018bb54786610d8c1dc1fdd9d45901fcab74570143b9",
+  "model": {
+    "config_sha256": "a1ee086a68d0cbfc87316da00ba4b8507bd1292978108e2496201a30a450f438",
+    "num_experts": 128,
+    "path": "/root/models/Qwen3-30B-A3B-Instruct-2507",
+    "revision": "0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
+    "weight_index_sha256": "8dde190b862c7c80ec7403c6495de00c60bbaf246ed479cee4506284989c584c"
+  },
+  "num_slots": 32,
+  "schema_version": 1,
+  "tensor_parallel_size": 1,
+  "vllm": {
+    "tag_commit": "b1388b1fbf5aaef47937fabe98931211684666a6",
+    "version": "0.19.1"
+  }
+}
