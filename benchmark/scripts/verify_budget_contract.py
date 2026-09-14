@@ -137,6 +137,45 @@ def validate_profile_events(
     }
 
 
+def validate_runtime_ledger(
+    ledger: Mapping[str, Any],
+    *,
+    selected_layer_count: int | None = None,
+    slots_per_layer: int | None = None,
+    bytes_per_expert: int | None = None,
+) -> dict[str, Any]:
+    """Validate the resource counters required by the 12-layer gate."""
+    temporary = int(ledger.get("temporary_bank_bytes", 0) or 0)
+    if temporary != 0:
+        raise BudgetContractError("temporary_bank_bytes must be zero")
+    if "pair_count" in ledger and "num_tokens" in ledger and "top_k" in ledger:
+        expected = int(ledger["num_tokens"]) * int(ledger["top_k"])
+        if int(ledger["pair_count"]) != expected:
+            raise BudgetContractError(
+                f"pair_count must equal num_tokens*top_k ({expected})"
+            )
+    if "combine_count" in ledger and "selected_layer_forward_count" in ledger:
+        if int(ledger["combine_count"]) != int(ledger["selected_layer_forward_count"]):
+            raise BudgetContractError("combine_count must equal selected layer forward count")
+    if (
+        slots_per_layer is not None
+        and bytes_per_expert is not None
+        and selected_layer_count is not None
+        and "allocated_dynamic_weight_bytes" in ledger
+    ):
+        expected = int(selected_layer_count) * int(slots_per_layer) * int(bytes_per_expert)
+        if int(ledger["allocated_dynamic_weight_bytes"]) != expected:
+            raise BudgetContractError(
+                "allocated_dynamic_weight_bytes does not match selected layers*slots*bytes_per_expert"
+            )
+    return {
+        "temporary_bank_bytes": temporary,
+        "pair_count": ledger.get("pair_count"),
+        "combine_count": ledger.get("combine_count"),
+        "allocated_dynamic_weight_bytes": ledger.get("allocated_dynamic_weight_bytes"),
+    }
+
+
 def verify_exact_token_gate(
     native: Mapping[str, Any],
     uva: Mapping[str, Any],
@@ -175,12 +214,19 @@ def verify_budget_contract(
     candidate: Mapping[str, Any],
     *,
     profile: Iterable[Mapping[str, Any]] | Mapping[str, Any] | None = None,
+    ledger: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_plan_evidence(baseline)
     validate_plan_evidence(candidate)
     comparison = validate_comparable_contracts(dict(baseline), dict(candidate))
     profile_report = validate_profile_events(profile) if profile is not None else None
-    return {"pass": True, "comparison": comparison, "profile": profile_report}
+    ledger_report = validate_runtime_ledger(ledger) if ledger is not None else None
+    return {
+        "pass": True,
+        "comparison": comparison,
+        "profile": profile_report,
+        "ledger": ledger_report,
+    }
 
 
 def _load(path: Path) -> dict[str, Any]:
@@ -223,6 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--uva", type=Path)
     parser.add_argument("--latchmoe", type=Path)
     parser.add_argument("--profile", type=Path)
+    parser.add_argument("--ledger", type=Path)
     parser.add_argument("--native-json", type=Path)
     parser.add_argument("--uva-json", type=Path)
     parser.add_argument("--latchmoe-json", type=Path)
@@ -236,11 +283,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             baseline_path, candidate_path = args.baseline, args.candidate
         profile = _load(args.profile) if args.profile else None
+        ledger = _load(args.ledger) if args.ledger else None
         if profile is None and args.latchmoe and args.latchmoe.is_dir():
             profile_path = args.latchmoe / "profile.jsonl"
             if profile_path.is_file():
                 profile = {"events": [json.loads(line) for line in profile_path.read_text().splitlines() if line]}
-        report = verify_budget_contract(_load(baseline_path), _load(candidate_path), profile=profile)
+        report = verify_budget_contract(
+            _load(baseline_path), _load(candidate_path), profile=profile, ledger=ledger
+        )
         native_path = args.native_json or args.native
         uva_path = args.uva_json or args.uva
         latchmoe_path = args.latchmoe_json or args.latchmoe

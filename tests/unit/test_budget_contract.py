@@ -1,5 +1,9 @@
 import pytest
 
+from benchmark.scripts.verify_budget_contract import (
+    BudgetContractError,
+    validate_runtime_ledger,
+)
 from vllm_latchmoe_cuda.benchmark import (
     compare_mode_summaries,
     validate_comparable_contracts,
@@ -72,4 +76,35 @@ def test_comparison_rejects_legacy_evidence():
         compare_mode_summaries(
             {**common, "mode": "uva"},
             {**common, "mode": "latchmoe-eager"},
+        )
+
+
+def test_runtime_ledger_enforces_zero_temporary_bank_and_pair_math():
+    ledger = {
+        "temporary_bank_bytes": 0,
+        "num_tokens": 4,
+        "top_k": 2,
+        "pair_count": 8,
+        "selected_layer_forward_count": 3,
+        "combine_count": 3,
+    }
+    report = validate_runtime_ledger(ledger)
+    assert report["pair_count"] == 8
+    ledger["pair_count"] = 7
+    with pytest.raises(BudgetContractError, match="pair_count"):
+        validate_runtime_ledger(ledger)
+
+
+def test_runtime_ledger_rejects_temporary_bank_and_wrong_dynamic_bytes():
+    with pytest.raises(BudgetContractError, match="temporary_bank_bytes"):
+        validate_runtime_ledger({"temporary_bank_bytes": 1})
+    with pytest.raises(BudgetContractError, match="allocated_dynamic"):
+        validate_runtime_ledger(
+            {
+                "temporary_bank_bytes": 0,
+                "allocated_dynamic_weight_bytes": 9,
+            },
+            selected_layer_count=2,
+            slots_per_layer=2,
+            bytes_per_expert=4,
         )

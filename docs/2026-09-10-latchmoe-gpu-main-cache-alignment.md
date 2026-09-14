@@ -869,7 +869,7 @@ git commit -m "test: enforce comparable CUDA LatchMoE evidence"
 - Modify only if a relevant failure is found in the preceding tasks.
 - Write new artifacts under a new run ID; never overwrite frozen 2026-07 results.
 
-- [ ] **Step 1: CPU 和静态门槛**
+- [x] **Step 1: CPU 和静态门槛**
 
 ```bash
 python -m pytest -q tests/unit
@@ -880,7 +880,7 @@ git diff --check
 
 Expected: 全部通过；没有 CUDA 设备也能验证 planner、pair coverage、capability 和 artifact comparator。
 
-- [ ] **Step 2: 小张量 CUDA 生命周期门槛**
+- [x] **Step 2: 小张量 CUDA 生命周期门槛**
 
 ```bash
 python -m pytest -q tests/gpu tests/integration \
@@ -1004,6 +1004,13 @@ Task 10 验收：
 ```
 
 ruff 未安装于 `/root/latchmoe-venv`，因此本轮未执行 ruff；未运行真实 full-model benchmark 或三方 token gate，Task 11 仍保持未完成。
+
+Task 11 分层验收进展（2026-09-14）：
+
+- Step 1 CPU/static：已通过 `tests/unit`（144 passed）和 `git diff --check`。当前虚拟环境没有 `ruff` 模块，因此 ruff 两项保持未执行。
+- Step 2 小张量 CUDA：已通过 `tests/gpu tests/integration -k "main_cache or overlap or graph or lifecycle or combine or shared"`（25 passed, 39 deselected）以及完整 `tests/gpu tests/integration`（64 passed）。
+- Step 3 的自动化门槛已具备：`verify_budget_contract.py` 新增 `validate_runtime_ledger()`，检查 `temporary_bank_bytes == 0`、`pair_count == num_tokens * top_k`、`combine_count == selected_layer_forward_count` 和动态权重字节公式；但真实 12 层 checkpoint 尚不可用，不能标记真实张量门槛完成。
+- Step 4-6 仍未完成：当前环境不存在 `/home/lcw/model`，未运行 full-resident/UVA/serial/async 三方 token gate，也未启动新的三轮正式性能实验。冻结的 2026-07 artifact 未被覆盖。
 
 ## 推荐实施顺序与停止点
 
