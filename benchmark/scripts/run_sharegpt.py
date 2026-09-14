@@ -28,6 +28,7 @@ from vllm_latchmoe_cuda.benchmark import (
     summarize_repetitions,
 )
 from vllm_latchmoe_cuda.manifest import OffloadManifest
+from vllm_latchmoe_cuda.manifest import build_identity_lock, serialize_identity_lock
 from vllm_latchmoe_cuda.residency_plan import deserialize_residency_plan
 
 
@@ -118,7 +119,12 @@ def _terminate(process: subprocess.Popen, timeout_s: float) -> None:
 
 
 def _server_environment(
-    mode: str, manifest_path: Path, profile_path: Path
+    mode: str,
+    manifest_path: Path,
+    profile_path: Path,
+    *,
+    plan_json: str | None = None,
+    identity_lock_json: str | None = None,
 ) -> dict[str, str]:
     environment = os.environ.copy()
     for name in (
@@ -128,6 +134,8 @@ def _server_environment(
         "VLLM_LATCHMOE_TELEMETRY_PATH",
         "VLLM_LATCHMOE_GRAPH_MODE",
         "VLLM_LATCHMOE_WAVE_SLOTS",
+        "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON",
+        "VLLM_LATCHMOE_IDENTITY_LOCK_JSON",
     ):
         environment.pop(name, None)
     environment.update(
@@ -149,6 +157,10 @@ def _server_environment(
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
             }
         )
+        if plan_json is not None:
+            environment["VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"] = plan_json
+        if identity_lock_json is not None:
+            environment["VLLM_LATCHMOE_IDENTITY_LOCK_JSON"] = identity_lock_json
         if mode.endswith("piecewise"):
             environment["VLLM_LATCHMOE_GRAPH_MODE"] = "piecewise"
     return environment
@@ -202,10 +214,19 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
     manifest = OffloadManifest.load(manifest_path)
     manifest.validate_model_files()
     plan = None
+    plan_json = None
+    identity_lock_json = None
     if args.plan is not None:
         plan = deserialize_residency_plan(args.plan.read_text(encoding="utf-8"))
         if tuple(manifest.layer_ids) != tuple(plan.offloaded_layer_ids):
             raise ValueError("manifest layers must exactly match plan offloaded layers")
+        plan_json = json.dumps(plan.to_jsonable(), sort_keys=True, separators=(",", ":"))
+        identity_lock_json = serialize_identity_lock(
+            build_identity_lock(
+                plan,
+                ["--model", manifest.model.path, "--revision", manifest.model.revision],
+            )
+        )
     dataset_sha256 = file_sha256(dataset_path)
     run_manifest = json.loads((run.path / "run_manifest.json").read_text())
     source_state_sha256 = run_manifest["source_state_sha256"]
@@ -286,7 +307,13 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
     )
     run.write_json("server_command.json", server_command)
-    environment = _server_environment(args.mode, manifest_path, profile_path)
+    environment = _server_environment(
+        args.mode,
+        manifest_path,
+        profile_path,
+        plan_json=plan_json,
+        identity_lock_json=identity_lock_json,
+    )
 
     server_log = (run.path / "server.log").open("w", encoding="utf-8")
     process = subprocess.Popen(

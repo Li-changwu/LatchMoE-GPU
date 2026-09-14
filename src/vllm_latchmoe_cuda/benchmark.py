@@ -462,9 +462,12 @@ def read_offload_telemetry(
             **graph_telemetry,
         }
     residual = [event for event in events if event.get("event") == "residual_uva"]
-    if len(residual) != 1:
-        raise RuntimeError("LatchMoE residual UVA telemetry is missing or duplicated")
+    if len(residual) > 1:
+        raise RuntimeError("LatchMoE residual UVA telemetry is duplicated")
     wave_events = [event for event in events if event.get("event") == "exact_waves"]
+    main_cache_events = [
+        event for event in events if event.get("event") == "main_cache_waves"
+    ]
     direct_slot_events = [
         event for event in events if event.get("event") == "direct_slots"
     ]
@@ -482,8 +485,8 @@ def read_offload_telemetry(
                 "ShareGPT measurement did not exercise every full-capacity "
                 "direct-slot layer"
             )
-    elif required_runtime_mode is None and not wave_events:
-        raise RuntimeError("ShareGPT measurement did not exercise exact waves")
+    elif required_runtime_mode is None and not wave_events and not main_cache_events:
+        raise RuntimeError("ShareGPT measurement did not exercise exact waves or Main Cache waves")
     if wave_events and len(device_wave_events) != len(wave_events):
         raise RuntimeError("not every exact wave used the CUDA device planner")
     if any(
@@ -493,17 +496,24 @@ def read_offload_telemetry(
         for event in direct_slot_events
     ):
         raise RuntimeError("invalid full-capacity direct-slot telemetry")
-    event = residual[0]
+    event = residual[0] if residual else None
     manifest_bytes = manifest.total_elements * 2
-    residual_bytes = int(event["cpu_offload_bytes"])
+    residual_bytes = int(event["cpu_offload_bytes"]) if event is not None else 0
+    ledger_events = [event for event in events if event.get("event") == "residency_ledger"]
+    dynamic_slot_bytes = sum(
+        int(event.get("dynamic_slot_bytes", 0) or 0) for event in ledger_events
+    )
     return {
         "implementation": "vllm_latchmoe_cuda.offloader.CudaSEWOffloader",
         "residual_implementation": "vllm.model_executor.offloader.uva.UVAOffloader",
         "manifest_bytes": manifest_bytes,
+        "dynamic_slot_bytes": dynamic_slot_bytes,
         "residual_uva_bytes": residual_bytes,
         "actual_offload_bytes": manifest_bytes + residual_bytes,
-        "configured_budget_bytes": manifest_bytes + int(event["cpu_offload_max_bytes"]),
+        "configured_budget_bytes": manifest_bytes
+        + (int(event["cpu_offload_max_bytes"]) if event is not None else 0),
         "exact_wave_events": len(wave_events),
+        "main_cache_wave_events": len(main_cache_events),
         "cuda_device_planner_events": len(device_wave_events),
         "direct_slot_events": len(direct_slot_events),
         **graph_telemetry,
