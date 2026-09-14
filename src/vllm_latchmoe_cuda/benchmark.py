@@ -521,7 +521,11 @@ def read_offload_telemetry(
 
 
 def compare_mode_summaries(
-    uva: dict[str, Any], latchmoe: dict[str, Any]
+    uva: dict[str, Any],
+    latchmoe: dict[str, Any],
+    *,
+    require_equal_offload_bytes: bool = True,
+    require_equal_contract: bool = True,
 ) -> dict[str, Any]:
     reference_mode = str(uva.get("mode", ""))
     candidate_mode = str(latchmoe.get("mode", ""))
@@ -535,7 +539,7 @@ def compare_mode_summaries(
         raise ValueError("benchmark workload contracts differ")
     uva_bytes = uva["offload_telemetry"]["actual_offload_bytes"]
     latchmoe_bytes = latchmoe["offload_telemetry"]["actual_offload_bytes"]
-    if uva_bytes != latchmoe_bytes:
+    if require_equal_offload_bytes and uva_bytes != latchmoe_bytes:
         raise ValueError(
             f"actual offload bytes differ: UVA={uva_bytes}, LatchMoE={latchmoe_bytes}"
         )
@@ -552,7 +556,8 @@ def compare_mode_summaries(
             latchmoe, "legacy_evidence"
         ) is True:
             raise ValueError("legacy temporary-bank/shared-pool evidence is not comparable")
-        validate_comparable_contracts(uva, latchmoe)
+        if require_equal_contract:
+            validate_comparable_contracts(uva, latchmoe)
 
     comparison: dict[str, Any] = {}
     for metric in SUMMARY_METRICS:
@@ -576,6 +581,20 @@ def compare_mode_summaries(
         "candidate_mode": candidate_mode,
         "workload_contract_sha256": uva["workload_contract_sha256"],
         "actual_offload_bytes": uva_bytes,
+        "latchmoe_actual_offload_bytes": latchmoe_bytes,
+        "comparable_offload_bytes": uva_bytes == latchmoe_bytes,
+        "comparable_contract": (
+            True
+            if not any(
+                _contract_value(uva, field) is not None
+                or _contract_value(latchmoe, field) is not None
+                for field in COMPARISON_CONTRACT_FIELDS
+            )
+            else all(
+                _contract_value(uva, field) == _contract_value(latchmoe, field)
+                for field in COMPARISON_CONTRACT_FIELDS
+            )
+        ),
         "comparison_contract": {
             field: _contract_value(uva, field)
             for field in COMPARISON_CONTRACT_FIELDS

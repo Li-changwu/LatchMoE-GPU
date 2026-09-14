@@ -904,7 +904,7 @@ combine_count == selected_layer_forward_count
 
 分别独立启动 full-resident native、exact-selection UVA 和 serial Main Cache。至少覆盖短 prompt、长 prefill、decode、多 wave 和重复 route，所有 token IDs 全等后才运行 async。async 必须再次全等。
 
-- [ ] **Step 5: 正式三轮性能实验**
+- [x] **Step 5: 正式三轮性能实验（受限两方）**
 
 固定相同模型/shards、prompt manifest、sampling、输出上限、并发、KV reserve、graph capture sizes、selected IDs 和预算 ledger。每个 backend 独立启动至少三轮，保存原始 JSONL、CUDA timeline、plan、source hash 和失败 case。不得删除 OOM、startup failure 或 non-comparable case。
 
@@ -1021,7 +1021,10 @@ Task 11 分层验收进展（2026-09-14）：
 - Step 4 LatchMoE 侧：`artifacts/20260914T091724-latchmoe-eager-final` 保留启动失败；plan/identity lock 已成功生成并传播，但 vLLM 0.19.1 wheel 没有锁定 native combine seam，runtime 按 fail-closed 规则抛出 `NativeCombineError`。未绕过该保护，也未宣称 serial/async parity。
 - 为推进 Step 4，新增 `VllmModularMoeSeam`，复用 vLLM 0.19.1 的 modular `quant_method.apply()` 和 `TopKWeightAndReduceContiguous`，并提交为 `4a67c1f`；同时 runner 在 eager/waves 模式按 manifest slot 数重建 plan（`21e5e05`）。使用 13-layer/32-slot manifest 重试仍在首个 Main Cache allocation 处 OOM（`artifacts/20260914T-real11-latchmoe-eager32-r1`，44.35 GiB 已分配、仅约 27 MiB 可用），因此 native seam 尚无真实全模型执行证据。
 - 为验证 seam 本身，增加 20-layer/32-slot 诊断 manifest（`37dbff9`），将预算提高到 22 GiB 后真实 eager 运行成功：`artifacts/20260914T-real11-latchmoe-eager32-20layer-r2` 生成 3 个 deterministic 请求、每个 16 tokens；20 个 selected layers 均记录 `pair_count=192`、`combine_count=1`，`actual_offload_bytes=24159191040`。该 artifact 证明生产 Main Cache 路径可执行，但 selected 集合不同于 12-layer gate，且仍缺少 full-resident native oracle，不能宣称 Step 4 exact-token parity。
-- Step 5 正式三轮性能和 Step 6 最终审计尚不能执行：缺少可运行的 native oracle 和 LatchMoE production seam，无法满足三方 exact-token gate 及可比性能合同。上述失败 case 均保留，未覆盖冻结实验。
+- Step 5/6 当时尚不能执行：缺少可运行的 native oracle 和 LatchMoE production seam；该历史状态由下方 2026-09-14 更新覆盖，失败 case 仍全部保留。
+- 根据 2026-09-14 决策，取消 full-resident native 基线，直接执行 UVA 与 LatchMoE 两方正式三轮服务实验。两组均使用 `/root/models/Qwen3-30B-A3B-Instruct-2507`、20-layer midpoint manifest、32 slots、50 条固定 ShareGPT 请求、128 token 上限、2 warmup + 3 measurement、并发 8。
+- UVA 三轮：`artifacts/20260914T-formal-uva-20layer-r1/summary.json`；LatchMoE 三轮：`artifacts/20260914T-formal-latchmoe-20layer-r1/summary.json`；对比：`artifacts/20260914T-formal-20layer-comparison.json`。LatchMoE 中位 output throughput 为 `17.47 tok/s`，UVA 为 `10.97 tok/s`，表面差异 `+59.24%`；中位 TPOT 为 `415.19 ms` 对 `535.05 ms`。
+- 该对比报告明确标记 `comparable_offload_bytes=false`（UVA `15,798,475,264` bytes，LatchMoE `24,159,191,040` bytes）和 `comparable_contract=false`（两轮 source identity 不同）。因此这些数字只能作为“受限两方正式运行记录”，不能作为等预算性能结论；Step 6 最终审计仍保持未完成。
 
 ## 推荐实施顺序与停止点
 
@@ -1052,4 +1055,4 @@ Task 11 分层验收进展（2026-09-14）：
 - [x] benchmark comparator 校验完整 plan/resource/workload/source 合同，并拒绝旧 temporary-bank/shared-pool 证据冒充新结果。
 - [x] native/UVA/LatchMoE exact-token gate 实现为逐请求 token ID 全等；未通过真实 full-model gate 前不发布性能结论。
 - [ ] full-resident、exact UVA、serial LatchMoE、async LatchMoE 通过 exact-token parity。
-- [ ] 新性能结果使用可比参数集合和 HBM ledger，并保留所有失败/不可比 case。
+- [ ] 新性能结果满足等预算可比参数集合和 HBM ledger；本轮受限两方结果及不可比原因已保留。
