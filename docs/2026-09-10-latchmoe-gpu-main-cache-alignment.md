@@ -1020,6 +1020,7 @@ Task 11 分层验收进展（2026-09-14）：
 - Step 4 native 侧：`artifacts/20260914T091724-native` 保留启动失败；A6000 在分配第 48 层专家权重时 OOM（总显存 44.42 GiB、仅余 430.62 MiB），因此没有 native token oracle。
 - Step 4 LatchMoE 侧：`artifacts/20260914T091724-latchmoe-eager-final` 保留启动失败；plan/identity lock 已成功生成并传播，但 vLLM 0.19.1 wheel 没有锁定 native combine seam，runtime 按 fail-closed 规则抛出 `NativeCombineError`。未绕过该保护，也未宣称 serial/async parity。
 - 为推进 Step 4，新增 `VllmModularMoeSeam`，复用 vLLM 0.19.1 的 modular `quant_method.apply()` 和 `TopKWeightAndReduceContiguous`，并提交为 `4a67c1f`；同时 runner 在 eager/waves 模式按 manifest slot 数重建 plan（`21e5e05`）。使用 13-layer/32-slot manifest 重试仍在首个 Main Cache allocation 处 OOM（`artifacts/20260914T-real11-latchmoe-eager32-r1`，44.35 GiB 已分配、仅约 27 MiB 可用），因此 native seam 尚无真实全模型执行证据。
+- 为验证 seam 本身，增加 20-layer/32-slot 诊断 manifest（`37dbff9`），将预算提高到 22 GiB 后真实 eager 运行成功：`artifacts/20260914T-real11-latchmoe-eager32-20layer-r2` 生成 3 个 deterministic 请求、每个 16 tokens；20 个 selected layers 均记录 `pair_count=192`、`combine_count=1`，`actual_offload_bytes=24159191040`。该 artifact 证明生产 Main Cache 路径可执行，但 selected 集合不同于 12-layer gate，且仍缺少 full-resident native oracle，不能宣称 Step 4 exact-token parity。
 - Step 5 正式三轮性能和 Step 6 最终审计尚不能执行：缺少可运行的 native oracle 和 LatchMoE production seam，无法满足三方 exact-token gate 及可比性能合同。上述失败 case 均保留，未覆盖冻结实验。
 
 ## 推荐实施顺序与停止点
