@@ -1003,7 +1003,7 @@ Task 10 验收：
 175 passed, 20 warnings
 ```
 
-ruff 未安装于 `/root/latchmoe-venv`，因此本轮未执行 ruff；未运行真实 full-model benchmark 或三方 token gate，Task 11 仍保持未完成。
+ruff 未安装于 `/root/latchmoe-venv`，因此本轮未执行 ruff；在 2026-09-12 时尚未运行真实 full-model benchmark 或三方 token gate，Task 11 仍保持未完成。
 
 Task 11 分层验收进展（2026-09-14）：
 
@@ -1011,6 +1011,15 @@ Task 11 分层验收进展（2026-09-14）：
 - Step 2 小张量 CUDA：已通过 `tests/gpu tests/integration -k "main_cache or overlap or graph or lifecycle or combine or shared"`（25 passed, 39 deselected）以及完整 `tests/gpu tests/integration`（64 passed）。
 - Step 3 的自动化门槛已具备：`verify_budget_contract.py` 新增 `validate_runtime_ledger()`，检查 `temporary_bank_bytes == 0`、`pair_count == num_tokens * top_k`、`combine_count == selected_layer_forward_count` 和动态权重字节公式；但真实 12 层 checkpoint 尚不可用，不能标记真实张量门槛完成。
 - Step 4-6 仍未完成：当前环境不存在 `/home/lcw/model`，未运行 full-resident/UVA/serial/async 三方 token gate，也未启动新的三轮正式性能实验。冻结的 2026-07 artifact 未被覆盖。
+
+真实模型验收更新（2026-09-14）：
+
+- 使用 `/root/models/Qwen3-30B-A3B-Instruct-2507` 生成并提交 midpoint manifest `benchmark/manifests/offload_manifest.qwen3-root.midpoint12.graph64.20260914.json`，selected layers 为 `(2,6,10,14,18,22,26,30,34,38,42,46)`，64 slots 与 13.5 GiB plan 的 capture 约束一致。
+- Step 3 真实权重部分：`LATCHMOE_REAL=1` 的 `tests/real/test_qwen_layers.py` 通过 `13 passed`，覆盖 12 个 selected layers 的 checkpoint tensor、eager staged path 和 union-128 path；runtime ledger/profile 中观察到 `temporary_bank_bytes=0`、`dynamic_slot_bytes=603979776`、`host_routed_expert_bytes=1207959552`。
+- Step 4 UVA 侧：`artifacts/20260914T091724-uva` 成功完成 3 个 deterministic prompts、16 token 输出，生成 `correctness.json` 和 `offload_telemetry.json`。
+- Step 4 native 侧：`artifacts/20260914T091724-native` 保留启动失败；A6000 在分配第 48 层专家权重时 OOM（总显存 44.42 GiB、仅余 430.62 MiB），因此没有 native token oracle。
+- Step 4 LatchMoE 侧：`artifacts/20260914T091724-latchmoe-eager-final` 保留启动失败；plan/identity lock 已成功生成并传播，但 vLLM 0.19.1 wheel 没有锁定 native combine seam，runtime 按 fail-closed 规则抛出 `NativeCombineError`。未绕过该保护，也未宣称 serial/async parity。
+- Step 5 正式三轮性能和 Step 6 最终审计尚不能执行：缺少可运行的 native oracle 和 LatchMoE production seam，无法满足三方 exact-token gate 及可比性能合同。上述失败 case 均保留，未覆盖冻结实验。
 
 ## 推荐实施顺序与停止点
 
