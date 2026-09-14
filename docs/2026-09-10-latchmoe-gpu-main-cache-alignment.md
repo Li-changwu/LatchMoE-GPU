@@ -821,23 +821,23 @@ git commit -m "feat: support resident external shared experts"
 - Modify: `src/vllm_latchmoe_cuda/correctness.py`
 - Modify: `README.md`
 
-- [ ] **Step 1: 让旧正式结果失去新算法标签**
+- [x] **Step 1: 让旧正式结果失去新算法标签**
 
 README 保留 2026-07 结果，但标记为 `legacy temporary-bank/shared-pool evidence`。旧 generator 的 `(3,7,...,47)` 和旧正式实验的 first-12 `(0..11)` 必须分别原样记录，不能改写冻结证据，也不能称为新的默认 placement。59.85% 不能作为 Main Slots Cache 的性能结果；32/64 slot 单轮数据继续标为 exploratory。
 
-- [ ] **Step 2: 建立严格 baseline 合同**
+- [x] **Step 2: 建立严格 baseline 合同**
 
 主对照使用 `ManifestUVAOffloader` 精确卸载与 LatchMoE 相同的 routed expert 参数集合。manifest 必须从已生成的 immutable plan 导出，禁止 generator 独立选择默认层。比较器必须校验 `selection_strategy`、ordered eligible IDs、selected layer IDs、`plan_id`、参数名、host bytes、resident weight bytes、KV reserve、graph policy、workload hash 和 source identity。若为了匹配 free HBM 给 UVA 增加等量 reservation，必须记录 reservation bytes；无 reservation 的 practical UVA 另表报告，不能混成等预算结论。
 
-- [ ] **Step 3: 强制 exact-token correctness gate**
+- [x] **Step 3: 强制 exact-token correctness gate**
 
 正式性能运行前，native full-resident oracle、exact-selection UVA 和 LatchMoE 对同一 deterministic prompts 必须 token ID 全等。短 smoke、BF16 `allclose` 和固定输出长度不能替代该门槛。
 
-- [ ] **Step 4: 验证 profile 语义**
+- [x] **Step 4: 验证 profile 语义**
 
 `verify_budget_contract.py` 拒绝以下结果：无 profile 的均匀 Qwen plan 不是 `midpoint_stratified_v1`；Qwen3 `E=48,K=12` 不是 `(2,6,...,46)`；eligible 中包含 dense/non-MoE 层；baseline 和 LatchMoE selected IDs 不同；存在 temporary bank；resident layer 有 H2D；hit wave 有 H2D；pair count 不完整；combine count 不为每层一次；`h=0` 或 `h=C<P` 声称 overlap；candidate 没有 actual event window 却计入 overlap；parent/worker plan_id 或 selected IDs 不同。
 
-- [ ] **Step 5: 使用新生产命令**
+- [x] **Step 5: 使用新生产命令**
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 \
@@ -852,7 +852,7 @@ python -m vllm_latchmoe_cuda serve /home/lcw/model \
   --no-enable-prefix-caching
 ```
 
-- [ ] **Step 6: 运行合同测试并提交**
+- [x] **Step 6: 运行合同测试并提交**
 
 ```bash
 python -m pytest -q tests/unit/test_budget_contract.py tests/unit/test_benchmark.py tests/unit/test_correctness.py
@@ -889,7 +889,7 @@ python -m pytest -q tests/gpu tests/integration \
 
 Expected: stable address、逐层 cache、真实 replacement、一次 combine、poison/drain 和 event overlap 全部通过。
 
-- [ ] **Step 3: 真实 12 层张量门槛**
+- [x] **Step 3: 真实 12 层张量门槛**
 
 运行 bounded route、union-128 overflow、连续 decode cache-hit、三种 overlap 边界和故障注入。记录 HBM 分项，确认：
 
@@ -1009,7 +1009,7 @@ Task 11 分层验收进展（2026-09-14）：
 
 - Step 1 CPU/static：已通过 `tests/unit`（144 passed）和 `git diff --check`。当前虚拟环境没有 `ruff` 模块，因此 ruff 两项保持未执行。
 - Step 2 小张量 CUDA：已通过 `tests/gpu tests/integration -k "main_cache or overlap or graph or lifecycle or combine or shared"`（25 passed, 39 deselected）以及完整 `tests/gpu tests/integration`（64 passed）。
-- Step 3 的自动化门槛已具备：`verify_budget_contract.py` 新增 `validate_runtime_ledger()`，检查 `temporary_bank_bytes == 0`、`pair_count == num_tokens * top_k`、`combine_count == selected_layer_forward_count` 和动态权重字节公式；但真实 12 层 checkpoint 尚不可用，不能标记真实张量门槛完成。
+- Step 3 真实张量门槛已通过：`verify_budget_contract.py` 的 `validate_runtime_ledger()` 检查 `temporary_bank_bytes == 0`、`pair_count == num_tokens * top_k`、`combine_count == selected_layer_forward_count` 和动态权重字节公式；真实 midpoint graph64 manifest 的 12 个 selected layers 通过 `LATCHMOE_RUN_REAL=1 ... tests/real/test_qwen_layers.py`（`13 passed`）。
 - Step 4-6 仍未完成：当前环境不存在 `/home/lcw/model`，未运行 full-resident/UVA/serial/async 三方 token gate，也未启动新的三轮正式性能实验。冻结的 2026-07 artifact 未被覆盖。
 
 真实模型验收更新（2026-09-14）：
@@ -1019,6 +1019,7 @@ Task 11 分层验收进展（2026-09-14）：
 - Step 4 UVA 侧：`artifacts/20260914T091724-uva` 成功完成 3 个 deterministic prompts、16 token 输出，生成 `correctness.json` 和 `offload_telemetry.json`。
 - Step 4 native 侧：`artifacts/20260914T091724-native` 保留启动失败；A6000 在分配第 48 层专家权重时 OOM（总显存 44.42 GiB、仅余 430.62 MiB），因此没有 native token oracle。
 - Step 4 LatchMoE 侧：`artifacts/20260914T091724-latchmoe-eager-final` 保留启动失败；plan/identity lock 已成功生成并传播，但 vLLM 0.19.1 wheel 没有锁定 native combine seam，runtime 按 fail-closed 规则抛出 `NativeCombineError`。未绕过该保护，也未宣称 serial/async parity。
+- 为推进 Step 4，新增 `VllmModularMoeSeam`，复用 vLLM 0.19.1 的 modular `quant_method.apply()` 和 `TopKWeightAndReduceContiguous`，并提交为 `4a67c1f`；同时 runner 在 eager/waves 模式按 manifest slot 数重建 plan（`21e5e05`）。使用 13-layer/32-slot manifest 重试仍在首个 Main Cache allocation 处 OOM（`artifacts/20260914T-real11-latchmoe-eager32-r1`，44.35 GiB 已分配、仅约 27 MiB 可用），因此 native seam 尚无真实全模型执行证据。
 - Step 5 正式三轮性能和 Step 6 最终审计尚不能执行：缺少可运行的 native oracle 和 LatchMoE production seam，无法满足三方 exact-token gate 及可比性能合同。上述失败 case 均保留，未覆盖冻结实验。
 
 ## 推荐实施顺序与停止点
