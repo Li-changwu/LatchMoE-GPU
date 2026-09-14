@@ -22,6 +22,11 @@ from vllm_latchmoe_cuda.correctness import (
     run_vllm_greedy,
 )
 from vllm_latchmoe_cuda.manifest import OffloadManifest
+from vllm_latchmoe_cuda.manifest import build_identity_lock, serialize_identity_lock
+from vllm_latchmoe_cuda.residency_plan import (
+    build_residency_plan,
+    serialize_residency_plan,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +48,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("uva", "latchmoe-eager", "latchmoe-piecewise", "latchmoe-waves"),
+        choices=("native", "uva", "latchmoe-eager", "latchmoe-piecewise", "latchmoe-waves"),
     )
     parser.add_argument(
         "--kind", choices=tuple(kind.value for kind in RunKind), required=True
@@ -147,6 +152,16 @@ def _offload_telemetry(
     mode: CorrectnessMode, manifest: OffloadManifest, profile_path: Path
 ) -> dict[str, object]:
     events = _profile_events(profile_path)
+    if mode.name == "native":
+        return {
+            "schema_version": 1,
+            "mode": mode.name,
+            "implementation": "vllm-native-full-resident",
+            "manifest_bytes": 0,
+            "residual_uva_bytes": 0,
+            "actual_offload_bytes": 0,
+            "configured_budget_bytes": 0,
+        }
     if mode.name == "uva":
         matches = [event for event in events if event.get("event") == "stock_uva"]
         if len(matches) != 1:
@@ -210,7 +225,12 @@ def _offload_telemetry(
 
 
 def _worker_environment(
-    mode: CorrectnessMode, manifest_path: Path, profile_path: Path
+    mode: CorrectnessMode,
+    manifest_path: Path,
+    profile_path: Path,
+    *,
+    plan_json: str | None = None,
+    identity_lock_json: str | None = None,
 ) -> dict[str, str]:
     environment = os.environ.copy()
     for key in (
@@ -220,6 +240,8 @@ def _worker_environment(
         "VLLM_LATCHMOE_TELEMETRY_PATH",
         "VLLM_LATCHMOE_GRAPH_MODE",
         "VLLM_LATCHMOE_WAVE_SLOTS",
+        "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON",
+        "VLLM_LATCHMOE_IDENTITY_LOCK_JSON",
     ):
         environment.pop(key, None)
     environment.update(
@@ -239,8 +261,14 @@ def _worker_environment(
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
             }
         )
+        if plan_json is not None:
+            environment["VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"] = plan_json
+        if identity_lock_json is not None:
+            environment["VLLM_LATCHMOE_IDENTITY_LOCK_JSON"] = identity_lock_json
         if mode.name == "latchmoe-piecewise":
             environment["VLLM_LATCHMOE_GRAPH_MODE"] = "piecewise"
+        else:
+            environment["VLLM_LATCHMOE_GRAPH_MODE"] = "eager"
     else:
         environment["VLLM_LATCHMOE_TELEMETRY_PATH"] = str(profile_path)
     return environment
@@ -250,6 +278,33 @@ def _execute_driver(args, run: ArtifactRun) -> None:
     manifest = OffloadManifest.load(args.manifest)
     manifest.validate_model_files()
     mode = resolve_correctness_mode(args.mode)
+    plan_json = None
+    identity_lock_json = None
+    if mode.backend == "latchmoe":
+        config = json.loads((Path(manifest.model.path) / "config.json").read_text())
+        config["model_path"] = manifest.model.path
+        config["revision"] = manifest.model.revision
+        plan = build_residency_plan(
+            13.5,
+            config,
+            max_capture_size=CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE,
+            top_k=int(config.get("num_experts_per_tok", 8)),
+            device_total_bytes=48 << 30,
+            kv_reserve_bytes=args.kv_cache_memory_bytes,
+        )
+        if tuple(plan.offloaded_layer_ids) != tuple(manifest.layer_ids):
+            raise RuntimeError(
+                "correctness manifest layers do not match midpoint residency plan: "
+                f"plan={plan.offloaded_layer_ids}, manifest={manifest.layer_ids}"
+            )
+        plan_json = serialize_residency_plan(plan)
+        identity_lock_json = serialize_identity_lock(
+            build_identity_lock(
+                plan,
+                ["--model", manifest.model.path, "--revision", manifest.model.revision],
+            )
+        )
+        run.write_json("residency_plan.json", plan.to_jsonable())
     run.write_json("environment.json", _environment())
     run.write_json(
         "contract.json",
@@ -312,6 +367,8 @@ def _execute_driver(args, run: ArtifactRun) -> None:
         mode,
         args.manifest.resolve(),
         profile_path.resolve(),
+        plan_json=plan_json,
+        identity_lock_json=identity_lock_json,
     )
     with (
         (run.path / "stdout.log").open("w", encoding="utf-8") as stdout,

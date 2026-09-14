@@ -55,6 +55,7 @@ def _result(mode: str, token_ids: list[list[int]]) -> dict[str, object]:
 @pytest.mark.parametrize(
     ("mode", "backend", "enforce_eager", "expect_waves"),
     [
+        ("native", "native", True, False),
         ("uva", "uva", True, False),
         ("latchmoe-eager", "latchmoe", True, False),
         ("latchmoe-piecewise", "latchmoe", False, False),
@@ -133,7 +134,7 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     assert latchmoe["VLLM_LATCHMOE_MANIFEST"] == str(manifest_path)
     assert latchmoe["VLLM_LATCHMOE_PROFILE_PATH"] == str(profile_path)
     assert "VLLM_LATCHMOE_TELEMETRY_PATH" not in latchmoe
-    assert "VLLM_LATCHMOE_GRAPH_MODE" not in latchmoe
+    assert latchmoe["VLLM_LATCHMOE_GRAPH_MODE"] == "eager"
     assert piecewise["VLLM_LATCHMOE_GRAPH_MODE"] == "piecewise"
     assert piecewise["VLLM_DISABLE_COMPILE_CACHE"] == "1"
     assert "VLLM_LATCHMOE_WAVE_SLOTS" not in piecewise
