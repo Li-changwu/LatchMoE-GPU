@@ -58,6 +58,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompts-json", type=Path)
     parser.add_argument("--reference-json", type=Path)
     parser.add_argument("--max-tokens", type=int, default=16)
+    parser.add_argument(
+        "--offload-gib",
+        type=float,
+        default=13.5,
+        help="requested routed-expert residency budget used to rebuild the plan",
+    )
     parser.add_argument("--max-model-len", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.98)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=256 * 1024 * 1024)
@@ -73,6 +79,7 @@ def _worker_parser() -> argparse.ArgumentParser:
     parser.add_argument("--result-json", type=Path, required=True)
     parser.add_argument("--profile-jsonl", type=Path, required=True)
     parser.add_argument("--max-tokens", type=int, required=True)
+    parser.add_argument("--offload-gib", type=float, required=True)
     parser.add_argument("--max-model-len", type=int, required=True)
     parser.add_argument("--gpu-memory-utilization", type=float, required=True)
     parser.add_argument("--kv-cache-memory-bytes", type=int, required=True)
@@ -284,11 +291,20 @@ def _execute_driver(args, run: ArtifactRun) -> None:
         config = json.loads((Path(manifest.model.path) / "config.json").read_text())
         config["model_path"] = manifest.model.path
         config["revision"] = manifest.model.revision
+        top_k = int(config.get("num_experts_per_tok", 8))
+        capture_size = CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE
+        if mode.name != "latchmoe-piecewise" and manifest.num_slots < capture_size * top_k:
+            # Eager/waves artifacts may intentionally use a smaller cache than
+            # the piecewise capture contract. Keep the immutable plan aligned
+            # with that manifest instead of silently allocating extra slots.
+            capture_size = max(1, manifest.num_slots // top_k)
         plan = build_residency_plan(
-            13.5,
+            # Keep this explicit in the artifact contract: hardware-constrained
+            # reruns may use a larger complete-layer budget than the default.
+            args.offload_gib,
             config,
-            max_capture_size=CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE,
-            top_k=int(config.get("num_experts_per_tok", 8)),
+            max_capture_size=capture_size,
+            top_k=top_k,
             device_total_bytes=48 << 30,
             kv_reserve_bytes=args.kv_cache_memory_bytes,
         )
@@ -353,6 +369,8 @@ def _execute_driver(args, run: ArtifactRun) -> None:
         str(profile_path.resolve()),
         "--max-tokens",
         str(args.max_tokens),
+        "--offload-gib",
+        str(args.offload_gib),
         "--max-model-len",
         str(args.max_model_len),
         "--gpu-memory-utilization",
