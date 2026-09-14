@@ -9,7 +9,12 @@ from torch import nn
 from .core.waves import plan_main_cache_waves
 from .capabilities import describe_capabilities, validate_capabilities
 from .errors import NativeCombineError, StagingDuringCaptureError
-from .moe_seam import CudaMoeSeam, FunctionalMoeSeam, NativeWavePayload
+from .moe_seam import (
+    CudaMoeSeam,
+    FunctionalMoeSeam,
+    NativeWavePayload,
+    VllmModularMoeSeam,
+)
 from .runtime import CudaLayerRuntime, WaveExecutionTrace
 from .routing import active_experts_from_topk
 from .split_ops import (
@@ -337,7 +342,16 @@ def install_vllm_forward_adapter(
     )
     if getattr(runtime, "production_plan", False):
         seam = getattr(experts_module, "_latchmoe_seam", None)
-        if seam is None or not all(
+        if seam is None:
+            # vLLM 0.19.1 exposes the modular expert kernel and native
+            # TopKWeightAndReduce primitive, but not a public layer-level seam.
+            # Adapt those locked primitives to the wave ABI here.
+            seam = VllmModularMoeSeam(
+                experts_module=experts_module,
+                runtime=runtime,
+            )
+            experts_module._latchmoe_seam = seam
+        if not all(
             callable(getattr(seam, name, None))
             for name in ("run_expert_mlp", "combine")
         ):
