@@ -187,11 +187,14 @@ def _offload_telemetry(
             "configured_budget_bytes": int(event["cpu_offload_max_bytes"]),
         }
     matches = [event for event in events if event.get("event") == "residual_uva"]
-    if len(matches) != 1:
-        raise RuntimeError("LatchMoE run produced no unique residual_uva event")
-    event = matches[0]
+    if len(matches) > 1:
+        raise RuntimeError("LatchMoE run produced multiple residual_uva events")
+    # Production residency plans are CPU-first for selected routed experts and
+    # explicitly forbid a residual UVA offloader.  Legacy diagnostic manifests
+    # still emit the residual_uva event and retain that accounting below.
+    event = matches[0] if matches else None
     manifest_bytes = manifest.total_elements * 2
-    residual_bytes = int(event["cpu_offload_bytes"])
+    residual_bytes = int(event["cpu_offload_bytes"]) if event is not None else 0
     graph_telemetry: dict[str, object] = {}
     if mode.name == "latchmoe-piecewise":
         captures = [
@@ -225,7 +228,8 @@ def _offload_telemetry(
         "residual_uva_bytes": residual_bytes,
         "actual_offload_bytes": manifest_bytes + residual_bytes,
         "configured_budget_bytes": (
-            manifest_bytes + int(event["cpu_offload_max_bytes"])
+            manifest_bytes
+            + (int(event["cpu_offload_max_bytes"]) if event is not None else 0)
         ),
         **graph_telemetry,
     }
