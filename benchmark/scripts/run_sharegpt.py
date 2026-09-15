@@ -133,6 +133,7 @@ def _server_environment(
         "VLLM_LATCHMOE_PROFILE_PATH",
         "VLLM_LATCHMOE_TELEMETRY_PATH",
         "VLLM_LATCHMOE_GRAPH_MODE",
+        "VLLM_LATCHMOE_OVERLAP",
         "VLLM_LATCHMOE_WAVE_SLOTS",
         "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON",
         "VLLM_LATCHMOE_IDENTITY_LOCK_JSON",
@@ -165,6 +166,7 @@ def _server_environment(
                 "VLLM_LATCHMOE_MODE": "latchmoe",
                 "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
+                "VLLM_LATCHMOE_OVERLAP": "1",
             }
         )
         if plan_json is not None:
@@ -277,6 +279,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
     mode_contract = {
         **workload_contract,
         "mode": args.mode,
+        "overlap_enabled": args.mode.startswith("latchmoe"),
         "latchmoe_wave_slots": (
             min(manifest.num_slots, 32)
             if args.mode.startswith("latchmoe")
@@ -425,6 +428,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "repetitions": args.repetitions,
         "exploratory": args.exploratory,
         "final_result": not args.exploratory,
+        "overlap_enabled": args.mode.startswith("latchmoe"),
         "offload_telemetry": telemetry,
         "comparison_contract": {
             key: mode_contract[key]

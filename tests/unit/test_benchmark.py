@@ -3,6 +3,7 @@ from dataclasses import replace
 
 import pytest
 
+from benchmark.scripts.run_sharegpt import _server_environment
 from vllm_latchmoe_cuda.benchmark import (
     build_client_command,
     build_server_command,
@@ -155,6 +156,20 @@ def test_local_benchmark_environment_bypasses_proxies():
     assert environment["NO_PROXY"] == "127.0.0.1,localhost"
     assert environment["no_proxy"] == "127.0.0.1,localhost"
     assert environment["PATH"] == "/bin"
+
+
+def test_server_environment_locks_latchmoe_overlap(tmp_path, monkeypatch):
+    monkeypatch.setenv("VLLM_LATCHMOE_OVERLAP", "0")
+
+    latchmoe = _server_environment(
+        "latchmoe-eager", tmp_path / "manifest.json", tmp_path / "profile.jsonl"
+    )
+    uva = _server_environment(
+        "uva", tmp_path / "manifest.json", tmp_path / "profile.jsonl"
+    )
+
+    assert latchmoe["VLLM_LATCHMOE_OVERLAP"] == "1"
+    assert "VLLM_LATCHMOE_OVERLAP" not in uva
 
 
 def test_normalize_and_summarize_require_three_complete_fixed_length_runs():
