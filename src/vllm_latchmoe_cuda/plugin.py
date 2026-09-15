@@ -111,6 +111,29 @@ def _instrument_stock_uva(offloader):
     return offloader
 
 
+def _instrument_manifest_uva(offloader):
+    telemetry_path = os.getenv(TELEMETRY_ENV)
+    if not telemetry_path:
+        return offloader
+    writer = JsonlEventWriter(telemetry_path)
+    original_wrap = offloader.wrap_modules
+
+    def wrap_modules(self, modules_generator):
+        modules = original_wrap(modules_generator)
+        writer.write(
+            "stock_uva",
+            implementation=f"{type(self).__module__}.{type(self).__name__}",
+            cpu_offload_max_bytes=self.cpu_offload_max_bytes,
+            cpu_offload_bytes=self.cpu_offload_bytes,
+            selection="manifest_exact",
+        )
+        writer.close()
+        return modules
+
+    offloader.wrap_modules = MethodType(wrap_modules, offloader)
+    return offloader
+
+
 def load_manifest_from_env() -> OffloadManifest:
     value = os.getenv(MANIFEST_ENV)
     if not value:
@@ -161,7 +184,15 @@ def register() -> None:
             return offloader
         if mode == "uva":
             manifest = load_manifest_from_env()
-            return ManifestUVAOffloader(manifest)
+            raw_plan = os.getenv(RESIDENCY_PLAN_ENV)
+            raw_lock = os.getenv(IDENTITY_LOCK_ENV)
+            if raw_plan and raw_lock:
+                plan = deserialize_residency_plan(raw_plan)
+                identity_lock = deserialize_identity_lock(raw_lock)
+                validate_identity_lock(identity_lock, plan)
+                if tuple(manifest.layer_ids) != tuple(plan.offloaded_layer_ids):
+                    raise RuntimeError("UVA manifest and parent plan selected layers differ")
+            return _instrument_manifest_uva(ManifestUVAOffloader(manifest))
         raise ValueError(
             f"unsupported {MODE_ENV}={mode!r}; expected 'latchmoe' or 'uva'"
         )

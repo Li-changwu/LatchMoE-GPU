@@ -148,7 +148,17 @@ def _server_environment(
         }
     )
     if mode.startswith("uva"):
-        environment["VLLM_LATCHMOE_TELEMETRY_PATH"] = str(profile_path)
+        environment.update(
+            {
+                "VLLM_LATCHMOE_MODE": "uva",
+                "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
+                "VLLM_LATCHMOE_TELEMETRY_PATH": str(profile_path),
+            }
+        )
+        if plan_json is not None:
+            environment["VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"] = plan_json
+        if identity_lock_json is not None:
+            environment["VLLM_LATCHMOE_IDENTITY_LOCK_JSON"] = identity_lock_json
     else:
         environment.update(
             {
@@ -202,6 +212,8 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         raise ValueError("final measurements require at least 3 repetitions")
     if args.num_prompts != 50:
         raise ValueError("the frozen ShareGPT contract requires exactly 50 prompts")
+    if not args.exploratory and args.plan is None:
+        raise ValueError("final measurements require an immutable --plan")
     for name in ("output_len", "max_concurrency", "max_num_seqs"):
         if int(getattr(args, name)) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")

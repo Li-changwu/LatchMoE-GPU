@@ -32,6 +32,12 @@ class ManifestUVAOffloader(BaseOffloader):
             raise RuntimeError("controlled UVA baseline requires pinned UVA")
         self.first_layer_id = first_layer_id
         self.offloaded_parameter_names: set[str] = set()
+        self.cpu_offload_bytes = 0
+        self.cpu_offload_max_bytes = sum(
+            tensor.nbytes
+            for layer in manifest.layers
+            for tensor in layer.tensors
+        )
         self._wrapped = False
 
     def wrap_modules(
@@ -79,6 +85,7 @@ class ManifestUVAOffloader(BaseOffloader):
                 )
                 parameter.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 parameter._vllm_is_uva_offloaded = True
+                self.cpu_offload_bytes += parameter.numel() * parameter.element_size()
                 self.offloaded_parameter_names.add(
                     f"model.layers.{layer_id}.{layout.parameter_name}"
                 )
