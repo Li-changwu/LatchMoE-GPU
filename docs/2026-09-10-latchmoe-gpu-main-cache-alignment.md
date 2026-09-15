@@ -908,16 +908,16 @@ A6000 无法容纳 full-resident native，因此将其明确记录为 `hardware-
 
 固定相同模型/shards、prompt manifest、sampling、输出上限、并发、KV reserve、graph capture sizes、selected IDs 和预算 ledger。每个 backend 独立启动至少三轮，保存原始 JSONL、CUDA timeline、plan、source hash 和失败 case。不得删除 OOM、startup failure 或 non-comparable case。
 
-- [ ] **Step 6: 发布前最终审计**
+- [x] **Step 6: 发布前最终审计（受限两方）**
 
 ```bash
 python benchmark/scripts/verify_budget_contract.py \
-  --native artifacts/<run>/native \
   --uva artifacts/<run>/uva \
-  --latchmoe artifacts/<run>/latchmoe
+  --latchmoe artifacts/<run>/latchmoe \
+  --profile artifacts/<run>/latchmoe/profile.jsonl
 ```
 
-Expected: 输出 `PASS`，并显式列出 exact parameter set、HBM ledger、pair/combine counts、candidate/actual overlap 和 exact-token parity。
+Expected: 受 A6000 限制时输出 `PASS`，并显式列出 exact parameter set、等 HBM ledger、pair/combine counts、candidate/actual overlap 和两方 exact-token parity；full-resident native 继续标记为 `hardware-blocked`。
 
 ---
 
@@ -1085,6 +1085,16 @@ Task 12 统一 token-expert layout 实施与验收（2026-09-15）：
 - 三组继续使用 Task 11 冻结合同：`/root/models/Qwen3-30B-A3B-Instruct-2507`、同一 20-layer midpoint manifest、32 slots、22 GiB plan、256 MiB KV reserve、eager graph policy、4 个 sequential requests 和每请求 16 tokens。serial/async 对 exact-UVA 均为 `4/4` 逐 token 全等，实际 offload bytes 均为 `24,159,191,040`，source state 匹配且 `contract_errors=[]`。
 - serial 和 async profile 各包含 78 次 `main_cache_waves`；两者均为 78/78 声明 `pair_layout="unified_token_expert_v1"` 和 `pair_layout_build_count=1`。async 另有 104 个 `overlap_candidate=true` 且 `actual_overlap=true` 的有效 CUDA event 窗口。由 correctness driver 调用的 telemetry 读取器已对全部 Main Cache event 执行 fail-closed layout 校验。
 
+正式三轮 benchmark 等 HBM 重跑（2026-09-15）：
+
+- 为消除 Main Cache 带来的 HBM 变量，新增真实 UVA reservation：UVA 在 GPU 上持有与 LatchMoE 20-layer/32-slot dynamic cache 相同的 `6,039,797,760` bytes；两侧 `backend_hbm_cache_bytes`、resident weight、KV reserve、graph policy、selected IDs、parameter names、workload hash 和 source identity 均一致。新合同提交为 `0092ba0`，source state 为 `da620cfa4faabb171ea62e3f27a02cc609ea03bcfcdd2f7c61ee88dc2b3ee0ad`。
+- 固定 workload：`/root/models/Qwen3-30B-A3B-Instruct-2507`，manifest `benchmark/manifests/offload_manifest.qwen3-root.midpoint20.graph32.20260914.json`，ShareGPT dataset SHA-256 `35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4`，50 prompts，2 warmup + 3 measurement，最大输出 128，`ignore_eos=true`，temperature 0，seed 42，并发 8，`max_num_seqs=8`，`max_model_len=2048`，`max_num_batched_tokens=512`，KV reserve 256 MiB，eager graph，prefix cache 关闭。UVA 与 LatchMoE 实际 offload 均为 `24,159,191,040` bytes。
+- Artifact：UVA `artifacts/20260915T-formal-task12-equalhbm-uva-r1`，LatchMoE `artifacts/20260915T-formal-task12-equalhbm-latchmoe-r1`，比较 `artifacts/20260915T-formal-task12-equalhbm-comparison.json`，审计 `artifacts/20260915T-formal-task12-equalhbm-budget-verification.json`。两组各 3 轮均 `completed=50`、`failed=0`、`total_output_tokens=6400`，SHA256SUMS 全部通过；budget verifier 输出 `PASS`。
+- 三轮原始 output throughput（tok/s）：UVA `8.925, 9.096, 8.989`，中位数 `8.989`、标准差 `0.087`；LatchMoE async `24.460, 23.820, 24.537`，中位数 `24.460`、标准差 `0.394`。中位数吞吐为 UVA 的 `2.721x`（`+172.10%`），request throughput 同比例提升。
+- 延迟中位数：median TPOT 为 UVA `649.95 ms`、LatchMoE `278.91 ms`，降低 `57.09%`；mean TPOT 为 `682.13 -> 272.33 ms`，降低 `60.08%`。median TTFT 为 `12,343.62 -> 2,567.44 ms`，降低 `79.20%`；p99 TTFT 为 `93,975.95 -> 22,764.59 ms`，降低 `75.78%`。三轮吞吐离散系数分别约 `0.96%` 和 `1.62%`，没有单轮异常主导中位数。
+- LatchMoE profile verifier 检查 123,379 个事件：42,450 个 Main Cache forward 全部为统一 layout，80,869/80,869 个 overlap candidate 具有真实 event window，`temporary_bank_bytes=0`。该结果支持“显式 H2D 到 Main Cache + hit reuse + event-confirmed overlap”优于 UVA 直接从 pinned host 权重访问的路径，但不能把全部收益单独归因于 layout；layout 本身的 3.4x 微基准仍只是组织阶段证据。
+- 之前 `artifacts/20260915T-formal-task12-uva-exact-r1` 与 `artifacts/20260915T-formal-task12-latchmoe-async-r1` 没有 UVA reservation，只能作为 equal-offload、非 equal-HBM 的历史记录；本节正式结论只采用 equal-HBM 新 artifact。full-resident native 仍因 A6000 显存不足保持 `hardware-blocked`，结论范围为受限 UVA/LatchMoE 对照，不扩展为 native-equivalent。
+
 ## 推荐实施顺序与停止点
 
 1. Task 1-3 先解决“选哪些层、如何进入 worker、存储属于谁”。完成后应能启动逐层 cache，但还不宣称 overflow 完成。
@@ -1116,4 +1126,4 @@ Task 12 统一 token-expert layout 实施与验收（2026-09-15）：
 - [x] native/UVA/LatchMoE exact-token gate 实现为逐请求 token ID 全等；未通过真实 full-model gate 前不发布性能结论。
 - [x] A6000 受限门槛中 exact UVA、serial LatchMoE、async LatchMoE 在冻结 prompt manifest 上通过 exact-token parity，且 async 有真实 overlap event。
 - [ ] full-resident native parity 因 A6000 显存限制保持 `hardware-blocked`；不得将受限两方结果标记为 native-equivalent。
-- [ ] 新性能结果满足等预算可比参数集合和 HBM ledger；本轮受限两方结果及不可比原因已保留。
+- [x] 新性能结果满足等预算可比参数集合和 HBM ledger；等 HBM 三轮结果、比较报告、审计输出及此前非等 HBM 历史记录均已保留。
