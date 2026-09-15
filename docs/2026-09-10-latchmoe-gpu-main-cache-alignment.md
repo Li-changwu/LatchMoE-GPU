@@ -921,6 +921,46 @@ Expected: 输出 `PASS`，并显式列出 exact parameter set、HBM ledger、pai
 
 ---
 
+### Task 12: 统一 token-expert layout 后再执行多波分拨
+
+**Files:**
+
+- Modify: `src/vllm_latchmoe_cuda/core/waves.py`
+- Modify: `src/vllm_latchmoe_cuda/runner_adapter.py`
+- Modify: `src/vllm_latchmoe_cuda/moe_seam.py`
+- Modify: `src/vllm_latchmoe_cuda/benchmark.py`
+- Modify: `benchmark/scripts/verify_budget_contract.py`
+- Modify: `tests/unit/test_waves.py`
+- Modify: `tests/unit/test_benchmark.py`
+- Modify: `tests/unit/test_budget_contract.py`
+- Modify: `tests/integration/test_runner_adapter.py`
+
+- [x] **Step 1: 定义统一 layout 合同**
+
+router 每层仍只调用一次。得到 `topk_ids/topk_weights` 和 hit-first wave specs 后，必须在任何 wave H2D/compute 之前构建一个不可变的 `MainCacheTokenExpertLayout`。layout 为每个 routed pair 保存原始 `pair_offset`、`token_index`、`topk_position`、logical expert ID 和 router weight，并按 wave ID 稳定分桶。所有 wave 的 pair offsets 必须无重复、无遗漏且总数严格等于 `num_tokens * top_k`。
+
+- [x] **Step 2: 执行循环只消费 layout**
+
+旧路径在每个 wave 内为每个 expert 重复扫描完整 flattened `topk_ids`。新路径使用一次 `expert -> wave` device lookup、一次 stable bucket order 和一次分段，随后各 wave 直接消费自己的连续 descriptor。slot 发布后只对该 wave 的 logical IDs 查询 `log2phy`；vLLM modular seam 直接接收 layout 的 logical IDs，不再对每个 wave 遍历全部 logical experts 来反向恢复 ID。router、hit-first 顺序、victim 顺序、H2D、每层一次 native combine 和原始 pair reduction 顺序均不得改变。
+
+- [x] **Step 3: 增加可审计 profile 和 fail-closed 验收**
+
+每个 `main_cache_waves` event 必须记录：
+
+```text
+pair_layout == "unified_token_expert_v1"
+pair_layout_build_count == 1
+pair_count == num_tokens * top_k
+```
+
+benchmark telemetry 和 `verify_budget_contract.py` 必须拒绝缺少统一 layout、schema 不符或同一 forward 重建多次 layout 的 Main Cache 证据。
+
+- [ ] **Step 4: 回归和真实模型验收**
+
+先运行 pair coverage、native combine、serial/async overlap 和 failure lifecycle 测试；再使用 Task 11 的冻结 A6000 correctness workload 重跑 exact-UVA、serial Main Cache 和 async Main Cache。serial/async 必须继续逐 token 全等，async 必须继续产生真实 overlap event，且所有 Main Cache wave event 都必须声明一次统一 layout 构建。性能收益只由新的同合同三轮 benchmark 决定，本任务不复用旧正式数字声称加速。
+
+---
+
 ## 本次实施进展与验收记录
 
 截至 2026-09-12，Task 1-9 已按功能边界完成并拆分提交：
