@@ -955,7 +955,7 @@ pair_count == num_tokens * top_k
 
 benchmark telemetry 和 `verify_budget_contract.py` 必须拒绝缺少统一 layout、schema 不符或同一 forward 重建多次 layout 的 Main Cache 证据。
 
-- [ ] **Step 4: 回归和真实模型验收**
+- [x] **Step 4: 回归和真实模型验收**
 
 先运行 pair coverage、native combine、serial/async overlap 和 failure lifecycle 测试；再使用 Task 11 的冻结 A6000 correctness workload 重跑 exact-UVA、serial Main Cache 和 async Main Cache。serial/async 必须继续逐 token 全等，async 必须继续产生真实 overlap event，且所有 Main Cache wave event 都必须声明一次统一 layout 构建。性能收益只由新的同合同三轮 benchmark 决定，本任务不复用旧正式数字声称加速。
 
@@ -1076,6 +1076,15 @@ Task 11 Step 4 A6000 受限验收更新（2026-09-15）：
 - async profile 包含 78 次 `main_cache_waves` 和 104 个 `actual_overlap=true` 窗口，证明验收实际执行了 H2D/compute overlap，而不是只打开配置开关。
 - 保留数值敏感失败证据：`artifacts/20260915T-correctness-latchmoe-eager-20layer-r2` 的默认开放式 prompt 在第 10 个生成 token 分叉；`artifacts/20260915T-task11-step4-latchmoe-serial-r1` 的 5-request 候选集中同类开放式 prompt 从首 token 分叉。其余覆盖请求全等。这说明 multi-wave 与 full-shape UVA 的 BF16 kernel 排序可能在低 margin token 上改变 argmax；本次通过结论严格限定为冻结 manifest 上的 `two_way_exact_token_parity`，不扩大为任意 prompt 或 native-equivalent 结论。
 
+Task 12 统一 token-expert layout 实施与验收（2026-09-15）：
+
+- `d2bcdad` `feat: unify token expert layout before wave dispatch`：每层 forward 在任何 H2D/compute 前，用一次 `expert -> wave` lookup 和 stable bucket 构造统一 layout；执行循环只消费各 wave 的连续 descriptor，vLLM seam 直接使用 logical IDs，并由 telemetry/profile verifier 强制检查 schema 和单次构建。
+- `cc9a0bc` `docs: define unified wave layout acceptance`：固化 layout、执行语义、profile 字段和真实模型门槛。完整回归 `/root/latchmoe-venv/bin/python -m pytest -q tests/unit tests/gpu tests/integration` 通过 `221 passed, 20 warnings`，`git diff --check` 通过。
+- A6000 小张量组织开销对比使用 512 tokens、top-k 8、128 experts、32 slots：旧 per-wave mask 为 `1.9417 ms`，统一 layout 为 `0.5663 ms`，layout 组织阶段约快 `3.4x`。这只是 layout microbenchmark，不作为端到端吞吐加速结论；端到端收益仍需新的同合同三轮 benchmark。
+- 真模型三组运行均来自干净 commit `cc9a0bc`，source state 均为 `b40cd13ee1e70f6fa092ec92b244829be18aa9dbb59cee25c11c817f8a7b48c9`：exact-UVA 为 `artifacts/20260915T-task12-uva-exact-final`，serial 为 `artifacts/20260915T-task12-latchmoe-serial-final`，async 为 `artifacts/20260915T-task12-latchmoe-async-final`。
+- 三组继续使用 Task 11 冻结合同：`/root/models/Qwen3-30B-A3B-Instruct-2507`、同一 20-layer midpoint manifest、32 slots、22 GiB plan、256 MiB KV reserve、eager graph policy、4 个 sequential requests 和每请求 16 tokens。serial/async 对 exact-UVA 均为 `4/4` 逐 token 全等，实际 offload bytes 均为 `24,159,191,040`，source state 匹配且 `contract_errors=[]`。
+- serial 和 async profile 各包含 78 次 `main_cache_waves`；两者均为 78/78 声明 `pair_layout="unified_token_expert_v1"` 和 `pair_layout_build_count=1`。async 另有 104 个 `overlap_candidate=true` 且 `actual_overlap=true` 的有效 CUDA event 窗口。由 correctness driver 调用的 telemetry 读取器已对全部 Main Cache event 执行 fail-closed layout 校验。
+
 ## 推荐实施顺序与停止点
 
 1. Task 1-3 先解决“选哪些层、如何进入 worker、存储属于谁”。完成后应能启动逐层 cache，但还不宣称 overflow 完成。
@@ -1098,6 +1107,7 @@ Task 11 Step 4 A6000 受限验收更新（2026-09-15）：
 - [x] 生产 profile 中 `temporary_bank_bytes == 0`。
 - [x] hit-first、真实 victim replacement、owner/generation/state lease 均有测试证据。
 - [x] router 每层每次 forward 一次，pair coverage 严格完整。
+- [x] 多波执行前只构建一次统一 token-expert layout；各 wave 只消费连续 descriptor，profile 中 schema、构建次数和 pair count 可审计。
 - [x] 每层 forward 只有一次 native combine seam 调用；缺少锁定 hook 时 fail closed，不存在生产 `index_add_` combine。
 - [x] `h=0`、`h=C<P` 不产生 overlap claim；partial-hit 只在下一 wave 能装入 idle slots 时产生 candidate，并记录 H2D/compute event 窗口和 `actual_overlap`。
 - [x] 异常使 runtime poisoned，并在 shutdown 时 drain 所有在途 CUDA 工作；重复 close 幂等。
