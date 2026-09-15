@@ -87,6 +87,137 @@ class MainCacheWaveSpec:
         return self.wave_type == "hit"
 
 
+@dataclass(frozen=True)
+class MainCacheWaveLayout:
+    """One contiguous wave slice from a unified token-expert layout."""
+
+    wave_id: int
+    experts: tuple[int, ...]
+    pair_offsets: Any
+    token_indices: Any
+    topk_positions: Any
+    logical_ids: Any
+    pair_weights: Any
+
+
+@dataclass(frozen=True)
+class MainCacheTokenExpertLayout:
+    """All routed pairs organized once before Main Cache wave execution."""
+
+    schema: str
+    top_k: int
+    num_tokens: int
+    pair_offsets: Any
+    dispatch_order: Any
+    waves: tuple[MainCacheWaveLayout, ...]
+
+    @property
+    def pair_count(self) -> int:
+        return int(self.pair_offsets.numel())
+
+
+def build_main_cache_token_expert_layout(
+    topk_ids,
+    topk_weights,
+    specs: Sequence[MainCacheWaveSpec],
+    *,
+    num_experts: int,
+) -> MainCacheTokenExpertLayout:
+    """Stable-bucket every routed pair into its wave with one global layout."""
+    import torch
+
+    if topk_ids.ndim != 2 or topk_ids.numel() == 0:
+        raise ValueError("routing tensors must be non-empty rank-2 tensors")
+    if topk_ids.shape != topk_weights.shape:
+        raise ValueError("topk_ids and topk_weights must have the same shape")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("topk_ids must use an integer dtype")
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+    if not specs:
+        raise PairIntegrityError("main cache layout requires at least one wave")
+
+    wave_by_expert = torch.full(
+        (num_experts,), -1, dtype=torch.long, device=topk_ids.device
+    )
+    assigned: set[int] = set()
+    for expected_wave_id, spec in enumerate(specs):
+        if spec.wave_id != expected_wave_id:
+            raise PairIntegrityError("main cache wave ids must be contiguous")
+        if not spec.experts:
+            raise PairIntegrityError("main cache waves cannot be empty")
+        duplicate = assigned.intersection(spec.experts)
+        if duplicate:
+            raise PairIntegrityError(
+                f"experts assigned to multiple waves: {sorted(duplicate)}"
+            )
+        if any(expert < 0 or expert >= num_experts for expert in spec.experts):
+            raise ValueError(f"invalid expert ids in wave {spec.wave_id}")
+        assigned.update(spec.experts)
+        expert_tensor = torch.tensor(
+            spec.experts, dtype=torch.long, device=topk_ids.device
+        )
+        wave_by_expert[expert_tensor] = spec.wave_id
+
+    top_k = int(topk_ids.shape[1])
+    flat_ids = topk_ids.reshape(-1).long()
+    flat_weights = topk_weights.reshape(-1)
+    pair_offsets = torch.arange(
+        flat_ids.numel(), dtype=torch.long, device=topk_ids.device
+    )
+    pair_wave_ids = wave_by_expert.index_select(0, flat_ids)
+    invalid_bucket = len(specs)
+    bucket_ids = torch.where(
+        pair_wave_ids >= 0,
+        pair_wave_ids,
+        torch.full_like(pair_wave_ids, invalid_bucket),
+    )
+    dispatch_order = torch.argsort(bucket_ids, stable=True)
+    ordered_offsets = pair_offsets.index_select(0, dispatch_order)
+    ordered_logical_ids = flat_ids.index_select(0, dispatch_order)
+    ordered_weights = flat_weights.index_select(0, dispatch_order)
+    bucket_counts = tuple(
+        int(value)
+        for value in torch.bincount(
+            bucket_ids, minlength=len(specs) + 1
+        ).cpu().tolist()
+    )
+    if bucket_counts[invalid_bucket]:
+        raise PairIntegrityError("token-expert layout contains an unassigned pair")
+    counts = bucket_counts[:invalid_bucket]
+    waves: list[MainCacheWaveLayout] = []
+    start = 0
+    for spec, count in zip(specs, counts, strict=True):
+        offsets = ordered_offsets.narrow(0, start, count)
+        logical_ids = ordered_logical_ids.narrow(0, start, count)
+        waves.append(
+            MainCacheWaveLayout(
+                wave_id=spec.wave_id,
+                experts=spec.experts,
+                pair_offsets=offsets,
+                token_indices=torch.div(offsets, top_k, rounding_mode="floor"),
+                topk_positions=torch.remainder(offsets, top_k),
+                logical_ids=logical_ids,
+                pair_weights=ordered_weights.narrow(0, start, count),
+            )
+        )
+        start += count
+    layout = MainCacheTokenExpertLayout(
+        schema="unified_token_expert_v1",
+        top_k=top_k,
+        num_tokens=int(topk_ids.shape[0]),
+        pair_offsets=pair_offsets,
+        dispatch_order=dispatch_order,
+        waves=tuple(waves),
+    )
+    assigned_pair_count = sum(
+        int(wave.pair_offsets.numel()) for wave in layout.waves
+    )
+    if assigned_pair_count != layout.pair_count:
+        raise PairIntegrityError("main cache token-expert layout lost routed pairs")
+    return layout
+
+
 def plan_main_cache_waves(
     active_experts: Iterable[int],
     capacity: int,

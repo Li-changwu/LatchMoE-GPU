@@ -3,8 +3,10 @@ import torch
 
 from vllm_latchmoe_cuda.core.waves import (
     ExactWavePlan,
+    MainCacheWaveSpec,
     PairDescriptor,
     WaveDescriptor,
+    build_main_cache_token_expert_layout,
     plan_device_exact_waves,
     plan_exact_waves,
     plan_transfer_issue_order,
@@ -208,3 +210,74 @@ def test_partial_hit_splits_first_miss_wave_to_fit_idle_slots():
         ("miss", (4, 5)),
     ]
     assert specs[0].overlap_candidate is True
+
+
+def test_main_cache_token_expert_layout_stably_buckets_all_pairs_once():
+    ids = torch.tensor([[3, 0], [2, 3], [1, 2]], dtype=torch.int64)
+    weights = torch.tensor([[0.6, 0.4], [0.7, 0.3], [0.8, 0.2]])
+    specs = plan_main_cache_waves(
+        active_experts=(3, 0, 2, 1), capacity=2, hit_experts=(3,)
+    )
+
+    layout = build_main_cache_token_expert_layout(
+        ids, weights, specs, num_experts=4
+    )
+
+    assert layout.schema == "unified_token_expert_v1"
+    assert layout.pair_count == ids.numel()
+    assert layout.dispatch_order.tolist() == [0, 3, 1, 2, 4, 5]
+    assert [wave.pair_offsets.tolist() for wave in layout.waves] == [
+        [0, 3],
+        [1],
+        [2, 4, 5],
+    ]
+    assert [wave.logical_ids.tolist() for wave in layout.waves] == [
+        [3, 3],
+        [0],
+        [2, 1, 2],
+    ]
+    assert [wave.token_indices.tolist() for wave in layout.waves] == [
+        [0, 1],
+        [0],
+        [1, 2, 2],
+    ]
+    assert [wave.topk_positions.tolist() for wave in layout.waves] == [
+        [0, 1],
+        [1],
+        [0, 0, 1],
+    ]
+    assert [wave.pair_weights.tolist() for wave in layout.waves] == [
+        pytest.approx([0.6, 0.3]),
+        pytest.approx([0.4]),
+        pytest.approx([0.7, 0.8, 0.2]),
+    ]
+    assert sorted(
+        offset
+        for wave in layout.waves
+        for offset in wave.pair_offsets.tolist()
+    ) == list(range(ids.numel()))
+
+
+def test_main_cache_token_expert_layout_rejects_duplicate_wave_assignment():
+    ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    weights = torch.ones_like(ids, dtype=torch.float32)
+    specs = (
+        MainCacheWaveSpec(0, "hit", (0,)),
+        MainCacheWaveSpec(1, "miss", (0, 1)),
+    )
+
+    with pytest.raises(PairIntegrityError, match="multiple waves"):
+        build_main_cache_token_expert_layout(
+            ids, weights, specs, num_experts=2
+        )
+
+
+def test_main_cache_token_expert_layout_rejects_unassigned_pair():
+    ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    weights = torch.ones_like(ids, dtype=torch.float32)
+    specs = (MainCacheWaveSpec(0, "hit", (0,)),)
+
+    with pytest.raises(PairIntegrityError, match="unassigned pair"):
+        build_main_cache_token_expert_layout(
+            ids, weights, specs, num_experts=2
+        )

@@ -214,6 +214,30 @@ def test_telemetry_proves_offload_bytes_and_device_planner(tiny_manifest, tmp_pa
     assert telemetry["cuda_device_planner_events"] == 1
 
 
+def test_main_cache_telemetry_requires_one_unified_pair_layout(
+    tiny_manifest, tmp_path
+):
+    profile = tmp_path / "profile.jsonl"
+    event = {
+        "event": "main_cache_waves",
+        "pair_count": 8,
+        "pair_layout": "unified_token_expert_v1",
+        "pair_layout_build_count": 1,
+    }
+    profile.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    telemetry = read_offload_telemetry(
+        "latchmoe-eager", tiny_manifest, profile
+    )
+
+    assert telemetry["main_cache_wave_events"] == 1
+    assert telemetry["unified_pair_layout_events"] == 1
+    event["pair_layout_build_count"] = 2
+    profile.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unified token-expert layout"):
+        read_offload_telemetry("latchmoe-eager", tiny_manifest, profile)
+
+
 def test_full_capacity_eager_telemetry_requires_every_direct_slot_layer(
     tiny_manifest, tmp_path
 ):

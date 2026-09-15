@@ -471,6 +471,15 @@ def read_offload_telemetry(
     main_cache_events = [
         event for event in events if event.get("event") == "main_cache_waves"
     ]
+    if any(
+        event.get("pair_layout") != "unified_token_expert_v1"
+        or int(event.get("pair_layout_build_count", 0)) != 1
+        or int(event.get("pair_count", 0)) <= 0
+        for event in main_cache_events
+    ):
+        raise RuntimeError(
+            "not every Main Cache wave used one unified token-expert layout"
+        )
     direct_slot_events = [
         event for event in events if event.get("event") == "direct_slots"
     ]
@@ -517,6 +526,7 @@ def read_offload_telemetry(
         + (int(event["cpu_offload_max_bytes"]) if event is not None else 0),
         "exact_wave_events": len(wave_events),
         "main_cache_wave_events": len(main_cache_events),
+        "unified_pair_layout_events": len(main_cache_events),
         "cuda_device_planner_events": len(device_wave_events),
         "direct_slot_events": len(direct_slot_events),
         **graph_telemetry,

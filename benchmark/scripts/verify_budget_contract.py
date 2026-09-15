@@ -110,6 +110,11 @@ def validate_profile_events(
                 errors.append("pair count is incomplete")
         if name in {"combine", "native_combine"} and int(event.get("combine_count", 1)) != 1:
             errors.append("combine count must be one per layer")
+        if name == "main_cache_waves" and (
+            event.get("pair_layout") != "unified_token_expert_v1"
+            or int(event.get("pair_layout_build_count", 0)) != 1
+        ):
+            errors.append("Main Cache forward must build one unified pair layout")
         candidate = bool(event.get("overlap_candidate"))
         actual = bool(event.get("actual_overlap"))
         if candidate and actual:
@@ -134,6 +139,11 @@ def validate_profile_events(
         "temporary_bank_bytes": sum(int(e.get("temporary_bank_bytes", 0) or 0) for e in events),
         "overlap_candidates": sum(bool(e.get("overlap_candidate")) for e in events),
         "actual_overlaps": sum(bool(e.get("actual_overlap")) for e in events),
+        "unified_pair_layouts": sum(
+            e.get("event") == "main_cache_waves"
+            and e.get("pair_layout") == "unified_token_expert_v1"
+            for e in events
+        ),
     }
 
 

@@ -121,6 +121,10 @@ def test_instance_adapter_routes_overflow_through_original_kernel_per_wave(
     assert runtime.last_wave_trace.compute_order == (0, 1)
     assert runtime.event_writer.events[0]["event"] == "main_cache_waves"
     assert runtime.event_writer.events[0]["combine_count"] == 1
+    assert runtime.event_writer.events[0]["pair_layout"] == (
+        "unified_token_expert_v1"
+    )
+    assert runtime.event_writer.events[0]["pair_layout_build_count"] == 1
 
 
 def test_regular_request_reloads_after_overflow_overwrites_main_slots(

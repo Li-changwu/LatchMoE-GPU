@@ -2,6 +2,7 @@ import pytest
 
 from benchmark.scripts.verify_budget_contract import (
     BudgetContractError,
+    validate_profile_events,
     validate_runtime_ledger,
 )
 from vllm_latchmoe_cuda.benchmark import (
@@ -108,3 +109,16 @@ def test_runtime_ledger_rejects_temporary_bank_and_wrong_dynamic_bytes():
             slots_per_layer=2,
             bytes_per_expert=4,
         )
+
+
+def test_profile_requires_one_unified_layout_per_main_cache_forward():
+    event = {
+        "event": "main_cache_waves",
+        "pair_layout": "unified_token_expert_v1",
+        "pair_layout_build_count": 1,
+    }
+
+    assert validate_profile_events([event])["unified_pair_layouts"] == 1
+    event["pair_layout"] = "per_wave_mask"
+    with pytest.raises(BudgetContractError, match="unified pair layout"):
+        validate_profile_events([event])

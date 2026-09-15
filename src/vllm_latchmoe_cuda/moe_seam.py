@@ -24,6 +24,7 @@ class CudaMoeSeam(Protocol):
         self,
         *,
         hidden_states: torch.Tensor,
+        logical_ids: torch.Tensor,
         physical_ids: torch.Tensor,
         slot_w13: torch.Tensor,
         slot_w2: torch.Tensor,
@@ -60,6 +61,7 @@ class FunctionalMoeSeam:
         self,
         *,
         hidden_states: torch.Tensor,
+        logical_ids: torch.Tensor,
         physical_ids: torch.Tensor,
         slot_w13: torch.Tensor,
         slot_w2: torch.Tensor,
@@ -119,23 +121,11 @@ class VllmModularMoeSeam:
 
         self._reducer = TopKWeightAndReduceContiguous()
 
-    def _logical_ids(self, physical_ids: torch.Tensor) -> torch.Tensor:
-        mapping = self.runtime.log2phy
-        logical = torch.full_like(physical_ids, -1)
-        for expert_id in range(self.runtime.num_experts):
-            logical = torch.where(
-                mapping[expert_id] == physical_ids,
-                torch.full_like(logical, expert_id),
-                logical,
-            )
-        if bool(torch.any(logical < 0)):
-            raise NativeCombineError("Main Cache physical expert has no logical owner")
-        return logical
-
     def run_expert_mlp(
         self,
         *,
         hidden_states: torch.Tensor,
+        logical_ids: torch.Tensor,
         physical_ids: torch.Tensor,
         slot_w13: torch.Tensor,
         slot_w2: torch.Tensor,
@@ -144,7 +134,7 @@ class VllmModularMoeSeam:
         apply = getattr(quant_method, "apply", None)
         if not callable(apply):
             raise NativeCombineError("vLLM modular quant method has no apply primitive")
-        logical_ids = self._logical_ids(physical_ids).reshape(-1, 1)
+        logical_ids = logical_ids.reshape(-1, 1)
         topk_weights = torch.ones(
             logical_ids.shape,
             dtype=torch.float32,
@@ -160,7 +150,9 @@ class VllmModularMoeSeam:
         if isinstance(output, tuple):
             output = output[-1]
         if not isinstance(output, torch.Tensor) or output.ndim != 2:
-            raise NativeCombineError("vLLM modular expert primitive returned an invalid shape")
+            raise NativeCombineError(
+                "vLLM modular expert primitive returned an invalid shape"
+            )
         return NativeWavePayload(
             outputs=output,
             pair_offsets=torch.empty(0, dtype=torch.long, device=output.device),

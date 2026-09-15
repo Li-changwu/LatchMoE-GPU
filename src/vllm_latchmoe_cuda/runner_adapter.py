@@ -6,7 +6,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .core.waves import plan_main_cache_waves
+from .core.waves import (
+    build_main_cache_token_expert_layout,
+    plan_main_cache_waves,
+)
 from .capabilities import describe_capabilities, validate_capabilities
 from .errors import NativeCombineError, StagingDuringCaptureError
 from .moe_seam import (
@@ -68,12 +71,18 @@ def execute_main_cache_waves(
                 "production LatchMoE requires the locked vLLM native combine seam"
             )
         seam = FunctionalMoeSeam(combine_fn=_diagnostic_scatter_combine)
-    flat_ids = topk_ids.reshape(-1).long()
-    pair_offsets = torch.arange(flat_ids.numel(), device=topk_ids.device, dtype=torch.long)
+    layout = build_main_cache_token_expert_layout(
+        topk_ids,
+        topk_weights,
+        specs,
+        num_experts=runtime.num_experts,
+    )
     payloads: list[NativeWavePayload] = []
     total_h2d_bytes = 0
     prefetched: PreparedMainCacheWave | None = None
-    for index, spec in enumerate(specs):
+    for index, (spec, wave_layout) in enumerate(
+        zip(specs, layout.waves, strict=True)
+    ):
         try:
             if prefetched is not None:
                 runtime.complete_pending_main_cache_computes()
@@ -98,16 +107,14 @@ def execute_main_cache_waves(
             )
             raise
         try:
-            mask = torch.zeros_like(flat_ids, dtype=torch.bool)
-            for expert in spec.experts:
-                mask |= flat_ids == expert
-            selected_offsets = pair_offsets[mask]
-            token_indices = torch.div(
-                selected_offsets, topk_ids.shape[1], rounding_mode="floor"
-            )
-            physical = runtime.log2phy.index_select(0, flat_ids[mask]).long()
+            physical = runtime.log2phy.index_select(
+                0, wave_layout.logical_ids
+            ).long()
             payload = seam.run_expert_mlp(
-                hidden_states=hidden_states.index_select(0, token_indices),
+                hidden_states=hidden_states.index_select(
+                    0, wave_layout.token_indices
+                ),
+                logical_ids=wave_layout.logical_ids,
                 physical_ids=physical,
                 slot_w13=runtime.slot_w13,
                 slot_w2=runtime.slot_w2,
@@ -126,8 +133,8 @@ def execute_main_cache_waves(
         payloads.append(
             NativeWavePayload(
                 outputs=payload.outputs,
-                pair_offsets=selected_offsets,
-                token_indices=token_indices,
+                pair_offsets=wave_layout.pair_offsets,
+                token_indices=wave_layout.token_indices,
             )
         )
         next_spec = specs[index + 1] if index + 1 < len(specs) else None
@@ -160,14 +167,14 @@ def execute_main_cache_waves(
         result = seam.combine(
             waves=payloads,
             topk_weights=topk_weights,
-            pair_offsets=pair_offsets,
+            pair_offsets=layout.pair_offsets,
             restore_shape=(hidden_states.shape[0], hidden_states.shape[1]),
         )
     except BaseException as exc:
         runtime.poison(exc, active_experts=active)
         raise
     runtime.last_wave_trace = WaveExecutionTrace(
-        pair_count=int(pair_offsets.numel()),
+        pair_count=layout.pair_count,
         compute_order=tuple(spec.wave_id for spec in specs),
         issue_order=tuple(spec.wave_id for spec in specs),
         buffer_by_wave=tuple((spec.wave_id, 0) for spec in specs),
@@ -176,7 +183,9 @@ def execute_main_cache_waves(
         runtime.event_writer.write(
             "main_cache_waves",
             layer_id=runtime.layer_id,
-            pair_count=int(pair_offsets.numel()),
+            pair_count=layout.pair_count,
+            pair_layout=layout.schema,
+            pair_layout_build_count=1,
             wave_count=len(specs),
             stage_mode=[spec.wave_type for spec in specs],
             h2d_bytes=total_h2d_bytes,
