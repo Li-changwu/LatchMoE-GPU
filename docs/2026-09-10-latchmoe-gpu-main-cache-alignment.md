@@ -1025,6 +1025,7 @@ Task 11 分层验收进展（2026-09-14）：
 - 根据 2026-09-14 决策，取消 full-resident native 基线，直接执行 UVA 与 LatchMoE 两方正式三轮服务实验。两组均使用 `/root/models/Qwen3-30B-A3B-Instruct-2507`、20-layer midpoint manifest、32 slots、50 条固定 ShareGPT 请求、128 token 上限、2 warmup + 3 measurement、并发 8。
 - UVA 三轮：`artifacts/20260914T-formal-uva-20layer-r1/summary.json`；LatchMoE 三轮：`artifacts/20260914T-formal-latchmoe-20layer-r1/summary.json`；对比：`artifacts/20260914T-formal-20layer-comparison.json`。LatchMoE 中位 output throughput 为 `17.47 tok/s`，UVA 为 `10.97 tok/s`，表面差异 `+59.24%`；中位 TPOT 为 `415.19 ms` 对 `535.05 ms`。
 - 该对比报告明确标记 `comparable_offload_bytes=false`（UVA `15,798,475,264` bytes，LatchMoE `24,159,191,040` bytes）和 `comparable_contract=false`（两轮 source identity 不同）。因此这些数字只能作为“受限两方正式运行记录”，不能作为等预算性能结论；Step 6 最终审计仍保持未完成。
+- 随后将正式 UVA 改为 `ManifestUVAOffloader` 精确消费 immutable plan，并完成新的三轮 exact-UVA workload：`artifacts/20260915T-formal-exact-uva-20layer-r1/summary.json`。profile 标记 `selection=manifest_exact`，实际 CPU offload 为 `24,159,191,040` bytes，与 LatchMoE Host Store 完全一致；三轮请求均完整成功。该 UVA artifact 使用 source commit `410d73e`，现有 LatchMoE 三轮 artifact 使用 `e2f073a`，因此仍需在同一 source commit 重跑 LatchMoE 后才能满足 source identity 合同；native token parity 仍因取消 full-resident baseline 而未执行。
 
 ## 推荐实施顺序与停止点
 
