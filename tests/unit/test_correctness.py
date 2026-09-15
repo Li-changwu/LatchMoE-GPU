@@ -21,18 +21,25 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def _result(mode: str, token_ids: list[list[int]]) -> dict[str, object]:
-    backend = "uva" if mode == "uva" else "latchmoe"
+    backend = "uva" if mode in {"uva", "uva-exact"} else "latchmoe"
     return {
         "schema_version": 1,
         "mode": mode,
         "backend": backend,
         "enforce_eager": mode != "latchmoe-piecewise",
         "expected_wave_event": mode == "latchmoe-waves",
+        "overlap_enabled": mode == "latchmoe-async",
         "manifest_sha256": "a" * 64,
         "model_revision": "revision-1",
         "dtype": "bfloat16",
         "tensor_parallel_size": 1,
         "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
+        "max_model_len": 512,
+        "kv_cache_memory_bytes": 256 * 1024 * 1024,
+        "plan_id": "plan-1",
+        "selected_layer_ids": [1, 3],
+        "identity_lock_sha256": "c" * 64,
+        "request_execution": "sequential",
         "prompts": ["alpha", "beta"],
         "sampling": {"temperature": 0.0, "max_tokens": 16, "seed": 0},
         "outputs": [
@@ -53,23 +60,26 @@ def _result(mode: str, token_ids: list[list[int]]) -> dict[str, object]:
 
 
 @pytest.mark.parametrize(
-    ("mode", "backend", "enforce_eager", "expect_waves"),
+    ("mode", "backend", "enforce_eager", "expect_waves", "overlap_enabled"),
     [
-        ("native", "native", True, False),
-        ("uva", "uva", True, False),
-        ("latchmoe-eager", "latchmoe", True, False),
-        ("latchmoe-piecewise", "latchmoe", False, False),
-        ("latchmoe-waves", "latchmoe", True, True),
+        ("native", "native", True, False, False),
+        ("uva", "uva", True, False, False),
+        ("uva-exact", "uva", True, False, False),
+        ("latchmoe-eager", "latchmoe", True, False, False),
+        ("latchmoe-async", "latchmoe", True, False, True),
+        ("latchmoe-piecewise", "latchmoe", False, False, False),
+        ("latchmoe-waves", "latchmoe", True, True, False),
     ],
 )
 def test_correctness_mode_has_explicit_backend_and_graph_policy(
-    mode, backend, enforce_eager, expect_waves
+    mode, backend, enforce_eager, expect_waves, overlap_enabled
 ):
     config = resolve_correctness_mode(mode)
 
     assert config.backend == backend
     assert config.enforce_eager is enforce_eager
     assert config.expect_waves is expect_waves
+    assert config.overlap_enabled is overlap_enabled
 
 
 def test_engine_kwargs_lock_target_and_piecewise_mode(tiny_manifest):
@@ -105,6 +115,18 @@ def test_engine_kwargs_enable_stock_uva_with_fixed_budget(tiny_manifest):
     assert kwargs["cpu_offload_gb"] == STOCK_UVA_CPU_OFFLOAD_GB == 14.0
 
 
+def test_engine_kwargs_enable_exact_uva_with_fixed_budget(tiny_manifest):
+    kwargs = build_engine_kwargs(
+        manifest=tiny_manifest,
+        mode=resolve_correctness_mode("uva-exact"),
+        max_model_len=512,
+        gpu_memory_utilization=0.98,
+        kv_cache_memory_bytes=256 * 1024 * 1024,
+    )
+
+    assert kwargs["cpu_offload_gb"] == STOCK_UVA_CPU_OFFLOAD_GB
+
+
 def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     from scripts.run_correctness import _worker_environment
 
@@ -118,8 +140,18 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     uva = _worker_environment(
         resolve_correctness_mode("uva"), manifest_path, profile_path
     )
+    exact_uva = _worker_environment(
+        resolve_correctness_mode("uva-exact"),
+        manifest_path,
+        profile_path,
+        plan_json="plan",
+        identity_lock_json="lock",
+    )
     latchmoe = _worker_environment(
         resolve_correctness_mode("latchmoe-eager"), manifest_path, profile_path
+    )
+    async_latchmoe = _worker_environment(
+        resolve_correctness_mode("latchmoe-async"), manifest_path, profile_path
     )
     piecewise = _worker_environment(
         resolve_correctness_mode("latchmoe-piecewise"), manifest_path, profile_path
@@ -130,11 +162,18 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     assert "VLLM_LATCHMOE_MANIFEST" not in uva
     assert "VLLM_LATCHMOE_PROFILE_PATH" not in uva
     assert uva["VLLM_LATCHMOE_TELEMETRY_PATH"] == str(profile_path)
+    assert exact_uva["VLLM_LATCHMOE_MODE"] == "uva"
+    assert exact_uva["VLLM_LATCHMOE_MANIFEST"] == str(manifest_path)
+    assert exact_uva["VLLM_LATCHMOE_TELEMETRY_PATH"] == str(profile_path)
+    assert exact_uva["VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"] == "plan"
+    assert exact_uva["VLLM_LATCHMOE_IDENTITY_LOCK_JSON"] == "lock"
     assert latchmoe["VLLM_LATCHMOE_MODE"] == "latchmoe"
     assert latchmoe["VLLM_LATCHMOE_MANIFEST"] == str(manifest_path)
     assert latchmoe["VLLM_LATCHMOE_PROFILE_PATH"] == str(profile_path)
     assert "VLLM_LATCHMOE_TELEMETRY_PATH" not in latchmoe
     assert latchmoe["VLLM_LATCHMOE_GRAPH_MODE"] == "eager"
+    assert latchmoe["VLLM_LATCHMOE_OVERLAP"] == "0"
+    assert async_latchmoe["VLLM_LATCHMOE_OVERLAP"] == "1"
     assert piecewise["VLLM_LATCHMOE_GRAPH_MODE"] == "piecewise"
     assert piecewise["VLLM_DISABLE_COMPILE_CACHE"] == "1"
     assert "VLLM_LATCHMOE_WAVE_SLOTS" not in piecewise
@@ -149,6 +188,25 @@ def test_greedy_comparison_requires_exact_token_ids():
     assert comparison["match"] is False
     assert comparison["mismatched_requests"] == [0]
     with pytest.raises(CorrectnessMismatchError, match="request 0"):
+        require_greedy_match(reference, candidate)
+
+
+def test_greedy_comparison_accepts_exact_uva_reference():
+    reference = _result("uva-exact", [[1, 2], [3]])
+    reference["uva_implementation"] = "ManifestUVAOffloader"
+    reference["manifest_controls_offload_selection"] = True
+    candidate = _result("latchmoe-eager", [[1, 2], [3]])
+
+    assert compare_greedy_results(reference, candidate)["match"] is True
+
+
+def test_greedy_comparison_rejects_stock_implementation_as_exact_uva():
+    reference = _result("uva-exact", [[1], [2]])
+    reference["uva_implementation"] = "vllm-stock"
+    reference["manifest_controls_offload_selection"] = True
+    candidate = _result("latchmoe-eager", [[1], [2]])
+
+    with pytest.raises(CorrectnessMismatchError, match="ManifestUVAOffloader"):
         require_greedy_match(reference, candidate)
 
 

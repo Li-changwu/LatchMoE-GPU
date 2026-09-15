@@ -48,7 +48,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=("native", "uva", "latchmoe-eager", "latchmoe-piecewise", "latchmoe-waves"),
+        choices=(
+            "native",
+            "uva",
+            "uva-exact",
+            "latchmoe-eager",
+            "latchmoe-async",
+            "latchmoe-piecewise",
+            "latchmoe-waves",
+        ),
     )
     parser.add_argument(
         "--kind", choices=tuple(kind.value for kind in RunKind), required=True
@@ -114,6 +122,16 @@ def _worker_main(argv: list[str]) -> int:
             raise RuntimeError(
                 "latchmoe-waves run produced no exact_waves profile event"
             )
+    events = _profile_events(args.profile_jsonl)
+    overlap_events = [
+        event for event in events if event.get("event") == "main_cache_overlap"
+    ]
+    if mode.overlap_enabled and not any(
+        event.get("actual_overlap") is True for event in overlap_events
+    ):
+        raise RuntimeError("LatchMoE async run produced no actual overlap evidence")
+    if mode.backend == "latchmoe" and not mode.overlap_enabled and overlap_events:
+        raise RuntimeError("serial LatchMoE run unexpectedly produced overlap evidence")
     return 0
 
 
@@ -169,14 +187,25 @@ def _offload_telemetry(
             "actual_offload_bytes": 0,
             "configured_budget_bytes": 0,
         }
-    if mode.name == "uva":
+    if mode.name in {"uva", "uva-exact"}:
         matches = [event for event in events if event.get("event") == "stock_uva"]
         if len(matches) != 1:
             raise RuntimeError("stock UVA run produced no unique stock_uva event")
         event = matches[0]
         implementation = event.get("implementation")
-        if implementation != "vllm.model_executor.offloader.uva.UVAOffloader":
+        if (
+            mode.name == "uva"
+            and implementation
+            != "vllm.model_executor.offloader.uva.UVAOffloader"
+        ):
             raise RuntimeError(f"unexpected UVA implementation: {implementation}")
+        if mode.name == "uva-exact" and (
+            implementation != "vllm_latchmoe_cuda.uva.ManifestUVAOffloader"
+            or event.get("selection") != "manifest_exact"
+        ):
+            raise RuntimeError(
+                f"unexpected exact UVA implementation: {implementation}"
+            )
         return {
             "schema_version": 1,
             "mode": mode.name,
@@ -253,6 +282,7 @@ def _worker_environment(
         "VLLM_LATCHMOE_WAVE_SLOTS",
         "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON",
         "VLLM_LATCHMOE_IDENTITY_LOCK_JSON",
+        "VLLM_LATCHMOE_OVERLAP",
     ):
         environment.pop(key, None)
     environment.update(
@@ -270,6 +300,7 @@ def _worker_environment(
                 "VLLM_LATCHMOE_MODE": mode.backend,
                 "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
+                "VLLM_LATCHMOE_OVERLAP": "1" if mode.overlap_enabled else "0",
             }
         )
         if plan_json is not None:
@@ -280,6 +311,20 @@ def _worker_environment(
             environment["VLLM_LATCHMOE_GRAPH_MODE"] = "piecewise"
         else:
             environment["VLLM_LATCHMOE_GRAPH_MODE"] = "eager"
+    elif mode.name == "uva-exact":
+        if plan_json is None or identity_lock_json is None:
+            raise RuntimeError(
+                "exact UVA worker requires parent plan and identity lock"
+            )
+        environment.update(
+            {
+                "VLLM_LATCHMOE_MODE": "uva",
+                "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
+                "VLLM_LATCHMOE_TELEMETRY_PATH": str(profile_path),
+                "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON": plan_json,
+                "VLLM_LATCHMOE_IDENTITY_LOCK_JSON": identity_lock_json,
+            }
+        )
     else:
         environment["VLLM_LATCHMOE_TELEMETRY_PATH"] = str(profile_path)
     return environment
@@ -291,13 +336,16 @@ def _execute_driver(args, run: ArtifactRun) -> None:
     mode = resolve_correctness_mode(args.mode)
     plan_json = None
     identity_lock_json = None
-    if mode.backend == "latchmoe":
+    if mode.backend == "latchmoe" or mode.name == "uva-exact":
         config = json.loads((Path(manifest.model.path) / "config.json").read_text())
         config["model_path"] = manifest.model.path
         config["revision"] = manifest.model.revision
         top_k = int(config.get("num_experts_per_tok", 8))
         capture_size = CORRECTNESS_MAX_CUDAGRAPH_CAPTURE_SIZE
-        if mode.name != "latchmoe-piecewise" and manifest.num_slots < capture_size * top_k:
+        if (
+            mode.name != "latchmoe-piecewise"
+            and manifest.num_slots < capture_size * top_k
+        ):
             # Eager/waves artifacts may intentionally use a smaller cache than
             # the piecewise capture contract. Keep the immutable plan aligned
             # with that manifest instead of silently allocating extra slots.
@@ -352,8 +400,17 @@ def _execute_driver(args, run: ArtifactRun) -> None:
             "backend": mode.backend,
             "enforce_eager": mode.enforce_eager,
             "expect_waves": mode.expect_waves,
-            "uva_implementation": "vllm-stock" if mode.name == "uva" else None,
-            "cpu_offload_gb": (STOCK_UVA_CPU_OFFLOAD_GB if mode.name == "uva" else 0.0),
+            "overlap_enabled": mode.overlap_enabled,
+            "uva_implementation": (
+                "ManifestUVAOffloader"
+                if mode.name == "uva-exact"
+                else ("vllm-stock" if mode.name == "uva" else None)
+            ),
+            "cpu_offload_gb": (
+                STOCK_UVA_CPU_OFFLOAD_GB
+                if mode.name in {"uva", "uva-exact"}
+                else 0.0
+            ),
             "manifest_controls_offload_selection": mode.name != "uva",
         },
     )
@@ -431,10 +488,31 @@ def _execute_driver(args, run: ArtifactRun) -> None:
         )
         comparison["candidate_actual_offload_bytes"] = telemetry["actual_offload_bytes"]
         comparison["offload_bytes_match"] = offload_bytes_match
+        reference_run_manifest = json.loads(
+            (args.reference_json.parent / "run_manifest.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        candidate_run_manifest = json.loads(
+            (run.path / "run_manifest.json").read_text(encoding="utf-8")
+        )
+        source_state_match = (
+            reference_run_manifest.get("source_state_sha256")
+            == candidate_run_manifest.get("source_state_sha256")
+        )
+        comparison["reference_source_state_sha256"] = reference_run_manifest.get(
+            "source_state_sha256"
+        )
+        comparison["candidate_source_state_sha256"] = candidate_run_manifest.get(
+            "source_state_sha256"
+        )
+        comparison["source_state_match"] = source_state_match
         run.write_json("comparison.json", comparison)
         require_greedy_match(reference, candidate)
         if not offload_bytes_match:
             raise CorrectnessMismatchError("actual offload bytes differ")
+        if not source_state_match:
+            raise CorrectnessMismatchError("source state differs")
 
 
 def _driver_main(argv: list[str]) -> int:

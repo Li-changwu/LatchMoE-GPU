@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -95,12 +97,17 @@ class CorrectnessMode:
     backend: str
     enforce_eager: bool
     expect_waves: bool
+    overlap_enabled: bool = False
 
 
 _MODES = {
     "native": CorrectnessMode("native", "native", True, False),
     "uva": CorrectnessMode("uva", "uva", True, False),
+    "uva-exact": CorrectnessMode("uva-exact", "uva", True, False),
     "latchmoe-eager": CorrectnessMode("latchmoe-eager", "latchmoe", True, False),
+    "latchmoe-async": CorrectnessMode(
+        "latchmoe-async", "latchmoe", True, False, True
+    ),
     "latchmoe-piecewise": CorrectnessMode(
         "latchmoe-piecewise", "latchmoe", False, False
     ),
@@ -146,18 +153,37 @@ def compare_greedy_results(
     reference: Mapping[str, Any], candidate: Mapping[str, Any]
 ) -> dict[str, object]:
     contract_errors: list[str] = []
-    if reference.get("mode") != "uva" or reference.get("backend") != "uva":
+    reference_mode = reference.get("mode")
+    if (
+        reference_mode not in {"uva", "uva-exact"}
+        or reference.get("backend") != "uva"
+    ):
         contract_errors.append("reference must be the UVA backend")
     elif (
         reference.get("enforce_eager") is not True
         or reference.get("expected_wave_event") is not False
     ):
         contract_errors.append("reference UVA graph policy is inconsistent")
+    if reference_mode == "uva-exact":
+        if reference.get("uva_implementation") != "ManifestUVAOffloader":
+            contract_errors.append("exact UVA reference must use ManifestUVAOffloader")
+        if reference.get("manifest_controls_offload_selection") is not True:
+            contract_errors.append("exact UVA reference must be manifest-controlled")
+        for field, label in (
+            ("plan_id", "plan ID"),
+            ("selected_layer_ids", "selected layer IDs"),
+            ("identity_lock_sha256", "identity lock"),
+        ):
+            if not reference.get(field) or reference.get(field) != candidate.get(
+                field
+            ):
+                contract_errors.append(f"{label} differs")
     candidate_mode = candidate.get("mode")
     candidate_policies = {
-        "latchmoe-eager": (True, False),
-        "latchmoe-piecewise": (False, False),
-        "latchmoe-waves": (True, True),
+        "latchmoe-eager": (True, False, False),
+        "latchmoe-async": (True, False, True),
+        "latchmoe-piecewise": (False, False, False),
+        "latchmoe-waves": (True, True, False),
     }
     if (
         not isinstance(candidate_mode, str)
@@ -166,10 +192,13 @@ def compare_greedy_results(
     ):
         contract_errors.append("candidate backend must be LatchMoE")
     else:
-        expected_eager, expected_waves = candidate_policies[candidate_mode]
+        expected_eager, expected_waves, expected_overlap = candidate_policies[
+            candidate_mode
+        ]
         if (
             candidate.get("enforce_eager") is not expected_eager
             or candidate.get("expected_wave_event") is not expected_waves
+            or candidate.get("overlap_enabled") is not expected_overlap
         ):
             contract_errors.append("candidate graph policy is inconsistent")
     if reference.get("manifest_sha256") != candidate.get("manifest_sha256"):
@@ -179,6 +208,9 @@ def compare_greedy_results(
         ("dtype", "dtype"),
         ("tensor_parallel_size", "tensor parallel size"),
         ("max_num_seqs", "maximum sequence count"),
+        ("max_model_len", "maximum model length"),
+        ("kv_cache_memory_bytes", "KV cache reserve"),
+        ("request_execution", "request execution policy"),
         ("sampling", "sampling configuration"),
         ("prompts", "prompt list"),
     )
@@ -274,9 +306,10 @@ def build_engine_kwargs(
         "max_model_len": max_model_len,
         "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
         "seed": 0,
+        "enable_prefix_caching": False,
         "disable_log_stats": True,
     }
-    if mode.name == "uva":
+    if mode.name in {"uva", "uva-exact"}:
         kwargs["cpu_offload_gb"] = STOCK_UVA_CPU_OFFLOAD_GB
     return kwargs
 
@@ -320,9 +353,12 @@ def run_vllm_greedy(
         max_tokens=max_tokens,
         seed=0,
     )
-    generated = engine.generate(list(prompts), sampling, use_tqdm=False)
     outputs: list[dict[str, object]] = []
-    for prompt, request_output in zip(prompts, generated, strict=True):
+    for prompt in prompts:
+        generated = engine.generate([prompt], sampling, use_tqdm=False)
+        if len(generated) != 1:
+            raise RuntimeError("greedy run returned an unexpected request count")
+        request_output = generated[0]
         if len(request_output.outputs) != 1:
             raise RuntimeError("greedy run returned more than one sequence")
         sequence = request_output.outputs[0]
@@ -334,19 +370,49 @@ def run_vllm_greedy(
                 "text": sequence.text,
             }
         )
+    raw_plan = os.getenv("VLLM_LATCHMOE_RESIDENCY_PLAN_JSON")
+    raw_identity_lock = os.getenv("VLLM_LATCHMOE_IDENTITY_LOCK_JSON")
+    plan_id = None
+    selected_layer_ids = None
+    if raw_plan:
+        from .residency_plan import deserialize_residency_plan
+
+        plan = deserialize_residency_plan(raw_plan)
+        plan_id = plan.plan_id
+        selected_layer_ids = list(plan.offloaded_layer_ids)
     return {
         "schema_version": 1,
         "mode": mode.name,
         "backend": mode.backend,
         "enforce_eager": mode.enforce_eager,
         "expected_wave_event": mode.expect_waves,
+        "overlap_enabled": mode.overlap_enabled,
         "manifest_sha256": manifest.manifest_sha256,
         "model_revision": manifest.model.revision,
         "dtype": manifest.dtype,
         "tensor_parallel_size": manifest.tensor_parallel_size,
         "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
-        "uva_implementation": "vllm-stock" if mode.name == "uva" else None,
-        "cpu_offload_gb": STOCK_UVA_CPU_OFFLOAD_GB if mode.name == "uva" else 0.0,
+        "max_model_len": max_model_len,
+        "kv_cache_memory_bytes": kv_cache_memory_bytes,
+        "enable_prefix_caching": False,
+        "request_execution": "sequential",
+        "plan_id": plan_id,
+        "selected_layer_ids": selected_layer_ids,
+        "identity_lock_sha256": (
+            hashlib.sha256(raw_identity_lock.encode("utf-8")).hexdigest()
+            if raw_identity_lock
+            else None
+        ),
+        "uva_implementation": (
+            "ManifestUVAOffloader"
+            if mode.name == "uva-exact"
+            else ("vllm-stock" if mode.name == "uva" else None)
+        ),
+        "cpu_offload_gb": (
+            STOCK_UVA_CPU_OFFLOAD_GB
+            if mode.name in {"uva", "uva-exact"}
+            else 0.0
+        ),
         "manifest_controls_offload_selection": mode.name != "uva",
         "prompts": list(prompts),
         "sampling": {"temperature": 0.0, "max_tokens": max_tokens, "seed": 0},

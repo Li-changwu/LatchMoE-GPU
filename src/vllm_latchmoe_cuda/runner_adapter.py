@@ -428,6 +428,7 @@ def install_vllm_forward_adapter(
                 topk_ids,
                 topk_weights,
                 seam=getattr(experts_module, "_latchmoe_seam", None),
+                overlap=os.getenv("VLLM_LATCHMOE_OVERLAP", "1") != "0",
             )
             return shared_output, result
         eager_prepare_compute(runtime, topk_ids)
