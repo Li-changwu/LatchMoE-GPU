@@ -115,7 +115,13 @@ def plan_main_cache_waves(
         specs.append(MainCacheWaveSpec(wave_id, "hit", hit_wave))
         wave_id += 1
     misses = tuple(value for value in active if value not in hits)
-    for start in range(0, len(misses), capacity):
+    start = 0
+    if hit_wave and len(hit_wave) < capacity and misses:
+        first_count = min(len(misses), capacity - len(hit_wave))
+        specs.append(MainCacheWaveSpec(wave_id, "miss", misses[:first_count]))
+        wave_id += 1
+        start = first_count
+    for start in range(start, len(misses), capacity):
         specs.append(
             MainCacheWaveSpec(
                 wave_id,
