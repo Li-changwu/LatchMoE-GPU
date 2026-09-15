@@ -38,11 +38,13 @@ def test_plugin_factory_keeps_manifest_uva_as_explicit_baseline(
     )
     monkeypatch.setattr(plugin, "load_manifest_from_env", lambda: tiny_manifest)
     monkeypatch.setenv("VLLM_LATCHMOE_MODE", "uva")
+    monkeypatch.setenv(plugin.UVA_RESERVATION_ENV, "4096")
 
     plugin.register()
     created = fake_runner.create_offloader(object())
 
     assert isinstance(created, ManifestUVAOffloader)
+    assert created.reservation_bytes == 4096
 
 
 def test_latchmoe_factory_consumes_parent_plan_without_residual_uva(

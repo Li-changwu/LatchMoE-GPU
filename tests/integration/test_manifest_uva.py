@@ -67,3 +67,14 @@ def test_manifest_uva_rejects_missing_manifest_layer(tiny_manifest):
 
     with pytest.raises(RuntimeError, match="missing manifest layers"):
         offloader.wrap_modules(iter(()))
+
+
+def test_manifest_uva_holds_exact_hbm_reservation(
+    tiny_manifest, tiny_decoder_factory
+):
+    module = tiny_decoder_factory("cuda")
+    offloader = ManifestUVAOffloader(tiny_manifest, reservation_bytes=4096)
+
+    offloader.wrap_modules(iter((module,)))
+
+    assert offloader.reserved_hbm_bytes == 4096

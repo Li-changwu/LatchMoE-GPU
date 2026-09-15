@@ -125,6 +125,7 @@ def _server_environment(
     *,
     plan_json: str | None = None,
     identity_lock_json: str | None = None,
+    uva_reservation_bytes: int = 0,
 ) -> dict[str, str]:
     environment = os.environ.copy()
     for name in (
@@ -137,6 +138,7 @@ def _server_environment(
         "VLLM_LATCHMOE_WAVE_SLOTS",
         "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON",
         "VLLM_LATCHMOE_IDENTITY_LOCK_JSON",
+        "VLLM_LATCHMOE_UVA_RESERVATION_BYTES",
     ):
         environment.pop(name, None)
     environment.update(
@@ -154,6 +156,9 @@ def _server_environment(
                 "VLLM_LATCHMOE_MODE": "uva",
                 "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
                 "VLLM_LATCHMOE_TELEMETRY_PATH": str(profile_path),
+                "VLLM_LATCHMOE_UVA_RESERVATION_BYTES": str(
+                    int(uva_reservation_bytes)
+                ),
             }
         )
         if plan_json is not None:
@@ -245,6 +250,10 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
     run_manifest = json.loads((run.path / "run_manifest.json").read_text())
     source_state_sha256 = run_manifest["source_state_sha256"]
     git_commit = run_manifest["git_commit"]
+    backend_hbm_cache_bytes = int(plan.main_slot_cache_bytes) if plan else 0
+    uva_reservation_bytes = (
+        backend_hbm_cache_bytes if args.mode.startswith("uva") else 0
+    )
     workload_contract = {
         "schema_version": 1,
         "model_path": manifest.model.path,
@@ -295,6 +304,8 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
             graph_policy=("piecewise" if args.mode.endswith("piecewise") else "eager"),
             kv_reserve_bytes=args.kv_cache_memory_bytes,
             plan=plan,
+            uva_reservation_bytes=uva_reservation_bytes,
+            backend_hbm_cache_bytes=backend_hbm_cache_bytes,
         )
     )
     mode_contract_sha256 = payload_sha256(mode_contract)
@@ -328,6 +339,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         profile_path,
         plan_json=plan_json,
         identity_lock_json=identity_lock_json,
+        uva_reservation_bytes=uva_reservation_bytes,
     )
 
     server_log = (run.path / "server.log").open("w", encoding="utf-8")
@@ -417,6 +429,19 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         server_log.close()
 
     telemetry = read_offload_telemetry(args.mode, manifest, profile_path)
+    observed_hbm_cache_bytes = int(
+        telemetry.get(
+            "uva_reservation_bytes"
+            if args.mode.startswith("uva")
+            else "dynamic_slot_bytes",
+            0,
+        )
+    )
+    if observed_hbm_cache_bytes != backend_hbm_cache_bytes:
+        raise RuntimeError(
+            "backend HBM cache evidence differs from the immutable plan: "
+            f"expected={backend_hbm_cache_bytes}, observed={observed_hbm_cache_bytes}"
+        )
     summary = {
         "schema_version": 1,
         "mode": args.mode,
@@ -440,6 +465,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
                 "parameter_names",
                 "host_bytes",
                 "resident_weight_bytes",
+                "backend_hbm_cache_bytes",
                 "kv_reserve_bytes",
                 "graph_policy",
                 "workload_contract_sha256",

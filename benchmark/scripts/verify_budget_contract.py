@@ -52,6 +52,15 @@ def validate_plan_evidence(document: Mapping[str, Any]) -> dict[str, Any]:
         raise BudgetContractError(
             "legacy temporary-bank/shared-pool evidence cannot be promoted"
         )
+    hbm_cache_bytes = _value(document, "backend_hbm_cache_bytes")
+    if (
+        not isinstance(hbm_cache_bytes, int)
+        or isinstance(hbm_cache_bytes, bool)
+        or hbm_cache_bytes < 0
+    ):
+        raise BudgetContractError(
+            "backend_hbm_cache_bytes must be a non-negative integer"
+        )
     model_value = document.get("model", "")
     model_type = document.get("model_type")
     if model_type is None and isinstance(model_value, Mapping):
@@ -70,6 +79,7 @@ def validate_plan_evidence(document: Mapping[str, Any]) -> dict[str, Any]:
         "eligible_layer_ids": list(eligible),
         "selected_layer_ids": list(selected),
         "plan_id": _value(document, "plan_id"),
+        "backend_hbm_cache_bytes": hbm_cache_bytes,
     }
 
 

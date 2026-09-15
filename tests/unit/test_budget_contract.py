@@ -25,6 +25,7 @@ def _contract(**overrides):
         "parameter_names": ["model.layers.2.mlp.experts.w13_weight"],
         "host_bytes": 123,
         "resident_weight_bytes": 456,
+        "backend_hbm_cache_bytes": 64,
         "kv_reserve_bytes": 512,
         "graph_policy": "piecewise",
         "workload_contract_sha256": "b" * 64,
@@ -48,6 +49,14 @@ def test_comparable_contract_checks_all_identity_fields():
     assert validate_comparable_contracts(left, right)["reservation_equal"]
     right["plan_id"] = "d" * 64
     with pytest.raises(ValueError, match="plan_id"):
+        validate_comparable_contracts(left, right)
+
+
+def test_comparable_contract_requires_equal_backend_hbm_cache():
+    left = _contract(backend_hbm_cache_bytes=64)
+    right = _contract(backend_hbm_cache_bytes=32)
+
+    with pytest.raises(ValueError, match="backend_hbm_cache_bytes"):
         validate_comparable_contracts(left, right)
 
 

@@ -41,6 +41,7 @@ COMPARISON_CONTRACT_FIELDS = (
     "parameter_names",
     "host_bytes",
     "resident_weight_bytes",
+    "backend_hbm_cache_bytes",
     "kv_reserve_bytes",
     "graph_policy",
     "workload_contract_sha256",
@@ -77,6 +78,16 @@ def validate_comparable_contracts(
     accidentally publish a result with only a matching workload hash.
     """
     mismatches: list[str] = []
+    for name, document in (("baseline", baseline), ("candidate", candidate)):
+        cache_bytes = _contract_value(document, "backend_hbm_cache_bytes")
+        if (
+            not isinstance(cache_bytes, int)
+            or isinstance(cache_bytes, bool)
+            or cache_bytes < 0
+        ):
+            raise ValueError(
+                f"{name} backend_hbm_cache_bytes must be a non-negative integer"
+            )
     for field in COMPARISON_CONTRACT_FIELDS:
         left = _contract_value(baseline, field)
         right = _contract_value(candidate, field)
@@ -145,6 +156,7 @@ def manifest_comparison_contract(
     kv_reserve_bytes: int,
     plan: Any | None = None,
     uva_reservation_bytes: int = 0,
+    backend_hbm_cache_bytes: int = 0,
 ) -> dict[str, Any]:
     """Render a flat comparison contract from an immutable plan or manifest.
 
@@ -191,6 +203,7 @@ def manifest_comparison_contract(
         "parameter_names": parameter_names,
         "host_bytes": host_bytes,
         "resident_weight_bytes": resident_bytes,
+        "backend_hbm_cache_bytes": int(backend_hbm_cache_bytes),
         "kv_reserve_bytes": int(kv_reserve_bytes),
         "graph_policy": graph_policy,
         "workload_contract_sha256": str(workload_contract_sha256),
@@ -462,6 +475,9 @@ def read_offload_telemetry(
             "implementation": implementation,
             "actual_offload_bytes": int(event["cpu_offload_bytes"]),
             "configured_budget_bytes": int(event["cpu_offload_max_bytes"]),
+            "uva_reservation_bytes": int(
+                event.get("uva_reservation_bytes", 0)
+            ),
             **graph_telemetry,
         }
     residual = [event for event in events if event.get("event") == "residual_uva"]

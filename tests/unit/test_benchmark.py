@@ -165,11 +165,16 @@ def test_server_environment_locks_latchmoe_overlap(tmp_path, monkeypatch):
         "latchmoe-eager", tmp_path / "manifest.json", tmp_path / "profile.jsonl"
     )
     uva = _server_environment(
-        "uva", tmp_path / "manifest.json", tmp_path / "profile.jsonl"
+        "uva",
+        tmp_path / "manifest.json",
+        tmp_path / "profile.jsonl",
+        uva_reservation_bytes=4096,
     )
 
     assert latchmoe["VLLM_LATCHMOE_OVERLAP"] == "1"
     assert "VLLM_LATCHMOE_OVERLAP" not in uva
+    assert uva["VLLM_LATCHMOE_UVA_RESERVATION_BYTES"] == "4096"
+    assert "VLLM_LATCHMOE_UVA_RESERVATION_BYTES" not in latchmoe
 
 
 def test_normalize_and_summarize_require_three_complete_fixed_length_runs():
@@ -394,6 +399,7 @@ def test_comparison_uses_latency_reduction_and_throughput_gain():
     )
     common = {
         "workload_contract_sha256": "a" * 64,
+        "backend_hbm_cache_bytes": 1024,
         "offload_telemetry": {"actual_offload_bytes": 1024},
     }
 
@@ -417,6 +423,7 @@ def test_piecewise_comparison_rejects_mixed_graph_policy():
     )
     common = {
         "workload_contract_sha256": "a" * 64,
+        "backend_hbm_cache_bytes": 1024,
         "offload_telemetry": {"actual_offload_bytes": 1024},
         "metrics": metrics,
     }
@@ -453,6 +460,7 @@ def test_ablation_comparison_requires_one_contract_source_and_offload_budget():
     )
     common = {
         "workload_contract_sha256": "a" * 64,
+        "backend_hbm_cache_bytes": 1024,
         "source_state_sha256": "b" * 64,
         "git_commit": "d" * 40,
         "offload_telemetry": {"actual_offload_bytes": 1024},

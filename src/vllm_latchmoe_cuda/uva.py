@@ -22,6 +22,7 @@ class ManifestUVAOffloader(BaseOffloader):
         pin_memory: bool | None = None,
         use_uva: bool | None = None,
         first_layer_id: int = 0,
+        reservation_bytes: int = 0,
     ):
         self.manifest = manifest
         self.pin_memory = (
@@ -31,6 +32,10 @@ class ManifestUVAOffloader(BaseOffloader):
         if not self.pin_memory or not self.use_uva:
             raise RuntimeError("controlled UVA baseline requires pinned UVA")
         self.first_layer_id = first_layer_id
+        self.reservation_bytes = int(reservation_bytes)
+        if self.reservation_bytes < 0:
+            raise ValueError("UVA reservation bytes must be non-negative")
+        self._hbm_reservation: torch.Tensor | None = None
         self.offloaded_parameter_names: set[str] = set()
         self.cpu_offload_bytes = 0
         self.cpu_offload_max_bytes = sum(
@@ -92,4 +97,16 @@ class ManifestUVAOffloader(BaseOffloader):
         missing = sorted(selected - bound_layers)
         if missing:
             raise RuntimeError(f"missing manifest layers during binding: {missing}")
+        if self.reservation_bytes:
+            self._hbm_reservation = torch.empty(
+                self.reservation_bytes,
+                dtype=torch.uint8,
+                device=torch.cuda.current_device(),
+            )
         return modules
+
+    @property
+    def reserved_hbm_bytes(self) -> int:
+        if self._hbm_reservation is None:
+            return 0
+        return self._hbm_reservation.numel() * self._hbm_reservation.element_size()

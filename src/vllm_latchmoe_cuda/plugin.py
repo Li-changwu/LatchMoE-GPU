@@ -26,6 +26,7 @@ RESIDENCY_PLAN_ENV = "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"
 IDENTITY_LOCK_ENV = "VLLM_LATCHMOE_IDENTITY_LOCK_JSON"
 TELEMETRY_ENV = "VLLM_LATCHMOE_TELEMETRY_PATH"
 PROFILE_ENV = "VLLM_LATCHMOE_PROFILE_PATH"
+UVA_RESERVATION_ENV = "VLLM_LATCHMOE_UVA_RESERVATION_BYTES"
 
 
 def _instrument_cudagraph_evidence() -> None:
@@ -126,6 +127,7 @@ def _instrument_manifest_uva(offloader):
             cpu_offload_max_bytes=self.cpu_offload_max_bytes,
             cpu_offload_bytes=self.cpu_offload_bytes,
             selection="manifest_exact",
+            uva_reservation_bytes=self.reserved_hbm_bytes,
         )
         writer.close()
         return modules
@@ -192,7 +194,22 @@ def register() -> None:
                 validate_identity_lock(identity_lock, plan)
                 if tuple(manifest.layer_ids) != tuple(plan.offloaded_layer_ids):
                     raise RuntimeError("UVA manifest and parent plan selected layers differ")
-            return _instrument_manifest_uva(ManifestUVAOffloader(manifest))
+            raw_reservation = os.getenv(UVA_RESERVATION_ENV, "0")
+            try:
+                reservation_bytes = int(raw_reservation)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{UVA_RESERVATION_ENV} must be an integer"
+                ) from exc
+            if reservation_bytes < 0:
+                raise ValueError(
+                    f"{UVA_RESERVATION_ENV} must be non-negative"
+                )
+            return _instrument_manifest_uva(
+                ManifestUVAOffloader(
+                    manifest, reservation_bytes=reservation_bytes
+                )
+            )
         raise ValueError(
             f"unsupported {MODE_ENV}={mode!r}; expected 'latchmoe' or 'uva'"
         )
