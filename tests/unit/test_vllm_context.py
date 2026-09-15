@@ -24,6 +24,23 @@ def test_advance_moe_layer_index_matches_vllm_order(monkeypatch):
     assert context.moe_layer_index == 1
 
 
+def test_advance_moe_layer_index_skips_unobserved_registered_layers(monkeypatch):
+    context = SimpleNamespace(
+        all_moe_layers=[
+            "model.layers.0.mlp.experts",
+            "model.layers.1.mlp.experts",
+            "model.layers.2.mlp.experts",
+            "model.layers.3.mlp.experts",
+        ],
+        moe_layer_index=0,
+    )
+    _install_context(monkeypatch, context)
+    advance_moe_layer_index(
+        SimpleNamespace(layer_name="model.layers.3.mlp.experts")
+    )
+    assert context.moe_layer_index == 4
+
+
 def test_advance_moe_layer_index_rejects_layer_order_mismatch(monkeypatch):
     context = SimpleNamespace(
         all_moe_layers=["model.layers.1.mlp.experts"], moe_layer_index=0

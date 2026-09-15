@@ -8,7 +8,12 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+
+try:  # Python 3.11+
+    from datetime import UTC
+except ImportError:  # Python 3.10 compatibility for the benchmark runner.
+    UTC = timezone.utc
 from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
