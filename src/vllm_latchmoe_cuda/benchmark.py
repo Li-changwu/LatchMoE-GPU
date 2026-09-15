@@ -452,8 +452,11 @@ def read_offload_telemetry(
             raise RuntimeError("official UVA telemetry is missing or duplicated")
         event = matches[0]
         implementation = event.get("implementation")
-        expected = "vllm.model_executor.offloader.uva.UVAOffloader"
-        if implementation != expected:
+        expected = {
+            "vllm.model_executor.offloader.uva.UVAOffloader",
+            "vllm_latchmoe_cuda.uva.ManifestUVAOffloader",
+        }
+        if implementation not in expected:
             raise RuntimeError(f"unexpected UVA implementation: {implementation}")
         return {
             "implementation": implementation,
