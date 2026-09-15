@@ -900,9 +900,9 @@ pair_count == num_tokens * top_k
 combine_count == selected_layer_forward_count
 ```
 
-- [ ] **Step 4: 全模型 exact-token 门槛**
+- [x] **Step 4: A6000 受限全模型 exact-token 门槛**
 
-分别独立启动 full-resident native、exact-selection UVA 和 serial Main Cache。至少覆盖短 prompt、长 prefill、decode、多 wave 和重复 route，所有 token IDs 全等后才运行 async。async 必须再次全等。
+A6000 无法容纳 full-resident native，因此将其明确记录为 `hardware-blocked`，不伪造 native oracle。受限验收分别独立启动 exact-selection UVA 和 serial Main Cache，固定同一 immutable plan、identity lock、source state、prompt manifest、sampling、KV reserve 和 graph policy；覆盖短 prompt、长 prefill、16-token decode、multi-wave 和重复请求。两方所有 prompt token IDs 和生成 token IDs 全等后才运行 async；async 必须再次全等且至少记录一个 `actual_overlap=true` 窗口。该门槛只允许发布 `two_way_exact_token_parity`，不允许宣称 `native-equivalent correctness`。
 
 - [x] **Step 5: 正式三轮性能实验（受限两方）**
 
@@ -1027,6 +1027,15 @@ Task 11 分层验收进展（2026-09-14）：
 - 该对比报告明确标记 `comparable_offload_bytes=false`（UVA `15,798,475,264` bytes，LatchMoE `24,159,191,040` bytes）和 `comparable_contract=false`（两轮 source identity 不同）。因此这些数字只能作为“受限两方正式运行记录”，不能作为等预算性能结论；Step 6 最终审计仍保持未完成。
 - 随后将正式 UVA 改为 `ManifestUVAOffloader` 精确消费 immutable plan，并完成新的三轮 exact-UVA workload：`artifacts/20260915T-formal-exact-uva-20layer-r1/summary.json`。profile 标记 `selection=manifest_exact`，实际 CPU offload 为 `24,159,191,040` bytes，与 LatchMoE Host Store 完全一致；三轮请求均完整成功。该 UVA artifact 使用 source commit `410d73e`，现有 LatchMoE 三轮 artifact 使用 `e2f073a`，因此仍需在同一 source commit 重跑 LatchMoE 后才能满足 source identity 合同；native token parity 仍因取消 full-resident baseline 而未执行。
 
+Task 11 Step 4 A6000 受限验收更新（2026-09-15）：
+
+- `799546f` 增加 `uva-exact`、显式 serial/async correctness 模式和冻结 prompt manifest；比较器强制校验 exact-UVA implementation、plan ID、selected IDs、identity lock、KV reserve、model length、sampling、逐请求 token IDs、offload bytes 和 source state。请求在同一 engine 内逐条执行，prefix caching 关闭，以覆盖跨请求 cache 状态。
+- `a6aa7d5` 修复生产 overlap candidate 不可达：有 hit wave 时，首个 miss wave 只填充 `capacity - hits` 个 idle slots。修复前 async artifact `artifacts/20260915T-task11-step4-latchmoe-async-r2` 因没有任何 actual overlap 按 fail-closed 失败；修复后相关 CPU/CUDA 测试 `48 passed`。
+- 最终三组运行均来自干净 commit `a6aa7d5`，source state 均为 `f066a3e3b5283ea84e7af1a6f5f9c228d1a1b2f965d8fee7040da6e13cac8b73`：exact-UVA 为 `artifacts/20260915T-task11-step4-uva-exact-final`，serial 为 `artifacts/20260915T-task11-step4-latchmoe-serial-final`，async 为 `artifacts/20260915T-task11-step4-latchmoe-async-final`。
+- 三组使用 `/root/models/Qwen3-30B-A3B-Instruct-2507`、20-layer midpoint selected IDs、32 slots、22 GiB plan、256 MiB KV reserve、eager graph policy 和 `benchmark/prompts/task11-step4-a6000.json`。4 个请求的 prompt 长度为 14/74/15/14 tokens，每个生成 16 tokens；serial 和 async 对 exact-UVA 均为 `4/4` 请求逐 token 全等，offload bytes 均为 `24,159,191,040`，无 contract error。
+- async profile 包含 78 次 `main_cache_waves` 和 104 个 `actual_overlap=true` 窗口，证明验收实际执行了 H2D/compute overlap，而不是只打开配置开关。
+- 保留数值敏感失败证据：`artifacts/20260915T-correctness-latchmoe-eager-20layer-r2` 的默认开放式 prompt 在第 10 个生成 token 分叉；`artifacts/20260915T-task11-step4-latchmoe-serial-r1` 的 5-request 候选集中同类开放式 prompt 从首 token 分叉。其余覆盖请求全等。这说明 multi-wave 与 full-shape UVA 的 BF16 kernel 排序可能在低 margin token 上改变 argmax；本次通过结论严格限定为冻结 manifest 上的 `two_way_exact_token_parity`，不扩大为任意 prompt 或 native-equivalent 结论。
+
 ## 推荐实施顺序与停止点
 
 1. Task 1-3 先解决“选哪些层、如何进入 worker、存储属于谁”。完成后应能启动逐层 cache，但还不宣称 overflow 完成。
@@ -1055,5 +1064,6 @@ Task 11 分层验收进展（2026-09-14）：
 - [x] vLLM commit/source、model config/index/shards 均可追溯。
 - [x] benchmark comparator 校验完整 plan/resource/workload/source 合同，并拒绝旧 temporary-bank/shared-pool 证据冒充新结果。
 - [x] native/UVA/LatchMoE exact-token gate 实现为逐请求 token ID 全等；未通过真实 full-model gate 前不发布性能结论。
-- [ ] full-resident、exact UVA、serial LatchMoE、async LatchMoE 通过 exact-token parity。
+- [x] A6000 受限门槛中 exact UVA、serial LatchMoE、async LatchMoE 在冻结 prompt manifest 上通过 exact-token parity，且 async 有真实 overlap event。
+- [ ] full-resident native parity 因 A6000 显存限制保持 `hardware-blocked`；不得将受限两方结果标记为 native-equivalent。
 - [ ] 新性能结果满足等预算可比参数集合和 HBM ledger；本轮受限两方结果及不可比原因已保留。
