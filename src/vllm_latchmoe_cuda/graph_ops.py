@@ -114,6 +114,7 @@ def _fused_moe_compute(
             hidden_states,
             topk_ids,
             topk_weights,
+            seam=getattr(experts_module, "_latchmoe_seam", None),
         )
 
     identity_slots = runtime.num_slots == runtime.num_experts

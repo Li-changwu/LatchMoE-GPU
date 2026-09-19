@@ -213,6 +213,8 @@ def compare_greedy_results(
         ("request_execution", "request execution policy"),
         ("sampling", "sampling configuration"),
         ("prompts", "prompt list"),
+        ("diagnostic_residual_uva_max_bytes", "residual UVA budget"),
+        ("backend_hbm_cache_bytes", "backend HBM cache"),
     )
     for field, label in contract_fields:
         if reference.get(field) != candidate.get(field):
@@ -286,6 +288,7 @@ def build_engine_kwargs(
     max_model_len: int,
     gpu_memory_utilization: float,
     kv_cache_memory_bytes: int,
+    max_num_seqs: int = CORRECTNESS_MAX_NUM_SEQS,
 ) -> dict[str, object]:
     compilation_config = None
     if not mode.enforce_eager:
@@ -304,10 +307,11 @@ def build_engine_kwargs(
         "gpu_memory_utilization": gpu_memory_utilization,
         "kv_cache_memory_bytes": kv_cache_memory_bytes,
         "max_model_len": max_model_len,
-        "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
+        "max_num_seqs": max_num_seqs,
         "seed": 0,
         "enable_prefix_caching": False,
         "disable_log_stats": True,
+        "attention_config": {"backend": "FLASH_ATTN"},
     }
     if mode.name in {"uva", "uva-exact"}:
         kwargs["cpu_offload_gb"] = STOCK_UVA_CPU_OFFLOAD_GB
@@ -323,6 +327,7 @@ def run_vllm_greedy(
     max_model_len: int,
     gpu_memory_utilization: float,
     kv_cache_memory_bytes: int,
+    max_num_seqs: int = CORRECTNESS_MAX_NUM_SEQS,
     llm_cls=None,
     sampling_params_cls=None,
 ) -> dict[str, object]:
@@ -346,6 +351,7 @@ def run_vllm_greedy(
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
+            max_num_seqs=max_num_seqs,
         )
     )
     sampling = sampling_params_cls(
@@ -374,12 +380,14 @@ def run_vllm_greedy(
     raw_identity_lock = os.getenv("VLLM_LATCHMOE_IDENTITY_LOCK_JSON")
     plan_id = None
     selected_layer_ids = None
+    backend_hbm_cache_bytes = 0
     if raw_plan:
         from .residency_plan import deserialize_residency_plan
 
         plan = deserialize_residency_plan(raw_plan)
         plan_id = plan.plan_id
         selected_layer_ids = list(plan.offloaded_layer_ids)
+        backend_hbm_cache_bytes = int(plan.main_slot_cache_bytes)
     return {
         "schema_version": 1,
         "mode": mode.name,
@@ -391,7 +399,7 @@ def run_vllm_greedy(
         "model_revision": manifest.model.revision,
         "dtype": manifest.dtype,
         "tensor_parallel_size": manifest.tensor_parallel_size,
-        "max_num_seqs": CORRECTNESS_MAX_NUM_SEQS,
+        "max_num_seqs": max_num_seqs,
         "max_model_len": max_model_len,
         "kv_cache_memory_bytes": kv_cache_memory_bytes,
         "enable_prefix_caching": False,
@@ -414,6 +422,10 @@ def run_vllm_greedy(
             else 0.0
         ),
         "manifest_controls_offload_selection": mode.name != "uva",
+        "diagnostic_residual_uva_max_bytes": int(
+            os.getenv("VLLM_LATCHMOE_DIAGNOSTIC_RESIDUAL_UVA_BYTES", "0")
+        ),
+        "backend_hbm_cache_bytes": backend_hbm_cache_bytes,
         "prompts": list(prompts),
         "sampling": {"temperature": 0.0, "max_tokens": max_tokens, "seed": 0},
         "outputs": outputs,

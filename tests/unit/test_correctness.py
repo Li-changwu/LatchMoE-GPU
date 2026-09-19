@@ -96,6 +96,7 @@ def test_engine_kwargs_lock_target_and_piecewise_mode(tiny_manifest):
     assert kwargs["tensor_parallel_size"] == 1
     assert kwargs["max_num_seqs"] == CORRECTNESS_MAX_NUM_SEQS == 32
     assert kwargs["enforce_eager"] is False
+    assert kwargs["attention_config"] == {"backend": "FLASH_ATTN"}
     assert kwargs["compilation_config"] == {
         "cudagraph_mode": "PIECEWISE",
         "custom_ops": ["+unquantized_fused_moe"],
@@ -158,6 +159,7 @@ def test_worker_environment_delegates_uva_to_stock_factory(monkeypatch):
     )
 
     assert uva["VLLM_PLUGINS"] == "latchmoe_cuda"
+    assert uva["VLLM_BATCH_INVARIANT"] == "1"
     assert "VLLM_LATCHMOE_MODE" not in uva
     assert "VLLM_LATCHMOE_MANIFEST" not in uva
     assert "VLLM_LATCHMOE_PROFILE_PATH" not in uva

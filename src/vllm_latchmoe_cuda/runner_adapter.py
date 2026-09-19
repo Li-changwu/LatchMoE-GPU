@@ -111,9 +111,10 @@ def execute_main_cache_waves(
                 0, wave_layout.logical_ids
             ).long()
             payload = seam.run_expert_mlp(
-                hidden_states=hidden_states.index_select(
-                    0, wave_layout.token_indices
-                ),
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                pair_offsets=wave_layout.pair_offsets,
                 logical_ids=wave_layout.logical_ids,
                 physical_ids=physical,
                 slot_w13=runtime.slot_w13,

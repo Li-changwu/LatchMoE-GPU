@@ -54,6 +54,17 @@ def parse_args() -> argparse.Namespace:
         help="immutable residency plan JSON; required for qualified production evidence",
     )
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--client-dataset-name",
+        choices=("sharegpt", "custom"),
+        default="sharegpt",
+        help="vLLM benchmark dataset loader; custom is exploratory only",
+    )
+    parser.add_argument(
+        "--skip-chat-template",
+        action="store_true",
+        help="submit preformatted custom prompts; exploratory only",
+    )
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument(
         "--exploratory",
@@ -65,6 +76,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-concurrency", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--warmup-requests", type=int, default=2)
+    parser.add_argument(
+        "--respect-eos",
+        action="store_true",
+        help="allow requests to stop at EOS; exploratory measurements only",
+    )
+    parser.add_argument(
+        "--disable-shuffle",
+        action="store_true",
+        help="preserve dataset order; exploratory measurements only",
+    )
+    parser.add_argument(
+        "--diagnostic-residual-uva-bytes",
+        type=int,
+        default=0,
+        help=(
+            "additional stock-UVA budget for capacity-constrained exploratory "
+            "LatchMoE runs"
+        ),
+    )
+    parser.add_argument(
+        "--batch-invariant",
+        action="store_true",
+        help="enable vLLM batch-invariant kernels for correctness diagnostics",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8026)
     parser.add_argument("--startup-timeout-s", type=float, default=600.0)
@@ -126,6 +161,8 @@ def _server_environment(
     plan_json: str | None = None,
     identity_lock_json: str | None = None,
     uva_reservation_bytes: int = 0,
+    diagnostic_residual_uva_bytes: int = 0,
+    batch_invariant: bool = False,
 ) -> dict[str, str]:
     environment = os.environ.copy()
     for name in (
@@ -139,6 +176,8 @@ def _server_environment(
         "VLLM_LATCHMOE_RESIDENCY_PLAN_JSON",
         "VLLM_LATCHMOE_IDENTITY_LOCK_JSON",
         "VLLM_LATCHMOE_UVA_RESERVATION_BYTES",
+        "VLLM_LATCHMOE_DIAGNOSTIC_RESIDUAL_UVA_BYTES",
+        "VLLM_BATCH_INVARIANT",
     ):
         environment.pop(name, None)
     environment.update(
@@ -150,6 +189,8 @@ def _server_environment(
             "TOKENIZERS_PARALLELISM": "false",
         }
     )
+    if batch_invariant:
+        environment["VLLM_BATCH_INVARIANT"] = "1"
     if mode.startswith("uva"):
         environment.update(
             {
@@ -165,15 +206,25 @@ def _server_environment(
             environment["VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"] = plan_json
         if identity_lock_json is not None:
             environment["VLLM_LATCHMOE_IDENTITY_LOCK_JSON"] = identity_lock_json
+        if diagnostic_residual_uva_bytes:
+            environment["VLLM_LATCHMOE_DIAGNOSTIC_RESIDUAL_UVA_BYTES"] = str(
+                int(diagnostic_residual_uva_bytes)
+            )
     else:
         environment.update(
             {
                 "VLLM_LATCHMOE_MODE": "latchmoe",
                 "VLLM_LATCHMOE_MANIFEST": str(manifest_path),
                 "VLLM_LATCHMOE_PROFILE_PATH": str(profile_path),
-                "VLLM_LATCHMOE_OVERLAP": "1",
+                "VLLM_LATCHMOE_OVERLAP": (
+                    "0" if mode == "latchmoe-eager" else "1"
+                ),
             }
         )
+        if diagnostic_residual_uva_bytes:
+            environment["VLLM_LATCHMOE_DIAGNOSTIC_RESIDUAL_UVA_BYTES"] = str(
+                int(diagnostic_residual_uva_bytes)
+            )
         if plan_json is not None:
             environment["VLLM_LATCHMOE_RESIDENCY_PLAN_JSON"] = plan_json
         if identity_lock_json is not None:
@@ -217,8 +268,26 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         raise ValueError("exploratory measurements require exactly 1 repetition")
     if not args.exploratory and args.repetitions < 3:
         raise ValueError("final measurements require at least 3 repetitions")
-    if args.num_prompts != 50:
+    if not args.exploratory and args.num_prompts != 50:
         raise ValueError("the frozen ShareGPT contract requires exactly 50 prompts")
+    if args.num_prompts <= 0:
+        raise ValueError("--num-prompts must be positive")
+    if args.respect_eos and not args.exploratory:
+        raise ValueError("--respect-eos is limited to exploratory measurements")
+    if args.disable_shuffle and not args.exploratory:
+        raise ValueError("--disable-shuffle is limited to exploratory measurements")
+    if args.client_dataset_name != "sharegpt" and not args.exploratory:
+        raise ValueError("custom dataset loading is limited to exploratory measurements")
+    if args.skip_chat_template and not args.exploratory:
+        raise ValueError("--skip-chat-template is limited to exploratory measurements")
+    if args.skip_chat_template and args.client_dataset_name != "custom":
+        raise ValueError("--skip-chat-template requires --client-dataset-name custom")
+    if args.diagnostic_residual_uva_bytes < 0:
+        raise ValueError("--diagnostic-residual-uva-bytes must be non-negative")
+    if args.diagnostic_residual_uva_bytes and not args.exploratory:
+        raise ValueError(
+            "diagnostic residual UVA is limited to exploratory measurements"
+        )
     if not args.exploratory and args.plan is None:
         raise ValueError("final measurements require an immutable --plan")
     for name in ("output_len", "max_concurrency", "max_num_seqs"):
@@ -266,9 +335,12 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "dataset_revision": SHAREGPT_REVISION,
         "dataset_sha256": dataset_sha256,
         "dataset_bytes": dataset_path.stat().st_size,
+        "client_dataset_name": args.client_dataset_name,
+        "skip_chat_template": args.skip_chat_template,
         "num_prompts": args.num_prompts,
         "output_len": args.output_len,
-        "ignore_eos": True,
+        "ignore_eos": not args.respect_eos,
+        "disable_shuffle": args.disable_shuffle,
         "seed": args.seed,
         "request_rate": "inf",
         "max_concurrency": args.max_concurrency,
@@ -283,12 +355,18 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "prefix_caching": False,
         "server_log_stats": False,
         "compile_cache": False,
+        "batch_invariant": args.batch_invariant,
+        "attention_backend": "FLASH_ATTN",
     }
     workload_contract_sha256 = payload_sha256(workload_contract)
     mode_contract = {
         **workload_contract,
         "mode": args.mode,
-        "overlap_enabled": args.mode.startswith("latchmoe"),
+        "overlap_enabled": args.mode in {
+            "latchmoe-async-eager",
+            "latchmoe-piecewise",
+        },
+        "diagnostic_residual_uva_max_bytes": args.diagnostic_residual_uva_bytes,
         "latchmoe_wave_slots": (
             min(manifest.num_slots, 32)
             if args.mode.startswith("latchmoe")
@@ -340,6 +418,8 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         plan_json=plan_json,
         identity_lock_json=identity_lock_json,
         uva_reservation_bytes=uva_reservation_bytes,
+        diagnostic_residual_uva_bytes=args.diagnostic_residual_uva_bytes,
+        batch_invariant=args.batch_invariant,
     )
 
     server_log = (run.path / "server.log").open("w", encoding="utf-8")
@@ -378,6 +458,10 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
                 seed=args.seed,
                 warmup_requests=args.warmup_requests,
                 request_id_prefix=f"{args.mode}-rep-{index + 1}-",
+                ignore_eos=not args.respect_eos,
+                disable_shuffle=args.disable_shuffle,
+                dataset_name=args.client_dataset_name,
+                skip_chat_template=args.skip_chat_template,
             )
             run.write_json(
                 (relative_dir / "client_command.json").as_posix(), client_command
@@ -407,7 +491,7 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
             normalized = normalize_benchmark_result(
                 raw,
                 expected_requests=args.num_prompts,
-                expected_output_len=args.output_len,
+                expected_output_len=None if args.respect_eos else args.output_len,
             )
             normalized["run_id"] = f"{args.mode}-rep-{index + 1}"
             measurement_path = run.write_json(
@@ -453,7 +537,11 @@ def execute(args: argparse.Namespace, run: ArtifactRun) -> None:
         "repetitions": args.repetitions,
         "exploratory": args.exploratory,
         "final_result": not args.exploratory,
-        "overlap_enabled": args.mode.startswith("latchmoe"),
+        "overlap_enabled": args.mode in {
+            "latchmoe-async-eager",
+            "latchmoe-piecewise",
+        },
+        "diagnostic_residual_uva_max_bytes": args.diagnostic_residual_uva_bytes,
         "offload_telemetry": telemetry,
         "comparison_contract": {
             key: mode_contract[key]

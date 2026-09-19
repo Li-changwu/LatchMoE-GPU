@@ -15,6 +15,7 @@ from vllm_latchmoe_cuda.graph_ops import (
     register_graph_runtime,
 )
 from vllm_latchmoe_cuda.offloader import CudaSEWOffloader
+from vllm_latchmoe_cuda.moe_seam import SpyMoeSeam
 from vllm_latchmoe_cuda.runner_adapter import (
     _capturable_weights_moe,
     capturable_slot_moe,
@@ -51,6 +52,19 @@ class _Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.mlp = _Mlp()
+
+
+def _native_combine(*, waves, topk_weights, pair_offsets, restore_shape):
+    output = torch.zeros(restore_shape, device=pair_offsets.device, dtype=torch.float32)
+    weights = topk_weights.reshape(-1).float()
+    for wave in waves:
+        values = wave.outputs.float() * weights.index_select(
+            0, wave.pair_offsets
+        ).unsqueeze(-1)
+        output.scatter_add_(
+            0, wave.token_indices[:, None].expand_as(values), values
+        )
+    return output.to(dtype=torch.bfloat16)
 
 
 def test_selected_real_fused_moe_postprocess_never_materializes_full_weights_on_cuda(
@@ -207,6 +221,8 @@ def test_finite_slot_graph_replays_dynamic_map_and_overflow_uses_main_cache(
     )
     runtime.finish_compute_async()
     overflow_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device="cuda")
+    experts._latchmoe_seam = SpyMoeSeam(_native_combine)
+    runtime.production_plan = True
     runtime.prepare_graph_compute((0, 1, 2, 3))
     overflow = graph_fused_moe_compute(
         runtime, runtime_id, hidden, topk_weights, overflow_ids
@@ -223,6 +239,8 @@ def test_finite_slot_graph_replays_dynamic_map_and_overflow_uses_main_cache(
     torch.testing.assert_close(
         pending_output.float(), expected.float(), rtol=2e-2, atol=2e-2
     )
+    assert experts._latchmoe_seam.run_calls == 2
+    assert experts._latchmoe_seam.combine_calls == 1
     assert torch.count_nonzero(runtime.log2phy == -1).item() == (
         runtime.num_experts - runtime.num_slots
     )

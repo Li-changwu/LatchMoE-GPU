@@ -75,6 +75,56 @@ def test_commands_lock_official_uva_and_identical_sharegpt_workload(tiny_manifes
     assert "--ignore-eos" in client
 
 
+def test_client_can_respect_eos_for_exploratory_workloads():
+    client = build_client_command(
+        python_executable="/env/bin/python",
+        base_url="http://127.0.0.1:8026",
+        served_model_name="qwen",
+        tokenizer="/model",
+        dataset_path="/data/sharegpt.json",
+        result_dir="/result",
+        result_filename="raw.json",
+        num_prompts=20,
+        output_len=128,
+        max_concurrency=1,
+        seed=20260905,
+        warmup_requests=0,
+        request_id_prefix="npu-aligned-",
+        ignore_eos=False,
+        disable_shuffle=True,
+    )
+
+    assert "--ignore-eos" not in client
+    assert "--disable-shuffle" in client
+
+
+def test_client_can_submit_all_preformatted_custom_prompts():
+    client = build_client_command(
+        python_executable="/env/bin/python",
+        base_url="http://127.0.0.1:8026",
+        served_model_name="qwen",
+        tokenizer="/model",
+        dataset_path="/data/npu-prompts.jsonl",
+        result_dir="/result",
+        result_filename="raw.json",
+        num_prompts=20,
+        output_len=128,
+        max_concurrency=1,
+        seed=20260905,
+        warmup_requests=0,
+        request_id_prefix="npu-aligned-",
+        ignore_eos=False,
+        disable_shuffle=True,
+        dataset_name="custom",
+        skip_chat_template=True,
+    )
+
+    assert client[client.index("--dataset-name") + 1] == "custom"
+    assert "--custom-output-len" in client
+    assert "--sharegpt-output-len" not in client
+    assert "--skip-chat-template" in client
+
+
 def test_latchmoe_server_does_not_enable_stock_offload(tiny_manifest):
     command = build_server_command(
         python_executable="/env/bin/python",
@@ -90,6 +140,24 @@ def test_latchmoe_server_does_not_enable_stock_offload(tiny_manifest):
     )
 
     assert "--cpu-offload-gb" not in command
+
+
+def test_async_eager_server_keeps_graphs_disabled(tiny_manifest):
+    command = build_server_command(
+        python_executable="/env/bin/python",
+        mode="latchmoe-async-eager",
+        manifest=tiny_manifest,
+        host="127.0.0.1",
+        port=8026,
+        served_model_name="qwen",
+        max_num_seqs=1,
+        max_model_len=4096,
+        max_num_batched_tokens=4096,
+        kv_cache_memory_bytes=536870912,
+    )
+
+    assert "--enforce-eager" in command
+    assert "--compilation-config" not in command
     assert "--enforce-eager" in command
 
 
@@ -171,10 +239,35 @@ def test_server_environment_locks_latchmoe_overlap(tmp_path, monkeypatch):
         uva_reservation_bytes=4096,
     )
 
-    assert latchmoe["VLLM_LATCHMOE_OVERLAP"] == "1"
+    assert latchmoe["VLLM_LATCHMOE_OVERLAP"] == "0"
+    assert "VLLM_BATCH_INVARIANT" not in latchmoe
+    assert "VLLM_BATCH_INVARIANT" not in uva
     assert "VLLM_LATCHMOE_OVERLAP" not in uva
     assert uva["VLLM_LATCHMOE_UVA_RESERVATION_BYTES"] == "4096"
     assert "VLLM_LATCHMOE_UVA_RESERVATION_BYTES" not in latchmoe
+
+    invariant = _server_environment(
+        "latchmoe-eager",
+        tmp_path / "manifest.json",
+        tmp_path / "profile.jsonl",
+        batch_invariant=True,
+    )
+    assert invariant["VLLM_BATCH_INVARIANT"] == "1"
+
+    async_eager = _server_environment(
+        "latchmoe-async-eager",
+        tmp_path / "manifest.json",
+        tmp_path / "profile.jsonl",
+    )
+    assert async_eager["VLLM_LATCHMOE_OVERLAP"] == "1"
+
+    diagnostic = _server_environment(
+        "latchmoe-piecewise",
+        tmp_path / "manifest.json",
+        tmp_path / "profile.jsonl",
+        diagnostic_residual_uva_bytes=536870912,
+    )
+    assert diagnostic["VLLM_LATCHMOE_DIAGNOSTIC_RESIDUAL_UVA_BYTES"] == "536870912"
 
 
 def test_normalize_and_summarize_require_three_complete_fixed_length_runs():
@@ -205,6 +298,17 @@ def test_normalize_rejects_early_eos():
         normalize_benchmark_result(raw, expected_requests=50, expected_output_len=128)
 
 
+def test_normalize_accepts_early_eos_when_output_length_is_not_fixed():
+    raw = _raw_result()
+    raw["total_output_tokens"] = 2345
+
+    normalized = normalize_benchmark_result(
+        raw, expected_requests=50, expected_output_len=None
+    )
+
+    assert normalized["total_output_tokens"] == 2345
+
+
 def test_telemetry_proves_offload_bytes_and_device_planner(tiny_manifest, tmp_path):
     profile = tmp_path / "profile.jsonl"
     profile.write_text(
@@ -232,6 +336,36 @@ def test_telemetry_proves_offload_bytes_and_device_planner(tiny_manifest, tmp_pa
     assert telemetry["actual_offload_bytes"] == tiny_manifest.total_elements * 2 + 64
     assert telemetry["exact_wave_events"] == 1
     assert telemetry["cuda_device_planner_events"] == 1
+
+
+def test_uva_telemetry_includes_residual_offload(tiny_manifest, tmp_path):
+    profile = tmp_path / "profile.jsonl"
+    profile.write_text(
+        json.dumps(
+            {
+                "event": "stock_uva",
+                "implementation": "vllm_latchmoe_cuda.uva.ManifestUVAOffloader",
+                "cpu_offload_bytes": 1024,
+                "cpu_offload_max_bytes": 1024,
+                "residual_implementation": (
+                    "vllm.model_executor.offloader.uva.UVAOffloader"
+                ),
+                "residual_uva_bytes": 64,
+                "residual_uva_max_bytes": 64,
+                "uva_reservation_bytes": 256,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    telemetry = read_offload_telemetry("uva", tiny_manifest, profile)
+
+    assert telemetry["manifest_bytes"] == 1024
+    assert telemetry["residual_uva_bytes"] == 64
+    assert telemetry["actual_offload_bytes"] == 1088
+    assert telemetry["configured_budget_bytes"] == 1088
+    assert telemetry["uva_reservation_bytes"] == 256
 
 
 def test_main_cache_telemetry_requires_one_unified_pair_layout(

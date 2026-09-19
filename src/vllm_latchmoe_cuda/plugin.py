@@ -27,6 +27,7 @@ IDENTITY_LOCK_ENV = "VLLM_LATCHMOE_IDENTITY_LOCK_JSON"
 TELEMETRY_ENV = "VLLM_LATCHMOE_TELEMETRY_PATH"
 PROFILE_ENV = "VLLM_LATCHMOE_PROFILE_PATH"
 UVA_RESERVATION_ENV = "VLLM_LATCHMOE_UVA_RESERVATION_BYTES"
+DIAGNOSTIC_RESIDUAL_UVA_ENV = "VLLM_LATCHMOE_DIAGNOSTIC_RESIDUAL_UVA_BYTES"
 
 
 def _instrument_cudagraph_evidence() -> None:
@@ -121,6 +122,7 @@ def _instrument_manifest_uva(offloader):
 
     def wrap_modules(self, modules_generator):
         modules = original_wrap(modules_generator)
+        residual = self.residual_uva
         writer.write(
             "stock_uva",
             implementation=f"{type(self).__module__}.{type(self).__name__}",
@@ -128,6 +130,17 @@ def _instrument_manifest_uva(offloader):
             cpu_offload_bytes=self.cpu_offload_bytes,
             selection="manifest_exact",
             uva_reservation_bytes=self.reserved_hbm_bytes,
+            residual_implementation=(
+                f"{type(residual).__module__}.{type(residual).__name__}"
+                if residual is not None
+                else None
+            ),
+            residual_uva_max_bytes=(
+                residual.cpu_offload_max_bytes if residual is not None else 0
+            ),
+            residual_uva_bytes=(
+                residual.cpu_offload_bytes if residual is not None else 0
+            ),
         )
         writer.close()
         return modules
@@ -181,7 +194,38 @@ def register() -> None:
             plan = deserialize_residency_plan(raw_plan)
             identity_lock = deserialize_identity_lock(raw_lock)
             validate_identity_lock(identity_lock, plan)
-            offloader = CudaSEWOffloader(plan=plan, identity_lock=identity_lock)
+            raw_residual = os.getenv(DIAGNOSTIC_RESIDUAL_UVA_ENV, "0")
+            try:
+                residual_uva_bytes = int(raw_residual)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{DIAGNOSTIC_RESIDUAL_UVA_ENV} must be an integer"
+                ) from exc
+            if residual_uva_bytes < 0:
+                raise ValueError(
+                    f"{DIAGNOSTIC_RESIDUAL_UVA_ENV} must be non-negative"
+                )
+            if residual_uva_bytes:
+                manifest = load_manifest_from_env()
+                if tuple(manifest.layer_ids) != tuple(plan.offloaded_layer_ids):
+                    raise RuntimeError(
+                        "diagnostic residual UVA manifest and plan layers differ"
+                    )
+                if manifest.num_slots != plan.effective_num_slots:
+                    raise RuntimeError(
+                        "diagnostic residual UVA manifest and plan slots differ"
+                    )
+                if manifest.total_elements * 2 != plan.effective_offloaded_bytes:
+                    raise RuntimeError(
+                        "diagnostic residual UVA manifest and plan bytes differ"
+                    )
+                offloader = CudaSEWOffloader(
+                    plan=plan,
+                    identity_lock=identity_lock,
+                    residual_uva_max_bytes=residual_uva_bytes,
+                )
+            else:
+                offloader = CudaSEWOffloader(plan=plan, identity_lock=identity_lock)
             atexit.register(offloader.close)
             return offloader
         if mode == "uva":
@@ -205,9 +249,22 @@ def register() -> None:
                 raise ValueError(
                     f"{UVA_RESERVATION_ENV} must be non-negative"
                 )
+            raw_residual = os.getenv(DIAGNOSTIC_RESIDUAL_UVA_ENV, "0")
+            try:
+                residual_uva_bytes = int(raw_residual)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{DIAGNOSTIC_RESIDUAL_UVA_ENV} must be an integer"
+                ) from exc
+            if residual_uva_bytes < 0:
+                raise ValueError(
+                    f"{DIAGNOSTIC_RESIDUAL_UVA_ENV} must be non-negative"
+                )
             return _instrument_manifest_uva(
                 ManifestUVAOffloader(
-                    manifest, reservation_bytes=reservation_bytes
+                    manifest,
+                    reservation_bytes=reservation_bytes,
+                    residual_uva_max_bytes=residual_uva_bytes,
                 )
             )
         raise ValueError(

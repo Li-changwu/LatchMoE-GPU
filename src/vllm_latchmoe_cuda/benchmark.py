@@ -17,6 +17,7 @@ BENCHMARK_MODES = (
     "uva-piecewise",
     "uva-full-and-piecewise",
     "latchmoe-eager",
+    "latchmoe-async-eager",
     "latchmoe-piecewise",
 )
 SUMMARY_METRICS = (
@@ -256,6 +257,8 @@ def build_server_command(
         "0",
         "--no-enable-prefix-caching",
         "--disable-log-stats",
+        "--attention-backend",
+        "FLASH_ATTN",
     ]
     if mode.startswith("uva"):
         command.extend(["--cpu-offload-gb", str(STOCK_UVA_CPU_OFFLOAD_GB)])
@@ -303,8 +306,14 @@ def build_client_command(
     seed: int,
     warmup_requests: int,
     request_id_prefix: str,
+    ignore_eos: bool = True,
+    disable_shuffle: bool = False,
+    dataset_name: str = "sharegpt",
+    skip_chat_template: bool = False,
 ) -> list[str]:
-    return [
+    if dataset_name not in {"sharegpt", "custom"}:
+        raise ValueError(f"unsupported benchmark dataset loader: {dataset_name}")
+    command = [
         str(Path(python_executable).parent / "vllm"),
         "bench",
         "serve",
@@ -319,12 +328,16 @@ def build_client_command(
         "--tokenizer",
         tokenizer,
         "--dataset-name",
-        "sharegpt",
+        dataset_name,
         "--dataset-path",
         str(dataset_path),
         "--num-prompts",
         str(num_prompts),
-        "--sharegpt-output-len",
+        (
+            "--sharegpt-output-len"
+            if dataset_name == "sharegpt"
+            else "--custom-output-len"
+        ),
         str(output_len),
         "--request-rate",
         "inf",
@@ -336,7 +349,6 @@ def build_client_command(
         str(warmup_requests),
         "--temperature",
         "0",
-        "--ignore-eos",
         "--no-oversample",
         "--disable-tqdm",
         "--percentile-metrics",
@@ -352,10 +364,17 @@ def build_client_command(
         "--result-filename",
         result_filename,
     ]
+    if ignore_eos:
+        command.append("--ignore-eos")
+    if disable_shuffle:
+        command.append("--disable-shuffle")
+    if skip_chat_template:
+        command.append("--skip-chat-template")
+    return command
 
 
 def normalize_benchmark_result(
-    raw: dict[str, Any], *, expected_requests: int, expected_output_len: int
+    raw: dict[str, Any], *, expected_requests: int, expected_output_len: int | None
 ) -> dict[str, Any]:
     completed = raw.get("completed")
     failed = raw.get("failed", 0)
@@ -365,12 +384,22 @@ def normalize_benchmark_result(
             f"incomplete benchmark: completed={completed}, failed={failed}, "
             f"expected={expected_requests}"
         )
-    expected_output = expected_requests * expected_output_len
-    if total_output != expected_output:
+    expected_output = (
+        expected_requests * expected_output_len
+        if expected_output_len is not None
+        else None
+    )
+    if expected_output is not None and total_output != expected_output:
         raise RuntimeError(
             f"unexpected output token count: actual={total_output}, "
             f"expected={expected_output}"
         )
+    if (
+        not isinstance(total_output, int)
+        or isinstance(total_output, bool)
+        or total_output <= 0
+    ):
+        raise RuntimeError(f"invalid output token count: {total_output}")
     metrics: dict[str, float] = {}
     for name in SUMMARY_METRICS:
         value = raw.get(name)
@@ -471,10 +500,17 @@ def read_offload_telemetry(
         }
         if implementation not in expected:
             raise RuntimeError(f"unexpected UVA implementation: {implementation}")
+        manifest_bytes = int(event["cpu_offload_bytes"])
+        residual_bytes = int(event.get("residual_uva_bytes", 0))
+        residual_budget = int(event.get("residual_uva_max_bytes", 0))
         return {
             "implementation": implementation,
-            "actual_offload_bytes": int(event["cpu_offload_bytes"]),
-            "configured_budget_bytes": int(event["cpu_offload_max_bytes"]),
+            "manifest_bytes": manifest_bytes,
+            "residual_implementation": event.get("residual_implementation"),
+            "residual_uva_bytes": residual_bytes,
+            "actual_offload_bytes": manifest_bytes + residual_bytes,
+            "configured_budget_bytes": int(event["cpu_offload_max_bytes"])
+            + residual_budget,
             "uva_reservation_bytes": int(
                 event.get("uva_reservation_bytes", 0)
             ),

@@ -39,12 +39,15 @@ def test_plugin_factory_keeps_manifest_uva_as_explicit_baseline(
     monkeypatch.setattr(plugin, "load_manifest_from_env", lambda: tiny_manifest)
     monkeypatch.setenv("VLLM_LATCHMOE_MODE", "uva")
     monkeypatch.setenv(plugin.UVA_RESERVATION_ENV, "4096")
+    monkeypatch.setenv(plugin.DIAGNOSTIC_RESIDUAL_UVA_ENV, "64")
 
     plugin.register()
     created = fake_runner.create_offloader(object())
 
     assert isinstance(created, ManifestUVAOffloader)
     assert created.reservation_bytes == 4096
+    assert created.residual_uva is not None
+    assert created.residual_uva.cpu_offload_max_bytes == 64
 
 
 def test_latchmoe_factory_consumes_parent_plan_without_residual_uva(
@@ -83,6 +86,43 @@ def test_latchmoe_factory_consumes_parent_plan_without_residual_uva(
     assert created.identity_lock is lock
     assert created.residual_uva is None
     assert validated == [(lock, plan)]
+
+
+def test_latchmoe_factory_allows_explicit_diagnostic_residual_uva(
+    monkeypatch, plugin, tiny_manifest
+):
+    fake_runner = SimpleNamespace(create_offloader=lambda config: object())
+    plan = build_residency_plan(
+        72 / (1 << 30),
+        {"model_type": "synthetic_moe", "moe_layer_ids": [0], "num_experts": 4},
+        max_capture_size=2,
+        top_k=1,
+        device_total_bytes=1 << 30,
+        kv_reserve_bytes=0,
+        layer_metadata=({"layer_id": 0, "routed_expert_bytes": 96},),
+    )
+    lock = object()
+    monkeypatch.setattr(plugin.metadata, "version", lambda _: "0.19.1")
+    monkeypatch.setattr(plugin, "_instrument_cudagraph_evidence", lambda: None)
+    monkeypatch.setattr(plugin.importlib, "import_module", lambda name: fake_runner)
+    monkeypatch.setattr(plugin, "deserialize_residency_plan", lambda raw: plan)
+    monkeypatch.setattr(plugin, "deserialize_identity_lock", lambda raw: lock)
+    monkeypatch.setattr(plugin, "validate_identity_lock", lambda actual, actual_plan: None)
+    monkeypatch.setattr(plugin, "load_manifest_from_env", lambda: tiny_manifest)
+    monkeypatch.setenv("VLLM_LATCHMOE_MODE", "latchmoe")
+    monkeypatch.setenv(plugin.RESIDENCY_PLAN_ENV, "parent-plan")
+    monkeypatch.setenv(plugin.IDENTITY_LOCK_ENV, "parent-lock")
+    monkeypatch.setenv(plugin.DIAGNOSTIC_RESIDUAL_UVA_ENV, "64")
+
+    plugin.register()
+    created = fake_runner.create_offloader(object())
+
+    assert isinstance(created, CudaSEWOffloader)
+    assert created.manifest is None
+    assert created.plan is plan
+    assert created.identity_lock is lock
+    assert created.residual_uva is not None
+    assert created.residual_uva.cpu_offload_max_bytes == 64
 
 
 def test_latchmoe_factory_fails_closed_without_parent_plan(monkeypatch, plugin):

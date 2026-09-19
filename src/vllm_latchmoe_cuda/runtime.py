@@ -471,6 +471,12 @@ class CudaLayerRuntime:
         overlap_candidate: bool | None = None,
     ) -> PreparedMainCacheWave:
         self.ensure_healthy()
+        # Expert kernels are asynchronous with respect to the host.  A serial
+        # wave therefore cannot make its slots immediately evictable when the
+        # kernel call returns: the transfer stream could overwrite weights
+        # that the compute stream is still reading.  Order subsequent copies
+        # after the recorded compute events before releasing the leases.
+        self._release_pending_main_computes_to_stream(self.transfer_engine.stream)
         prepared = self.main_cache.prepare_wave(
             spec,
             host_w13=self.host_w13,
@@ -521,12 +527,17 @@ class CudaLayerRuntime:
             end_event.record(torch.cuda.current_stream(self.device))
             window = self._main_cache_windows.setdefault(prepared.wave_id, {})
             window["end"] = end_event
-            if defer:
-                self._pending_main_computes[prepared.wave_id] = PendingCompute(
-                    handle=handle, event=end_event
-                )
-            else:
-                self.bank.end_compute(handle)
+            self._pending_main_computes[prepared.wave_id] = PendingCompute(
+                handle=handle, event=end_event
+            )
+
+    def _release_pending_main_computes_to_stream(
+        self, stream: torch.cuda.Stream
+    ) -> None:
+        for wave_id, pending in tuple(self._pending_main_computes.items()):
+            stream.wait_event(pending.event)
+            self.bank.end_compute(pending.handle)
+            del self._pending_main_computes[wave_id]
 
     def complete_pending_main_cache_computes(self) -> None:
         for wave_id, pending in tuple(self._pending_main_computes.items()):

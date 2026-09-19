@@ -114,8 +114,6 @@ class CudaSEWOffloader(BaseOffloader):
         self.first_layer_id = first_layer_id
         if residual_uva_max_bytes < 0:
             raise ValueError("residual_uva_max_bytes must be non-negative")
-        if plan is not None and residual_uva_max_bytes:
-            raise ValueError("production plan cannot enable residual UVA")
         self.residual_uva = (
             UVAOffloader(cpu_offload_max_bytes=residual_uva_max_bytes)
             if residual_uva_max_bytes

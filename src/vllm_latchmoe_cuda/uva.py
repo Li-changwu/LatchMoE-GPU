@@ -5,11 +5,16 @@ from collections.abc import Generator
 import torch
 from torch import nn
 from vllm.model_executor.offloader.base import BaseOffloader
+from vllm.model_executor.offloader.uva import UVAOffloader
 from vllm.utils.platform_utils import is_pin_memory_available, is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from .manifest import OffloadManifest
-from .offloader import _resolve_parameter
+from .offloader import (
+    _install_post_load_filter,
+    _remove_post_load_filter,
+    _resolve_parameter,
+)
 
 
 class ManifestUVAOffloader(BaseOffloader):
@@ -23,6 +28,7 @@ class ManifestUVAOffloader(BaseOffloader):
         use_uva: bool | None = None,
         first_layer_id: int = 0,
         reservation_bytes: int = 0,
+        residual_uva_max_bytes: int = 0,
     ):
         self.manifest = manifest
         self.pin_memory = (
@@ -35,6 +41,13 @@ class ManifestUVAOffloader(BaseOffloader):
         self.reservation_bytes = int(reservation_bytes)
         if self.reservation_bytes < 0:
             raise ValueError("UVA reservation bytes must be non-negative")
+        if residual_uva_max_bytes < 0:
+            raise ValueError("residual UVA bytes must be non-negative")
+        self.residual_uva = (
+            UVAOffloader(cpu_offload_max_bytes=residual_uva_max_bytes)
+            if residual_uva_max_bytes
+            else None
+        )
         self._hbm_reservation: torch.Tensor | None = None
         self.offloaded_parameter_names: set[str] = set()
         self.cpu_offload_bytes = 0
@@ -52,6 +65,7 @@ class ManifestUVAOffloader(BaseOffloader):
             raise RuntimeError("wrap_modules may only be called once")
         self._wrapped = True
         modules: list[nn.Module] = []
+        selected_modules: list[nn.Module] = []
         selected = set(self.manifest.layer_ids)
         bound_layers: set[int] = set()
         for relative_index, module in enumerate(modules_generator):
@@ -60,6 +74,7 @@ class ManifestUVAOffloader(BaseOffloader):
             if layer_id not in selected:
                 continue
             bound_layers.add(layer_id)
+            selected_modules.append(module)
             for layout in self.manifest.layer(layer_id).tensors:
                 parameter = _resolve_parameter(module, layout.parameter_name)
                 if tuple(parameter.shape) != layout.shape:
@@ -94,6 +109,14 @@ class ManifestUVAOffloader(BaseOffloader):
                 self.offloaded_parameter_names.add(
                     f"model.layers.{layer_id}.{layout.parameter_name}"
                 )
+        if self.residual_uva is not None:
+            for module in selected_modules:
+                _install_post_load_filter(module)
+            try:
+                modules = self.residual_uva.wrap_modules(iter(modules))
+            finally:
+                for module in selected_modules:
+                    _remove_post_load_filter(module)
         missing = sorted(selected - bound_layers)
         if missing:
             raise RuntimeError(f"missing manifest layers during binding: {missing}")

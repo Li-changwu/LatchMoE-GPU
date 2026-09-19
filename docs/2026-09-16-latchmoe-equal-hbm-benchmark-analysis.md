@@ -126,3 +126,7 @@ TPOT 改善小于 TTFT 是合理的：decode 每步 token 数较少，可利用�
 - [实施与验收计划](2026-09-10-latchmoe-gpu-main-cache-alignment.md)
 
 两组 run 的 `SHA256SUMS` 均已通过，比较器输出 `comparable_contract=true` 和 `comparable_offload_bytes=true`，budget verifier 输出 `PASS`。
+
+## 7. NPU 参数对齐补充实验
+
+concurrency=1、12 offload layers、3.375 GiB Main Cache、NPU 原始 20 条 prompt 的后续 GPU 单轮实验见 [GPU/NPU 参数对齐报告](2026-09-16-latchmoe-npu-aligned-gpu-benchmark.md)。该实验中 GPU 为 6.792 tok/s，NPU 为 13.298 tok/s；但两侧 checkpoint、输出 token 总数和总 offload bytes 未完全一致，因此结果标记为 exploratory，不能覆盖本报告的 GPU 内部 equal-HBM 正式结论。

@@ -78,3 +78,22 @@ def test_manifest_uva_holds_exact_hbm_reservation(
     offloader.wrap_modules(iter((module,)))
 
     assert offloader.reserved_hbm_bytes == 4096
+
+
+def test_manifest_uva_residual_skips_manifest_parameters(
+    tiny_manifest, tiny_decoder_factory
+):
+    selected = tiny_decoder_factory("cuda")
+    residual = tiny_decoder_factory("cuda")
+    offloader = ManifestUVAOffloader(
+        tiny_manifest,
+        residual_uva_max_bytes=96,
+    )
+
+    offloader.wrap_modules(iter((selected, residual)))
+
+    assert offloader.cpu_offload_bytes == 96
+    assert offloader.residual_uva is not None
+    assert offloader.residual_uva.cpu_offload_bytes == 96
+    assert getattr(selected.mlp.experts.w13_weight, "_vllm_is_uva_offloaded")
+    assert getattr(residual.mlp.experts.w13_weight, "_vllm_is_uva_offloaded")

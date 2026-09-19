@@ -902,7 +902,7 @@ combine_count == selected_layer_forward_count
 
 - [x] **Step 4: A6000 受限全模型 exact-token 门槛**
 
-A6000 无法容纳 full-resident native，因此将其明确记录为 `hardware-blocked`，不伪造 native oracle。受限验收分别独立启动 exact-selection UVA 和 serial Main Cache，固定同一 immutable plan、identity lock、source state、prompt manifest、sampling、KV reserve 和 graph policy；覆盖短 prompt、长 prefill、16-token decode、multi-wave 和重复请求。两方所有 prompt token IDs 和生成 token IDs 全等后才运行 async；async 必须再次全等且至少记录一个 `actual_overlap=true` 窗口。该门槛只允许发布 `two_way_exact_token_parity`，不允许宣称 `native-equivalent correctness`。
+A6000 无法容纳 full-resident native，因此将其明确记录为 `hardware-blocked`，不伪造 native oracle。受限验收分别独立启动 exact-selection UVA、serial Main Cache 和 async Main Cache，固定同一 immutable plan、identity lock、source state、prompt manifest、sampling、KV reserve 和 graph policy；覆盖短 prompt、长 prefill、decode、multi-wave 和重复请求。serial 对 exact-UVA 的所有 prompt token IDs 和生成 token IDs 全等后才运行 async；async 必须再次全等且至少记录一个 `actual_overlap=true` 窗口。该门槛只允许发布冻结 prompt 集上的 `three_way_4_of_4_exact_token_parity`，不允许宣称 `native-equivalent correctness` 或任意 prompt 全等。
 
 - [x] **Step 5: 正式三轮性能实验（受限两方）**
 
@@ -1094,6 +1094,26 @@ Task 12 统一 token-expert layout 实施与验收（2026-09-15）：
 - 延迟中位数：median TPOT 为 UVA `649.95 ms`、LatchMoE `278.91 ms`，降低 `57.09%`；mean TPOT 为 `682.13 -> 272.33 ms`，降低 `60.08%`。median TTFT 为 `12,343.62 -> 2,567.44 ms`，降低 `79.20%`；p99 TTFT 为 `93,975.95 -> 22,764.59 ms`，降低 `75.78%`。三轮吞吐离散系数分别约 `0.96%` 和 `1.62%`，没有单轮异常主导中位数。
 - LatchMoE profile verifier 检查 123,379 个事件：42,450 个 Main Cache forward 全部为统一 layout，80,869/80,869 个 overlap candidate 具有真实 event window，`temporary_bank_bytes=0`。该结果支持“显式 H2D 到 Main Cache + hit reuse + event-confirmed overlap”优于 UVA 直接从 pinned host 权重访问的路径，但不能把全部收益单独归因于 layout；layout 本身的 3.4x 微基准仍只是组织阶段证据。
 - 之前 `artifacts/20260915T-formal-task12-uva-exact-r1` 与 `artifacts/20260915T-formal-task12-latchmoe-async-r1` 没有 UVA reservation，只能作为 equal-offload、非 equal-HBM 的历史记录；本节正式结论只采用 equal-HBM 新 artifact。full-resident native 仍因 A6000 显存不足保持 `hardware-blocked`，结论范围为受限 UVA/LatchMoE 对照，不扩展为 native-equivalent。
+
+NPU 对齐配置三方门槛与性能重跑（2026-09-16）：
+
+- 修复 correctness driver 后，exact-UVA、serial LatchMoE、async LatchMoE 统一消费 `artifacts/20260916T-npu-aligned-c1-contract/residency_plan.json`，并统一 `max_num_seqs=1`、KV 512 MiB、PIECEWISE graph、3.375 GiB backend HBM、12 个 selected layers 和 10 GiB residual-UVA 上限。exact-UVA 同时执行 manifest exact-selection、residual stock UVA，并分配与 Main Cache 等大的真实 HBM reservation。
+- 最终 evidence 为 `artifacts/20260916T-npu-aligned-gate-uva-exact-r3`、`artifacts/20260916T-npu-aligned-gate-latchmoe-serial-r1` 和 `artifacts/20260916T-npu-aligned-gate-latchmoe-async-r1`。三方 source state 均为 `308b55e911e80f4d4c079903d768e1d1d7f3a970a204ecbf93c8248b268b3ba7`，plan ID 均为 `a63cf79af170918e613226861f3b49ffc272db95dece32d954a537b375cebe9c`，实际卸载均为 `25,423,869,952` bytes。
+- `artifacts/20260916T-npu-aligned-three-way-token-gate.json` 输出 `PASS`：exact-UVA 对 serial 为 4/4 token IDs 和 text 全等，exact-UVA 对 async 同样为 4/4；async profile 有 60 个 `actual_overlap=true` event。资格为 `three_way_4_of_4_exact_token_parity`，full-resident native 继续为 `hardware-blocked`。
+- 门槛通过后各自单次完整冷启动，复用 NPU 证据的 20 条原始 prompt、concurrency=1、temperature=0、128 token 上限、允许 EOS、无 warmup、固定顺序、4096 上下文和 512 MiB KV。UVA artifact 为 `artifacts/20260916T-npu-aligned-gated-gpu-uva-piecewise-r1`，async LatchMoE 为 `artifacts/20260916T-npu-aligned-gated-gpu-latchmoe-piecewise-r1`；两者均 20/20、failed=0，SHA256SUMS 全部通过，合同和总卸载量可比。
+- UVA / LatchMoE output throughput 为 `4.569 / 6.800 tok/s`，LatchMoE 高 `48.81%`；median TPOT 为 `184.21 / 127.21 ms`，降低 `30.94%`；median TTFT 为 `2,211.95 / 1,482.22 ms`，降低 `32.99%`。LatchMoE profile 的 238/238 个 Main Cache forward 均使用 `unified_token_expert_v1`，另有 252 个 `actual_overlap=true` event。
+- 20 条 EOS 性能 workload 的输入长度 20/20 相同，但 output length 仅 17/20 相同、generated text 仅 6/20 相同，总输出为 UVA 1,634、LatchMoE 1,923。因此性能结果资格为 `correctness_gate_passed_benchmark_output_not_equivalent`：4/4 correctness gate 有效，但 aggregate output throughput 不作为 20 条 workload 的严格 token-equivalent 加速比。完整分析见 `docs/2026-09-16-npu-aligned-a6000-latchmoe-vs-uva.md`。
+
+Main Cache slot 读写顺序修复与复验（2026-09-16）：
+
+- 根因是 serial Main Cache wave 的 CUDA expert kernel 只完成入队后，runtime 就立即将其 slot lease 标记为可驱逐；下一 wave 的独立 transfer stream 可以在前一 kernel 仍读取权重时覆盖同一 slot。竞态结果依赖请求历史和 GPU 时序，因此表现为单请求隔离时一致、连续请求后偶发 token 分叉。
+- `CudaLayerRuntime.mark_compute_complete()` 现在始终记录 compute-done event 并保留 lease；下一次 Main Cache H2D 复用 slot 前，由 transfer stream 等待对应 event，再释放 lease。该依赖不执行 CPU 全局同步，也不改变 partial-hit async 预取只写 idle slot 的路径。
+- 新增延迟 slot-read GPU 回归：第一 wave 故意延迟读取，第二 wave 立即复用全部 slot；修复后逐 bit 输出正确。完整测试为 `233 passed, 13 skipped`。
+- 新三方 token gate 使用同一 source state `83d5c40e89a628fda7a8c4e8df520fd1f2ecd626548d137224dafca7d333be85`、同一 plan 和 25,423,869,952 bytes 实际卸载。exact-UVA 对 serial、async 均为 4/4 请求、每请求 32 个 token IDs 全等；async 记录 46 次 Main Cache wave 和 56 个 `actual_overlap=true` event。
+- 新连续 20-request eager workload 中，UVA 与 serial LatchMoE 的 input lengths、output lengths、generated texts 均为 20/20 全等，总输出均为 1,753 tokens；serial 实际执行 239 次 Main Cache wave，无 failure。审计为 `artifacts/20260916T-slot-read-order-token-gate.json`。
+- NPU 对齐正式性能重跑使用同一 eager graph policy，并新增 `latchmoe-async-eager` 模式以保留 H2D/compute overlap。UVA 与 async LatchMoE 均完成 20/20 请求，输入/输出长度和 generated text 均为 20/20 全等，总输出均为 1,753 tokens；实际 offload 均为 25,423,869,952 bytes，backend HBM 均为 3,623,878,656 bytes，source state 和完整比较合同一致。
+- 正式结果为 UVA `4.601 tok/s`、async eager LatchMoE `5.912 tok/s`，吞吐提升 `28.48%`；median TPOT `185.28 -> 147.22 ms`，降低 `20.54%`；median TTFT `2,209.62 -> 1,502.10 ms`，降低 `32.02%`。LatchMoE profile 包含 239 次 Main Cache wave、239/239 unified layout 和 260 个 `actual_overlap=true` event。完整数据见 `docs/2026-09-16-npu-aligned-a6000-latchmoe-vs-uva.md`。
+- 同 source 的 PIECEWISE 诊断重跑仍只有 17/20 output length、8/20 generated text 一致，明确标记为 `output_not_equivalent`，不纳入正式性能结论。
 
 ## 推荐实施顺序与停止点
 
